@@ -1,0 +1,39 @@
+{
+  "family": "worldmonitor-dashboard",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/worldmonitor-ecs-execution-role",
+  "containerDefinitions": [
+    {
+      "name": "worldmonitor-dashboard",
+      "image": "<ECR_REPOSITORY_URI>:latest",
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "environment": [
+        { "name": "DASHBOARD_PORT", "value": "8000" }
+      ],
+      "secrets": [
+        { "name": "AZURE_OPENAI_API_KEY", "valueFrom": "arn:aws:secretsmanager:<REGION>:<AWS_ACCOUNT_ID>:secret:worldmonitor/azure-openai-api-key" },
+        { "name": "AZURE_OPENAI_ENDPOINT", "valueFrom": "arn:aws:secretsmanager:<REGION>:<AWS_ACCOUNT_ID>:secret:worldmonitor/azure-openai-endpoint" },
+        { "name": "AZURE_OPENAI_DEPLOYMENT", "valueFrom": "arn:aws:secretsmanager:<REGION>:<AWS_ACCOUNT_ID>:secret:worldmonitor/azure-openai-deployment" },
+        { "name": "AZURE_OPENAI_API_VERSION", "valueFrom": "arn:aws:secretsmanager:<REGION>:<AWS_ACCOUNT_ID>:secret:worldmonitor/azure-openai-api-version" },
+        { "name": "SSL_VERIFY", "valueFrom": "arn:aws:secretsmanager:<REGION>:<AWS_ACCOUNT_ID>:secret:worldmonitor/ssl-verify" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/worldmonitor-dashboard",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "worldmonitor"
+        }
+      }
+    }
+  ]
+}

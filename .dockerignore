@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+dist_venv/
+*.zip
+*.pptx
+config.json
+tests/
+*.bat
+.git
+.claude/
+test_*.py
+test_*.html

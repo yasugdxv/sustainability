@@ -1,0 +1,59 @@
+{
+  "azure": {
+    "endpoint":           "https://YOUR-RESOURCE.openai.azure.com/",
+    "api_key":            "ここにAzure OpenAIのAPIキー",
+    "default_deployment": "gpt-4o",
+    "api_version":        "2024-05-01-preview"
+  },
+  "api_keys": {
+    "openai": "sk-proj-ここにOpenAI APIキーを入力（azureがあれば不要）",
+    "marinetraffic": "ここにMarineTraffic APIキーを入力（船舶追跡に必要・marinetraffic.com で無料登録）"
+  },
+  "proxy": {
+    "enabled": true,
+    "http_proxy": "http://jejp1prfp001.sgn.suntory.co.jp:9400"
+  },
+  "ssl": {
+    "verify": false
+  },
+  "supabase": {
+    "url": "https://xxxx.supabase.co",
+    "key": "ここに anon public API key を入力",
+    "service_role_key": "ここに service_role key を入力（article_crawler.py / article_analyzer.py / sustainability_*.py で必要）"
+  },
+  "sustainability_expert": {
+    "enabled": true,
+    "expert_version": "0.1.0",
+    "knowledge_search": {
+      "mode": "local",
+      "azure_ai_search": {
+        "endpoint": "https://YOUR-SEARCH-SERVICE.search.windows.net",
+        "api_key": "ここにAzure AI SearchのAPIキーを入力（modeがazure_ai_searchの場合のみ必要）",
+        "index_name": "suntory-sustainability-expert-v1"
+      },
+      "embedding_deployment": "（任意。ベクトル検索を使う場合のみAzure OpenAIのembeddingデプロイ名を入力）"
+    }
+  },
+  "weekly_digest": {
+    "since_days": 7,
+    "target_min": 15,
+    "target_max": 20
+  },
+  "competitor_monitoring": {
+    "enabled": true,
+    "auto_send_confidence_threshold": 0.85
+  },
+  "monthly_competitor_digest": {
+    "since_days": 30
+  },
+  "email": {
+    "enabled": false,
+    "smtp_host": "（例: 社内SMTPリレーのホスト名、またはsmtp.office365.com）",
+    "smtp_port": 587,
+    "use_starttls": true,
+    "smtp_user": "（認証が必要な場合のみ）",
+    "smtp_password": "（認証が必要な場合のみ）",
+    "from_address": "sustainability-report@example.com",
+    "to_addresses": ["recipient1@example.com", "recipient2@example.com"]
+  }
+}

@@ -1,0 +1,22 @@
+streamlit>=1.30.0
+openai>=1.0.0
+httpx>=0.25.0
+pandas>=2.0.0
+requests>=2.31.0
+feedparser>=6.0.0
+urllib3>=2.0.0
+
+# 記事クロール・分析パイプライン（article_crawler.py / article_analyzer.py）用
+trafilatura>=1.8.0
+lxml>=5.0.0
+python-docx>=1.1.0
+pypdf>=4.0.0
+python-dateutil>=2.9.0
+playwright>=1.40.0
+
+# サスティナビリティ専門家MVP（sustainability_*.py）用
+jsonschema>=4.20.0
+
+# サスティナビリティ専門家MVP: Azure AI Search を本番利用する場合のみ追加インストール
+# （sustainability_expert.knowledge_search.mode を azure_ai_search にする場合）
+# azure-search-documents>=11.5.0

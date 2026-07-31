@@ -1,0 +1,35 @@
+# 秘密情報（CLAUDE.mdルール: config.json/.envは絶対にコミットしない）
+config.json
+.env
+
+# 生成物
+dashboard.html
+eco-digest-spark/.output/
+eco-digest-spark/.tanstack/
+eco-digest-spark/.wrangler/
+eco-digest-spark/.vinxi/
+eco-digest-spark/.nitro/
+eco-digest-spark/dist/
+eco-digest-spark/dist-ssr/
+
+# キャッシュ・依存関係
+cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+node_modules/
+
+# ポータブルツール（サイズが大きく、別途取得可能なため管理外）
+.tools/
+
+# ログ
+*.log
+
+# 退避した旧ファイル（削除ではなく退避のため、追跡対象から外す）
+_removed_20260723/
+
+# 社内業務資料（コードのみ管理する方針。ソースコードとは別に社内で共有・保管する）
+uploads/
+knowledge/
+docs/
