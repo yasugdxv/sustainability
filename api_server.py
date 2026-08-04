@@ -30,7 +30,13 @@ ARTICLES_CACHE_TTL = 300
 
 _config = load_config()
 _azure_client, _model = make_openai_client(_config)
-_expert_base = common.load_expert_base()
+try:
+    # knowledge/はgitignore対象（社外秘）のため、デプロイ環境に無い場合がある。
+    # サスティナビリティ専門家機能はcommon.is_enabled()で別途フラグ制御されているため、
+    # ここでは起動を止めずに空データにフォールバックする。
+    _expert_base = common.load_expert_base()
+except FileNotFoundError:
+    _expert_base = {}
 _knowledge_store = get_knowledge_store(_config)
 _competitor_client = SupabaseClient(_config)
 
