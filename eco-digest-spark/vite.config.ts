@@ -12,4 +12,7 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  // Azure App Service (Node.js)へのデプロイ用。既定のcloudflare-moduleではなく
+  // プレーンなNode.jsサーバー(.output/server/index.mjs)を出力させる
+  nitro: { preset: "node-server" },
 });

@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-const API_BASE = "http://127.0.0.1:8000";
+// ローカル開発ではAPIサーバー(127.0.0.1:8000)、本番ビルドではVITE_API_BASEで
+// デプロイ先のバックエンドURLを指定する（フロントとバックエンドを別ホストに配置するため）
+const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 
 export type Lang = "ja" | "en";
 
