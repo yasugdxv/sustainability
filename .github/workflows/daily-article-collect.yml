@@ -1,0 +1,42 @@
+name: 記事の日次収集・分析
+
+on:
+  schedule:
+    - cron: '0 21 * * *'  # UTC 21:00 = JST 06:00
+  workflow_dispatch:       # 手動実行も可能
+
+jobs:
+  collect-and-analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 依存パッケージインストール
+        run: |
+          pip install -r requirements_azure.txt
+          playwright install --with-deps chromium
+
+      - name: 記事収集(article_crawler.py)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SSL_VERIFY: "true"
+        run: python article_crawler.py
+
+      - name: 記事分析(article_analyzer.py)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          SSL_VERIFY: "true"
+        run: python article_analyzer.py 10
