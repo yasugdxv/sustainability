@@ -418,7 +418,6 @@ def _translate_short(azure_client, model: str, namespace: str, article_id: str,
                                                f"1行で出力してください。"},
                 {"role": "user", "content": text},
             ],
-            temperature=0.2,
         )
         result = (resp.choices[0].message.content or "").strip() or text
         if _looks_garbled(result):
@@ -457,7 +456,6 @@ def translate_plain(azure_client, model: str, text: str, target_lang: str = "ja"
                                                f"前置きや説明を付けず、翻訳結果のみを出力してください。"},
                 {"role": "user", "content": text},
             ],
-            temperature=0.2,
             max_completion_tokens=2000,
         )
         result = (resp.choices[0].message.content or "").strip() or text
@@ -497,7 +495,6 @@ def translate_body(azure_client, model: str, article_id: str, text: str, target_
                                                    f"前置きや説明を付けず、翻訳結果のみを出力してください。"},
                     {"role": "user", "content": chunk},
                 ],
-                temperature=0.2,
                 max_completion_tokens=4000,
             )
             piece = (resp.choices[0].message.content or "").strip() or chunk

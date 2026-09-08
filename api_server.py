@@ -421,7 +421,7 @@ def chat(req: ChatRequest):
     messages.append({"role": "user", "content": req.message})
 
     try:
-        resp = _azure_client.chat.completions.create(model=_model, messages=messages, temperature=0.3)
+        resp = _azure_client.chat.completions.create(model=_model, messages=messages)
         reply = resp.choices[0].message.content
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
