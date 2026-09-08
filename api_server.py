@@ -205,6 +205,10 @@ app.add_middleware(
     ],
     allow_methods=["*"],
     allow_headers=["*"],
+    # backendはAzure Private Endpoint経由(プライベートIP)でのみ到達可能なため、
+    # 公開アドレスのfrontendから呼ぶとChromeのPrivate Network Accessでブロックされる。
+    # 明示的に許可する(社内ネットワーク/VPN経由の利用が前提)。
+    allow_private_network=True,
 )
 
 

@@ -6,6 +6,10 @@ requests>=2.31.0
 feedparser>=6.0.0
 urllib3>=2.0.0
 
+# APIバックエンド（api_server.py / docker_entrypoint.py）用
+fastapi>=0.139.0
+pydantic>=2.13.0
+
 # 記事クロール・分析パイプライン（article_crawler.py / article_analyzer.py）用
 trafilatura>=1.8.0
 lxml>=5.0.0
