@@ -7,6 +7,7 @@ _removed_20260827/ へ退避済み。
 """
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from article_crawler import SupabaseClient
 import sustainability_chat_geo_service as chat_geo
@@ -484,8 +485,8 @@ def translate_body(azure_client, model: str, article_id: str, text: str, target_
         return text
     lang_name = _LANG_NAME.get(target_lang, "日本語")
     chunks = split_text(text, TRANSLATE_CHUNK_SIZE)
-    translated = []
-    for chunk in chunks:
+
+    def _translate_chunk(chunk: str) -> str:
         try:
             resp = azure_client.chat.completions.create(
                 model=model,
@@ -498,9 +499,15 @@ def translate_body(azure_client, model: str, article_id: str, text: str, target_
                 max_completion_tokens=4000,
             )
             piece = (resp.choices[0].message.content or "").strip() or chunk
-            translated.append(chunk if _looks_garbled(piece) else piece)
+            return chunk if _looks_garbled(piece) else piece
         except Exception:
-            translated.append(chunk)
+            return chunk
+
+    # チャンクを逐次翻訳すると長い記事ほど所要時間が線形に増え、
+    # 記事詳細表示が数十秒〜1分以上かかる原因になっていたため並列実行にする
+    # （2026-09-09、川崎さんからの表示速度指摘対応）。
+    with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as pool:
+        translated = list(pool.map(_translate_chunk, chunks))
     result = "\n\n".join(translated)
     _body_cache[key] = result
     try:
