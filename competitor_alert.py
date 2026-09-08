@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from article_crawler import SupabaseClient  # noqa: E402
 from weekly_email_report import send_email  # noqa: E402
 import competitor_audit as audit  # noqa: E402
+import sustainability_expert_common as common  # noqa: E402
 
 DEFAULT_AUTO_SEND_THRESHOLD = 0.85
 
@@ -34,11 +35,11 @@ def get_auto_send_threshold(config: dict) -> float:
         "auto_send_confidence_threshold", DEFAULT_AUTO_SEND_THRESHOLD)
 
 
-def list_recipients(client: SupabaseClient, notify_field: str) -> list:
-    rows = client.select("competitor_recipients", {
-        "select": "email", "active": "eq.true", notify_field: "eq.true",
-    })
-    return [r["email"] for r in rows]
+def list_recipients(client: SupabaseClient, notify_field: str, test_mode: bool = False) -> list:
+    """common.list_recipients()への薄いラッパー（既存呼び出し元との後方互換のため維持）。
+    weekly_email_report.pyとの相互import（circular import）を避けるため、実体は
+    sustainability_expert_common.pyに置いている"""
+    return common.list_recipients(client, notify_field, test_mode=test_mode)
 
 
 def build_alert_email(company: dict, change_event: dict) -> tuple:

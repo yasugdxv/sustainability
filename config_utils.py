@@ -56,6 +56,27 @@ def build_config_from_env() -> dict:
         config["sustainability_expert"] = {
             "enabled": os.environ.get("SUSTAINABILITY_EXPERT_ENABLED", "").strip().lower() in ("1", "true", "yes"),
         }
+    if os.environ.get("GEO_INTELLIGENCE_ENABLED") or os.environ.get("GEO_INTELLIGENCE_BASE_URL"):
+        config["geo_intelligence"] = {
+            "enabled": os.environ.get("GEO_INTELLIGENCE_ENABLED", "").strip().lower() in ("1", "true", "yes"),
+            "base_url": os.environ.get("GEO_INTELLIGENCE_BASE_URL", ""),
+            "query_path": os.environ.get("GEO_INTELLIGENCE_QUERY_PATH", "/api/v1/geo-intelligence/query"),
+            "timeout_seconds": os.environ.get("GEO_INTELLIGENCE_TIMEOUT_SECONDS", "20"),
+            "api_key": os.environ.get("GEO_INTELLIGENCE_API_KEY", ""),
+            "max_retries": os.environ.get("GEO_INTELLIGENCE_MAX_RETRIES", "2"),
+        }
+    if os.environ.get("SUSTAINABILITY_WEEKLY_GEO_ENABLED"):
+        # Phase S2: Weekly x Geo Intelligence Batch Inquiryの個別Kill Switch
+        # （geo_intelligence.enabled＝Geo機能全体のKill Switchとは別枠。sustainability_expertブロックと同型）
+        config.setdefault("geo_intelligence", {})["weekly_monitoring"] = {
+            "enabled": os.environ.get("SUSTAINABILITY_WEEKLY_GEO_ENABLED", "").strip().lower() in ("1", "true", "yes"),
+        }
+    if os.environ.get("SUSTAINABILITY_CHAT_GEO_ENABLED"):
+        # Phase S3: Sustainability AI Chat x Geo Intelligenceの個別Kill Switch
+        # （geo_intelligence.enabled＝Geo機能全体のKill Switch、weekly_monitoringとはそれぞれ別枠）
+        config.setdefault("geo_intelligence", {})["chat"] = {
+            "enabled": os.environ.get("SUSTAINABILITY_CHAT_GEO_ENABLED", "").strip().lower() in ("1", "true", "yes"),
+        }
     return config
 
 

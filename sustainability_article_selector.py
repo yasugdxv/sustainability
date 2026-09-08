@@ -1,7 +1,7 @@
 """
-当社サスティナビリティ専門家MVP: 記事選定パイプライン
+当社サステナビリティ専門家MVP: 記事選定パイプライン
 
-収集済み記事(事象クラスタ単位)を、当社サスティナビリティの公式方針・重点テーマ・
+収集済み記事(事象クラスタ単位)を、当社サステナビリティの公式方針・重点テーマ・
 中長期目標との関連性で評価し、publish_candidate / watch_or_archive / not_selected に
 分類する。コンテンツ生成(sustainability_content_generator.py)とは必ず別のLLM呼び出しにする。
 
@@ -31,6 +31,7 @@ from article_crawler import SupabaseClient, load_config  # noqa: E402
 from ai_client import make_openai_client  # noqa: E402
 import sustainability_expert_common as common  # noqa: E402
 from sustainability_knowledge_store import get_knowledge_store  # noqa: E402
+import article_filter  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -47,6 +48,14 @@ def list_candidate_cluster_ids(client, since_days: int = None, article_ids: list
     if article_ids:
         params["article_id"] = f"in.({','.join(article_ids)})"
     articles = client.select("articles", params)
+
+    suppressed_ids = {
+        a["article_id"] for a in common._select_in_chunks(
+            client, "article_analysis", {"select": "article_id,representative_role"},
+            "article_id", [a["article_id"] for a in articles])
+        if a.get("representative_role") == "suppressed_duplicate"
+    }
+    articles = [a for a in articles if a["article_id"] not in suppressed_ids]
 
     if since_days is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
@@ -78,18 +87,102 @@ def list_candidate_cluster_ids(client, since_days: int = None, article_ids: list
 
 RANK_ORDER = {"S": 0, "A": 1, "B": 2, "C": 3, "D": 4, None: 5}
 
+# Tier0〜3の設定値。2026-08-03 PMOフィードバック（重要度判定仕様・記事掲載ルールへの
+# フィードバック v0.1）反映済み。
+# - Tier1（マテリアリティ接続タグワイルドカード）は廃止。マテリアリティ紐付けは月次の
+#   外部環境スクリーニングシート更新（Step2）が別途担当するため。
+# - Tier0の対象は「主要9テーマ＋横断2軸（情報開示／ESG評価・サステナブルファイナンス）」。
+#   PMOのテーマ体系（主要9軸＋横断2軸＋下位5軸）に合わせ、この2つの横断タグはTier2ではなく
+#   Tier0（無条件・上位N件）側で扱う。
+TIER0_RANK_FLOOR = {"S", "A", "B"}
+TIER0_PROMOTED_CROSS_CUTTING_IDS = {"CR-01", "CR-02"}  # 情報開示／ESG評価・サステナブルファイナンス
+# 自社（サントリーグループ）発の記事は、週次ダイジェスト・重要度判定の候補選定から除外する
+# （PMO 2026-08-18フィードバック3章(2)。自社サイトの開示自体は競合モニタリング側で別途収集する）
+OWN_COMPANY_TAG_ID = "SJ-12"
+# Tier0内で「規制・基準系」と「企業・業界の取組事例系」の双方が一定数含まれるよう配慮する
+# （記事種別タグ AT-01規制・法律／AT-03基準・イニシアチブ を規制・基準系、AT-02企業活動を
+# 取組事例系とみなす）
+REGULATORY_TYPE_ROOT_IDS = {"AT-01", "AT-03"}
+CORPORATE_TYPE_ROOT_IDS = {"AT-02"}
 
-def list_theme_prioritized_cluster_ids(client, all_urls: dict, top_n: int = 10) -> list:
-    """テーマ大分類（tag_axis='テーマ'）ごとに、importance_level+importance_total_scoreが
-    上位N件の事象クラスタのみを候補とする。加えて、マテリアリティ接続タグ（tag_axis='マテリアリティ接続'）
-    が付いたクラスタは、テーマ別の上位N件に入っていなくても無条件で候補に含める（ワイルドカード）。
+CROSS_CUTTING_RANK_FLOOR = {"S", "A"}
+CROSS_CUTTING_TOP_N_DEFAULT = 10
+SUB_AXIS_PARENT_TAG_ID = "TH-10"  # 下位種別（下位5軸の親大分類）
+SUB_AXIS_RANK_FLOOR = {"S", "A"}
+SUB_AXIS_TOP_N_DEFAULT = 5
+# 下位軸の監視閾値（要件定義案2.5）は次の3条件：
+#   (i) 主要地理・グローバルでの規制の新設・重要改定
+#   (ii) 業界に波及しうる重大訴訟・不祥事
+#   (iii) 基準・団体の統廃合
+# 専用のLLM出力フィールドが未実装のため、暫定的に既存の「閾値語（横断）」キーワードグループ
+# への本文一致を代理指標として使う（このグループには(i)(ii)を捉える語彙も含める必要がある）。
+SUB_AXIS_THRESHOLD_KEYWORD_GROUP = "閾値語（横断）"
+
+
+def _load_threshold_patterns(client) -> list:
+    rows = client.select("filter_keywords", {
+        "select": "keyword_text",
+        "keyword_group": f"eq.{SUB_AXIS_THRESHOLD_KEYWORD_GROUP}",
+        "status": "eq.有効",
+    })
+    return [article_filter._compile(r["keyword_text"]) for r in rows]
+
+
+def _matches_threshold_condition(patterns: list, title: str, body: str) -> bool:
+    haystack = (title or "") + "\n" + (body or "")[:1000]
+    return any(p.search(haystack) for p in patterns)
+
+
+def _stratified_top_n(candidate_ids: list, clusters: dict, top_n: int) -> list:
+    """スコア上位を優先しつつ、規制・基準系(regulatory_type)と企業・業界の取組事例系
+    (corporate_type)の双方が一定数含まれるよう配慮する（PMO 2026-08-03フィードバック④）。
+    各タイプについて上限top_n//2件を優先確保し、残り枠は全体のスコア順で埋める。"""
+    half = -(-top_n // 2)  # 切り上げ
+    regulatory = sorted((c for c in candidate_ids if clusters[c]["regulatory_type"]),
+                         key=lambda c: clusters[c]["best_key"])[:half]
+    corporate = sorted((c for c in candidate_ids if clusters[c]["corporate_type"]),
+                        key=lambda c: clusters[c]["best_key"])[:half]
+
+    picked, seen = [], set()
+    for cid in regulatory + corporate:
+        if cid not in seen:
+            seen.add(cid)
+            picked.append(cid)
+
+    if len(picked) < top_n:
+        remaining = sorted((c for c in candidate_ids if c not in seen),
+                            key=lambda c: clusters[c]["best_key"])
+        picked.extend(remaining[:top_n - len(picked)])
+
+    picked.sort(key=lambda c: clusters[c]["best_key"])
+    return picked[:top_n]
+
+
+def list_theme_prioritized_cluster_ids(client, all_urls: dict, top_n: int = 10,
+                                        top_n_cross_cutting: int = CROSS_CUTTING_TOP_N_DEFAULT,
+                                        top_n_sub_axis: int = SUB_AXIS_TOP_N_DEFAULT) -> list:
+    """主要9テーマ＋横断2軸（情報開示／ESG評価・サステナブルファイナンス）ごとに、
+    ランクB以上かつimportance_total_score上位N件の事象クラスタのみを候補とする（Tier0）。
+    各テーマ・軸の上位N件選定では、規制・基準系と企業・業界の取組事例系の双方が
+    一定数含まれるよう配慮する（_stratified_top_n）。
+
+    Tier0で拾いきれない記事を取りこぼさないよう、以下の2つのワイルドカードを追加する：
+      - Tier2: 横断タグ（Tier0に昇格した2軸を除く）が付き、ランクS・Aの事象クラスタを、
+        スコア降順で上位top_n_cross_cutting件まで候補に加える
+      - Tier3: 下位軸タグ（テーマ軸のTH-10配下の小分類）が付き、ランクS・A、かつ
+        「閾値語（横断）」キーワードへの本文一致（3条件の代理判定）がある事象クラスタを、
+        スコア降順で上位top_n_sub_axis件まで候補に加える
 
     全クラスタをLLMで評価するとコストが大きいため、重要度が既に高い/戦略的に重要とわかっている
     クラスタに絞ってLLM選定を行うための事前フィルタ。"""
     tag_rows = client.select("tag_reference", {"select": "tag_id,tag_axis,tag_level,parent_tag_id"})
     tag_by_id = {t["tag_id"]: t for t in tag_rows}
     theme_major_ids = {t["tag_id"] for t in tag_rows if t["tag_axis"] == "テーマ" and t["tag_level"] == "大分類"}
-    materiality_tag_ids = {t["tag_id"] for t in tag_rows if t["tag_axis"] == "マテリアリティ接続"}
+    cross_cutting_tag_ids = {t["tag_id"] for t in tag_rows if t["tag_axis"] == "横断"}
+    cross_cutting_tag_ids -= TIER0_PROMOTED_CROSS_CUTTING_IDS
+    sub_axis_tag_ids = {t["tag_id"] for t in tag_rows if t.get("parent_tag_id") == SUB_AXIS_PARENT_TAG_ID}
+
+    tier0_bucket_ids = (theme_major_ids - {SUB_AXIS_PARENT_TAG_ID}) | TIER0_PROMOTED_CROSS_CUTTING_IDS
 
     def theme_major_of(tag_id: str) -> str | None:
         """tag_idがテーマ軸の（小分類含む）タグなら、対応する大分類のtag_idを返す。テーマ軸以外はNone"""
@@ -104,43 +197,119 @@ def list_theme_prioritized_cluster_ids(client, all_urls: dict, top_n: int = 10) 
             t = tag_by_id.get(t.get("parent_tag_id"))
         return None
 
-    articles = client.select("articles", {"select": "article_id,article_url_id", "is_current": "eq.true"})
+    def article_type_root_of(tag_id: str) -> str | None:
+        """tag_idが記事種別軸のタグなら、対応する大分類のtag_idを返す。それ以外はNone"""
+        t = tag_by_id.get(tag_id)
+        if not t or t["tag_axis"] != "記事種別":
+            return None
+        if t["tag_level"] == "大分類":
+            return t["tag_id"]
+        parent = tag_by_id.get(t.get("parent_tag_id"))
+        return parent["tag_id"] if parent else None
+
+    own_company_target_ids = {
+        t["crawl_target_id"] for t in client.select(
+            "crawl_targets", {"select": "crawl_target_id,publisher_tag_id"})
+        if t.get("publisher_tag_id") == OWN_COMPANY_TAG_ID
+    }
+    articles = client.select("articles", {
+        "select": "article_id,article_url_id,crawl_target_id", "is_current": "eq.true"})
+    articles = [a for a in articles if a.get("crawl_target_id") not in own_company_target_ids]
     analysis_by_article = {
         a["article_id"]: a for a in client.select(
-            "article_analysis", {"select": "article_id,importance_level,importance_total_score"})
+            "article_analysis", {"select": "article_id,importance_level,importance_total_score,"
+                                            "representative_role"})
     }
+    # 一次情報の要約・言い換えに留まると判定された二次記事(representative_role=
+    # suppressed_duplicate)は、そもそも選定用LLM評価の候補にしない。一次情報側は
+    # 本ロジックと無関係に通常通り評価される（article_analyzer.py参照）
+    articles = [a for a in articles
+                if analysis_by_article.get(a["article_id"], {}).get("representative_role")
+                != "suppressed_duplicate"]
     tags_by_article = defaultdict(set)
     for r in client.select("article_tags", {"select": "article_id,tag_id"}):
         tags_by_article[r["article_id"]].add(r["tag_id"])
 
-    # クラスタ単位に集約：所属テーマ大分類（複数可）、マテリアリティ接続の有無、
-    # クラスタ内で最も評価が高い記事のimportance_level/スコアを代表値とする
-    clusters = defaultdict(lambda: {"themes": set(), "materiality": False, "best_key": None})
+    # クラスタ単位に集約：所属テーマ大分類・Tier0昇格軸（複数可）、横断・下位軸タグの有無、
+    # 記事種別（規制・基準系／企業取組系）、クラスタ内で最も評価が高い記事の
+    # importance_level/スコアを代表値とする
+    clusters = defaultdict(lambda: {"themes": set(), "cross_cutting": False, "sub_axis": False,
+                                     "regulatory_type": False, "corporate_type": False,
+                                     "article_ids": set(), "best_key": None, "best_rank": None})
     for a in articles:
         article_id = a["article_id"]
         url_row = all_urls.get(a["article_url_id"], {"article_url_id": a["article_url_id"]})
         root = common.resolve_cluster_root(url_row, all_urls)
         c = clusters[root]
+        c["article_ids"].add(article_id)
         for tag_id in tags_by_article.get(article_id, ()):
             theme = theme_major_of(tag_id)
             if theme:
                 c["themes"].add(theme)
-            if tag_id in materiality_tag_ids:
-                c["materiality"] = True
+            if tag_id in TIER0_PROMOTED_CROSS_CUTTING_IDS:
+                c["themes"].add(tag_id)
+            if tag_id in cross_cutting_tag_ids:
+                c["cross_cutting"] = True
+            if tag_id in sub_axis_tag_ids:
+                c["sub_axis"] = True
+            art_type_root = article_type_root_of(tag_id)
+            if art_type_root in REGULATORY_TYPE_ROOT_IDS:
+                c["regulatory_type"] = True
+            if art_type_root in CORPORATE_TYPE_ROOT_IDS:
+                c["corporate_type"] = True
 
         an = analysis_by_article.get(article_id, {})
         score = an.get("importance_total_score")
-        key = (RANK_ORDER.get(an.get("importance_level"), 5), -(score if score is not None else -1))
+        level = an.get("importance_level")
+        key = (RANK_ORDER.get(level, 5), -(score if score is not None else -1))
         if c["best_key"] is None or key < c["best_key"]:
             c["best_key"] = key
+            c["best_rank"] = level
 
+    # Tier0: 主要9テーマ＋横断2軸ごとに、ランクB以上のクラスタから上位N件
+    # （規制・基準系／企業取組系のバランスに配慮）
     selected = set()
-    for theme_id in theme_major_ids:
-        candidates = [cid for cid, c in clusters.items() if theme_id in c["themes"]]
-        candidates.sort(key=lambda cid: clusters[cid]["best_key"])
-        selected.update(candidates[:top_n])
+    for bucket_id in tier0_bucket_ids:
+        candidates = [cid for cid, c in clusters.items()
+                      if bucket_id in c["themes"] and c["best_rank"] in TIER0_RANK_FLOOR]
+        selected.update(_stratified_top_n(candidates, clusters, top_n))
 
-    selected.update(cid for cid, c in clusters.items() if c["materiality"])
+    # Tier2: 横断タグ（Tier0昇格分を除く）＋S・Aランクの孤立クラスタを、スコア降順で上位N件まで追加
+    cross_cutting_pool = [
+        cid for cid, c in clusters.items()
+        if c["cross_cutting"] and cid not in selected and c["best_rank"] in CROSS_CUTTING_RANK_FLOOR
+    ]
+    cross_cutting_pool.sort(key=lambda cid: clusters[cid]["best_key"])
+    selected.update(cross_cutting_pool[:top_n_cross_cutting])
+
+    # Tier3: 下位軸タグ＋S・Aランク＋3条件（閾値語キーワードでの代理判定）の孤立クラスタを、
+    # スコア降順で上位N件まで追加
+    sub_axis_pool_raw = [
+        cid for cid, c in clusters.items()
+        if c["sub_axis"] and cid not in selected and c["best_rank"] in SUB_AXIS_RANK_FLOOR
+    ]
+    if sub_axis_pool_raw:
+        threshold_patterns = _load_threshold_patterns(client)
+        candidate_article_ids = sorted({
+            aid for cid in sub_axis_pool_raw for aid in clusters[cid]["article_ids"]
+        })
+        article_text_by_id = {
+            a["article_id"]: a for a in client.select(
+                "articles", {"select": "article_id,title,extracted_text",
+                             "article_id": f"in.({','.join(candidate_article_ids)})"})
+        }
+
+        def _cluster_meets_threshold(cid: str) -> bool:
+            for aid in clusters[cid]["article_ids"]:
+                art = article_text_by_id.get(aid)
+                if art and _matches_threshold_condition(threshold_patterns, art.get("title"),
+                                                         art.get("extracted_text")):
+                    return True
+            return False
+
+        sub_axis_pool = [cid for cid in sub_axis_pool_raw if _cluster_meets_threshold(cid)]
+        sub_axis_pool.sort(key=lambda cid: clusters[cid]["best_key"])
+        selected.update(sub_axis_pool[:top_n_sub_axis])
 
     return sorted(selected)
 
@@ -410,7 +579,7 @@ def select_clusters_batch(client, azure_client, model: str, knowledge_store, exp
 
 # ─── メイン ───────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="当社サスティナビリティ記事選定パイプライン")
+    parser = argparse.ArgumentParser(description="当社サステナビリティ記事選定パイプライン")
     parser.add_argument("limit", nargs="?", type=int, default=None, help="先頭N件だけ処理（テスト用）")
     parser.add_argument("--since-days", type=int, default=None, help="直近N日分の記事のみ対象")
     parser.add_argument("--article-ids", type=str, default=None, help="カンマ区切りのarticle_id指定")

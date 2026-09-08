@@ -1,5 +1,5 @@
 """
-当社サスティナビリティ専門家MVP: 共通処理モジュール
+当社サステナビリティ専門家MVP: 共通処理モジュール
 
 記事選定(sustainability_article_selector.py)とコンテンツ生成
 (sustainability_content_generator.py)の両方から使う共通部品をまとめる。
@@ -276,6 +276,9 @@ def categorize_tags(tag_ids: list, tag_ref_by_id: dict) -> dict:
     cross = [_major_category_name(t, tag_ref_by_id) for t in by_axis.get("横断", [])]
     subjects = [_major_category_name(t, tag_ref_by_id) for t in by_axis.get("主体", [])]
     materiality_codes = [t["tag_code"] for t in by_axis.get("マテリアリティ接続", []) if t.get("tag_code")]
+    # テーマ軸の小分類タグ名（検索画面のタグ絞り込みを大分類だけでなく
+    # 小分類まで指定できるようにするため、2026-09-02追加）
+    theme_subtags = [t["tag_name"] for t in by_axis.get("テーマ", []) if t["tag_level"] == "小分類"]
 
     def _dedup(items):
         return list(dict.fromkeys(items))
@@ -285,6 +288,7 @@ def categorize_tags(tag_ids: list, tag_ref_by_id: dict) -> dict:
         "cross_tags": _dedup(cross),
         "subject_tags": _dedup(subjects),
         "materiality_codes": _dedup(materiality_codes),
+        "theme_subtags": _dedup(theme_subtags),
     }
 
 
@@ -307,11 +311,22 @@ def fetch_articles_with_tags(client, since_days: int, ranks: tuple = None) -> li
     LLM分析自体を行っていないスタブ行)は常に除外する。
     （旧: weekly_email_report.fetch_ranked_articles と
     sustainability_dashboard_core.fetch_dashboard_articles にほぼ同一のロジックが
-    個別実装されていたものを統合）"""
+    個別実装されていたものを統合）
+
+    性能: 以前はarticlesをanalysis由来のid集合（全期間分、実測3709件）でchunk取得したのち
+    Python側で日付フィルタしており、chunk数の多さ（100件区切りで約38回）が最も時間を
+    要していた（実測: 2573件で60秒超）。articlesテーブル自体をDB側で日付フィルタして
+    直接取得することで、この「idでchunk取得」という工程を無くす。article_tagsのchunk対象も
+    「analysisにも日付内articlesにも存在するid」に絞り込み、chunk数自体を削減する。
+    published_atがNULLの行は現状存在しないが、将来発生しても従来の「日付不明なら除外しない」
+    挙動を壊さないよう、DB側フィルタもgte単独ではなく`or=(published_at.gte.X,published_at.is.null)`
+    で組む。"""
     cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    cutoff_iso = cutoff.isoformat()
 
     params = {
         "select": "analysis_id,article_id,summary_short,importance_level,importance_reason,"
+                  "importance_total_score,importance_scores,needs_review,"
                   "publication_category,analysis_status",
         "is_current": "eq.true",
         "analysis_status": "not.in.(差戻し,フィルタ除外)",
@@ -322,20 +337,21 @@ def fetch_articles_with_tags(client, since_days: int, ranks: tuple = None) -> li
     if not analyses:
         return []
 
-    article_ids = [a["article_id"] for a in analyses]
-    articles = _select_in_chunks(client, "articles", {
+    articles = client.select("articles", {
         "select": "article_id,article_url_id,title,extracted_text,published_at,fetched_at,"
                   "final_url,fetched_url,crawl_target_id",
         "is_current": "eq.true",
-    }, "article_id", article_ids)
+        "or": f"(published_at.gte.{cutoff_iso},published_at.is.null)",
+    })
     articles_by_id = {a["article_id"]: a for a in articles}
+    relevant_ids = [a["article_id"] for a in analyses if a["article_id"] in articles_by_id]
 
     targets = {t["crawl_target_id"]: t for t in client.select(
         "crawl_targets", {"select": "crawl_target_id,publisher_name"})}
 
     tag_rows = _select_in_chunks(client, "article_tags", {
         "select": "article_id,tag_id",
-    }, "article_id", article_ids)
+    }, "article_id", relevant_ids)
     tag_ref_by_id = {t["tag_id"]: t for t in client.select(
         "tag_reference", {"select": "tag_id,tag_axis,tag_level,tag_code,tag_name,parent_tag_id"})}
     tags_by_article: dict = {}
@@ -348,12 +364,6 @@ def fetch_articles_with_tags(client, since_days: int, ranks: tuple = None) -> li
         if not article:
             continue
         pub_dt = article.get("published_at")
-        if pub_dt:
-            try:
-                if dateutil_parser.parse(pub_dt) < cutoff:
-                    continue
-            except Exception:
-                pass
 
         tag_ids = tags_by_article.get(a["article_id"], [])
         categorized = categorize_tags(tag_ids, tag_ref_by_id)
@@ -383,7 +393,10 @@ class ExpertLLMError(Exception):
     """Schema検証が最終的に失敗した場合、またはLLM呼び出し自体が失敗した場合"""
 
 
-def _extract_json_object(text: str) -> dict:
+def extract_json_object(text: str) -> dict:
+    """LLM出力からJSON1個を抽出する（```json コードブロック優先、無ければ{}を検出）。
+    call_llm_structured()の手動抽出フォールバック、およびresponses APIのoutput_text等
+    schema強制なしの自由記述レスポンス（competitor_disclosure_verifier.py等）の両方で使う"""
     text = (text or "").strip()
     m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
     if m:
@@ -409,13 +422,17 @@ def _usage_dict(resp) -> dict:
 
 
 def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str,
-                         schema: dict, schema_name: str) -> dict:
+                         schema: dict, schema_name: str, temperature: float = 0.2) -> dict:
     """schemaに準拠したJSONを1個取得する。
 
     Azure OpenAIの構造化出力(response_format=json_schema)が使える場合はそれを使う。
     使えない場合（古いAPIバージョン等でエラーになる場合）は、通常のJSON生成 →
     サーバー側でSchema検証 → 検証失敗時に最大1回だけ修正再実行、という流れにフォールバックする。
     それでも失敗した場合は ExpertLLMError を送出する（呼び出し側でexpert_runsにエラー記録する）。
+
+    temperatureは既定0.2（従来通り）。競合目標DB抽出のように「同じ入力からは毎回同じ
+    構造化結果を返してほしい」タスクでは、呼び出し側でより低い値（例: 0）を指定できる
+    （2026-08-24追加。既定値は変更していないため既存呼び出し元の挙動は変わらない）。
 
     戻り値: {"data": dict, "mode": str, "token_usage": dict, "latency_ms": int}
     """
@@ -433,7 +450,7 @@ def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str
                 "type": "json_schema",
                 "json_schema": {"name": schema_name, "schema": schema, "strict": False},
             },
-            temperature=0.2,
+            temperature=temperature,
         )
         data = json.loads(resp.choices[0].message.content)
         jsonschema.validate(data, schema)
@@ -448,10 +465,10 @@ def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str
         {"role": "system", "content": system_prompt + "\n\n必ずJSON1個のみを出力すること。説明文・Markdown装飾は不要。"},
         {"role": "user", "content": user_prompt},
     ]
-    resp = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
+    resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
     raw = resp.choices[0].message.content
     try:
-        data = _extract_json_object(raw)
+        data = extract_json_object(raw)
         jsonschema.validate(data, schema)
         latency_ms = int((time.monotonic() - started) * 1000)
         return {"data": data, "mode": "manual_json", "token_usage": _usage_dict(resp),
@@ -466,11 +483,11 @@ def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str
         "content": f"前回の出力はJSON Schema検証に失敗しました: {first_error}\n"
                     f"Schemaに厳密に従うJSON1個のみを再出力してください。",
     })
-    resp2 = client.chat.completions.create(model=model, messages=messages, temperature=0.2)
+    resp2 = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
     raw2 = resp2.choices[0].message.content
     latency_ms = int((time.monotonic() - started) * 1000)
     try:
-        data2 = _extract_json_object(raw2)
+        data2 = extract_json_object(raw2)
         jsonschema.validate(data2, schema)
         combined_usage = _usage_dict(resp)
         u2 = _usage_dict(resp2)
@@ -556,3 +573,42 @@ def find_existing_success_run(client, *, article_cluster_id: str, task_type: str
         "limit": "1",
     })
     return rows[0] if rows else None
+
+
+# ─── 配信先（DB管理。email_recipients） ────────────────────────────
+# 週次ダイジェスト(weekly_email_report.py)・競合速報/月次(competitor_alert.py経由)の
+# 全メール種別が共有する配信先解決処理。weekly_email_report.py⇄competitor_alert.pyの
+# 相互import（circular import）を避けるため、両者から参照されるこのモジュールに置く
+def list_recipients(client, notify_field: str, test_mode: bool = False) -> list:
+    """email_recipientsから宛先を取得する。test_mode=Falseなら本番受信者
+    （is_test=false）のみ、test_mode=Trueならテスト受信者（is_test=true）のみを返す
+    （本番・テストが混ざって誤送信しないよう、常にどちらか一方だけを対象にする）"""
+    rows = client.select("email_recipients", {
+        "select": "email", "active": "eq.true", notify_field: "eq.true",
+        "is_test": f"eq.{'true' if test_mode else 'false'}",
+    })
+    return [r["email"] for r in rows]
+
+
+# ─── LLM自由記述レスポンスからの引用URL抽出 ─────────────────────────────
+# article_analyzer.pyの_extract_evidenceと同等の処理。extract_json_object()（上記）と合わせ、
+# competitor_disclosure_verifier.py（一次開示照合、Web検索を伴う）でも使う。article_analyzer.py
+# 自体は変更しない（既存の記事分析パイプラインの挙動に影響を与えないため）
+def extract_url_citations(resp) -> list:
+    """Azure OpenAI responses APIのannotations(url_citation)だけをエビデンスとして拾う。
+    本文中の自由記述URLは信用しない（幻覚URLを排除するため）"""
+    evidence = []
+    seen_urls = set()
+    for item in getattr(resp, "output", []) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for c in getattr(item, "content", []) or []:
+            for ann in getattr(c, "annotations", None) or []:
+                if getattr(ann, "type", None) != "url_citation":
+                    continue
+                url = getattr(ann, "url", None)
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                evidence.append({"url": url, "title": getattr(ann, "title", None)})
+    return evidence

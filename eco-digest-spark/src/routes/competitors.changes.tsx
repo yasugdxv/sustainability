@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { TopBar } from "@/components/top-bar";
 import { relativeTime, useCompetitorChanges, useCompetitorCompanies } from "@/lib/api";
 import {
@@ -31,6 +31,7 @@ function CompetitorChangesPage() {
   const { lang, t } = useLanguage();
   const [companyId, setCompanyId] = useState("");
   const [theme, setTheme] = useState("");
+  const [goalCategory, setGoalCategory] = useState("");
   const [sort, setSort] = useState<SortOption>("createdAtDesc");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -45,7 +46,19 @@ function CompetitorChangesPage() {
     dateTo: dateTo || undefined,
   });
   const companies = companiesData?.companies ?? [];
-  const changes = data?.changes ?? [];
+  const allChanges = data?.changes ?? [];
+
+  // 目標カテゴリの選択肢は、現在の絞り込み結果に登場するものだけを動的に出す
+  const goalCategoryOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const c of allChanges) {
+      if (c.goalCategoryId && c.goalCategoryName) seen.set(c.goalCategoryId, c.goalCategoryName);
+    }
+    return [...seen.entries()];
+  }, [allChanges]);
+  const changes = goalCategory
+    ? allChanges.filter((c) => c.goalCategoryId === goalCategory)
+    : allChanges;
 
   return (
     <>
@@ -73,7 +86,13 @@ function CompetitorChangesPage() {
               ))}
             </SelectContent>
           </Select>
-          <Select value={theme || "all"} onValueChange={(v) => setTheme(v === "all" ? "" : v)}>
+          <Select
+            value={theme || "all"}
+            onValueChange={(v) => {
+              setTheme(v === "all" ? "" : v);
+              setGoalCategory("");
+            }}
+          >
             <SelectTrigger className="w-48">
               <SelectValue placeholder={t("competitor.filter.allThemes")} />
             </SelectTrigger>
@@ -81,6 +100,17 @@ function CompetitorChangesPage() {
               <SelectItem value="all">{t("competitor.filter.allThemes")}</SelectItem>
               {COMPETITOR_THEMES.map((th) => (
                 <SelectItem key={th} value={th}>{themeLabel(th, lang)}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={goalCategory || "all"} onValueChange={(v) => setGoalCategory(v === "all" ? "" : v)}>
+            <SelectTrigger className="w-56">
+              <SelectValue placeholder={t("competitor.filter.allGoalCategories")} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("competitor.filter.allGoalCategories")}</SelectItem>
+              {goalCategoryOptions.map(([id, name]) => (
+                <SelectItem key={id} value={id}>{name}</SelectItem>
               ))}
             </SelectContent>
           </Select>
@@ -128,6 +158,7 @@ function CompetitorChangesPage() {
                     <Badge variant="outline">{recordTypeLabel(c.recordType, lang)}</Badge>
                     {c.changeType && <Badge variant="secondary">{changeTypeLabel(c.changeType, lang)}</Badge>}
                     {c.direction && <Badge variant="outline">{directionLabel(c.direction, lang)}</Badge>}
+                    {c.goalCategoryName && <Badge variant="outline">{c.goalCategoryName}</Badge>}
                     {c.reviewRequired && (
                       <Badge variant="destructive">{t("competitor.changes.reviewBadge")}</Badge>
                     )}

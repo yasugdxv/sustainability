@@ -90,7 +90,7 @@ create index weekly_email_reports_period_idx
 
 comment on table public.weekly_email_reports is
     '週次メールレポート(weekly_email_report.py)の実行ログ。対象記事・トークン使用量・
-     送信結果を記録する（サスティナビリティ専門家MVPのexpert_runsとは別系統）';
+     送信結果を記録する（サステナビリティ専門家MVPのexpert_runsとは別系統）';
 comment on column public.weekly_email_reports.article_ids is
     'このレポートに掲載した記事(articles.article_id)の一覧';
 comment on column public.weekly_email_reports.token_usage is

@@ -29,13 +29,19 @@ import competitor_audit as audit  # noqa: E402
 
 
 def collect_today_change_events(client: SupabaseClient) -> list:
-    """本日(UTC日付)確定した変更イベントを取得する。
+    """本日(UTC日付)確定した変更イベントのうち、一次開示照合が完了したものを取得する。
     実績(ACTUAL)・ESG評価(ESG_RATING)の変化は日次ダイジェストの対象外
-    （目標・KPIの変更のみを扱う。実績更新は月次メールでまとめて報告する）"""
+    （目標・KPIの変更のみを扱う。実績更新は月次メールでまとめて報告する）。
+
+    2026-08-24追加: verification_status='VERIFIED'のみを対象にする（competitor_disclosure_
+    verifier.py参照）。WORDING_ONLY等の非実質変更や、一次開示で確認できなかった変更
+    （PARTIALLY_VERIFIED/UNVERIFIED/CONTRADICTED）は自動速報の対象から除外される
+    （DBには残るため、レビュー画面やDBから個別に確認は可能）"""
     today = datetime.now(timezone.utc).date().isoformat()
     events = client.select("competitor_change_events", {
         "select": "*", "created_at": f"gte.{today}T00:00:00+00:00",
         "record_type": "in.(TARGET,KPI)",
+        "verification_status": "eq.VERIFIED",
         "order": "created_at.asc",
     })
     return [e for e in events if e["created_at"][:10] == today]
@@ -90,6 +96,19 @@ def _render_event_item(e: dict, target_records: dict) -> str:
                 f'判定根拠: {_esc(e.get("reasoning_summary"))}</p>'
                 if e.get("review_required") and e.get("reasoning_summary") else "")
 
+    # 一次開示照合結果（competitor_disclosure_verifier.py）。ダイジェスト対象は既に
+    # verification_status='VERIFIED'のみに絞られているため、ここでは常に確認済みバッジ＋
+    # 原典リンクのみを短く添える（メール本文を長くしないため、根拠テキストまでは載せない）
+    primary_source_html = ""
+    if e.get("primary_source_url"):
+        doc_type = e.get("primary_source_document_type")
+        link_label = f"Primary Source（{_esc(doc_type)}）" if doc_type else "Primary Source"
+        primary_source_html = (
+            f'<p style="margin:4px 0 0;font-size:11px;">'
+            f'<span style="color:#1e7a4c;font-weight:700;">✓ 一次開示確認済み</span>　'
+            f'<a href="{_esc(e["primary_source_url"])}" style="color:#064f8a;">{link_label}</a></p>'
+        )
+
     return f"""
     <div style="background:#fbfdff;border:1px solid #c7d6e6;border-left:4px solid #2f6fa8;
                 border-radius:6px;padding:10px 12px;margin:0 0 8px;">
@@ -98,6 +117,7 @@ def _render_event_item(e: dict, target_records: dict) -> str:
       {diff_html}
       <p style="margin:0;font-size:13px;color:#0b1220;line-height:1.6;">{_esc(e.get('summary'))}</p>
       {footnote}
+      {primary_source_html}
     </div>"""
 
 
@@ -144,8 +164,8 @@ def build_email(events: list, companies: dict, digest_date: str, target_records:
     return subject, html
 
 
-def list_recipients(client: SupabaseClient) -> list:
-    return competitor_alert.list_recipients(client, "notify_immediate_alert")
+def list_recipients(client: SupabaseClient, test_mode: bool = False) -> list:
+    return competitor_alert.list_recipients(client, "notify_immediate_alert", test_mode=test_mode)
 
 
 def save_or_update_digest(client: SupabaseClient, *, digest_date: str, change_event_ids: list,
@@ -207,8 +227,8 @@ def build_digest(client: SupabaseClient, config: dict) -> dict:
     )
 
     if auto_send_eligible:
-        recipients = list_recipients(client)
-        result = send_email(subject, html_body, config)
+        recipients = list_recipients(client)  # 自動配信は常に本番受信者（test_mode=False）
+        result = send_email(subject, html_body, config, recipients)
         record_send_result(
             client, digest["digest_id"], recipients=recipients,
             send_status="success" if result.get("ok") else "error",
@@ -243,7 +263,7 @@ def reject_digest(client: SupabaseClient, digest_id: str, reviewer_id: str,
 
 
 def approve_and_send(client: SupabaseClient, config: dict, digest_id: str, reviewer_id: str,
-                      reviewer_feedback: dict = None) -> dict:
+                      reviewer_feedback: dict = None, test_mode: bool = False) -> dict:
     rows = client.select("competitor_daily_alert_digests", {"digest_id": f"eq.{digest_id}", "limit": "1"})
     digest = rows[0] if rows else None
     if digest is None:
@@ -256,8 +276,8 @@ def approve_and_send(client: SupabaseClient, config: dict, digest_id: str, revie
         "reviewer_feedback": reviewer_feedback, "reviewed_at": datetime.now(timezone.utc).isoformat(),
     })
 
-    recipients = list_recipients(client)
-    result = send_email(digest["subject"], digest["html_body"], config)
+    recipients = list_recipients(client, test_mode=test_mode)
+    result = send_email(digest["subject"], digest["html_body"], config, recipients)
     record_send_result(client, digest_id, recipients=recipients,
                         send_status="success" if result.get("ok") else "error",
                         send_error_message=result.get("error"), send_mode=result.get("mode"))

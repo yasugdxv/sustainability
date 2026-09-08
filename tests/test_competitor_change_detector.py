@@ -40,6 +40,7 @@ def test_process_extracted_record_new_target_creates_record_and_change_event():
         "record_type": "TARGET", "title": "CO2削減目標",
         "structured_fields": {"target_year": "2030", "reduction_rate": "50%"},
         "summary": "2030年までにCO2排出50%削減",
+        "evidence_quote": "2030年までにCO2排出量を50%削減すると明記",
     }
 
     result = detector.process_extracted_record(
@@ -54,6 +55,23 @@ def test_process_extracted_record_new_target_creates_record_and_change_event():
     assert event["before_record_id"] is None
     # classifierが生成した内容要約をそのまま使う（タイトルだけの空疎な定型文にしない）
     assert event["summary"] == "2030年までにCO2排出50%削減"
+    # evidence_quoteがあれば抽出時点の自己検証でVERIFIEDになる（再取得しない）
+    assert event["verification_status"] == "VERIFIED"
+    assert event["verification_evidence"] == "2030年までにCO2排出量を50%削減すると明記"
+
+
+def test_process_extracted_record_new_target_without_evidence_is_unverified():
+    client = FakeSupabaseClient()
+    extracted = {
+        "record_type": "TARGET", "title": "CO2削減目標",
+        "structured_fields": {"target_year": "2030", "reduction_rate": "50%"},
+        "summary": "2030年までにCO2排出50%削減",
+        "evidence_quote": "",
+    }
+    result = detector.process_extracted_record(
+        client, azure_client=None, model="gpt-4o",
+        company=COMPANY, source=SOURCE, extracted=extracted)
+    assert result["change_event"]["verification_status"] == "UNVERIFIED"
 
 
 # ─── process_extracted_record: ハッシュ一致で変更なし ───────────────────
@@ -96,6 +114,8 @@ def test_process_extracted_record_change_confirmed_calls_llm_and_supersedes():
             "direction": "STRENGTHENED", "summary": "対象範囲が拡大された",
             "reasoning_summary": "target_yearは同一だがscopeが拡大", "confidence": 0.92,
             "review_required": False, "review_reasons": [],
+            "verification_status": "VERIFIED", "verification_reason": "本文で対象範囲拡大を確認",
+            "verification_evidence": "全事業所を対象とする旨の記載",
         }),
     ]
 
@@ -111,11 +131,47 @@ def test_process_extracted_record_change_confirmed_calls_llm_and_supersedes():
     assert event["change_type"] == "SCOPE_EXPANDED"
     assert event["direction"] == "STRENGTHENED"
     assert event["confidence"] == 0.92
+    assert event["verification_status"] == "VERIFIED"
+    assert event["primary_source_url"] == SOURCE["source_url"]
 
     old_record = next(r for r in client.tables["competitor_target_records"]
                        if r["record_id"] == old_record_id)
     assert old_record["is_current"] is False
     assert old_record["superseded_by"] == result["record"]["record_id"]
+
+
+# ─── process_extracted_record: WORDING_ONLYはLLMの申告に関わらず強制UNVERIFIED ──
+def test_process_extracted_record_wording_only_forced_unverified():
+    client = FakeSupabaseClient()
+    first_extracted = {"record_type": "TARGET", "title": "水目標",
+                        "structured_fields": {"target_year": "2030", "scope": "全事業所"},
+                        "summary": "...", "evidence_quote": "2030年までに全事業所を対象"}
+    detector.process_extracted_record(
+        client, azure_client=None, model="gpt-4o",
+        company=COMPANY, source=SOURCE, extracted=first_extracted)
+    old_record_id = client.tables["competitor_target_records"][0]["record_id"]
+
+    azure_client = MagicMock()
+    azure_client.chat.completions.create.side_effect = [
+        _mock_llm_response({"matched_record_id": old_record_id, "reasoning": "同一目標のため"}),
+        _mock_llm_response({
+            # LLMが誤ってVERIFIEDと申告しても、change_type=WORDING_ONLYならコード側で強制的に
+            # UNVERIFIEDへ倒す（プロンプト指示だけに頼らない防御）
+            "same_entity": True, "change_status": "CHANGE_CONFIRMED", "change_type": "WORDING_ONLY",
+            "direction": "NEUTRAL", "summary": "表現のみの変更", "reasoning_summary": "文言の言い換えのみ",
+            "confidence": 0.8, "review_required": False, "review_reasons": [],
+            "verification_status": "VERIFIED", "verification_reason": "誤って確認済みと申告",
+            "verification_evidence": "...",
+        }),
+    ]
+    second_extracted = {"record_type": "TARGET", "title": "水目標",
+                         "structured_fields": {"target_year": "2030", "scope": "全ての事業所"},
+                         "summary": "...", "evidence_quote": "..."}
+    result = detector.process_extracted_record(
+        client, azure_client=azure_client, model="gpt-4o",
+        company=COMPANY, source=SOURCE, extracted=second_extracted)
+
+    assert result["change_event"]["verification_status"] == "UNVERIFIED"
 
 
 # ─── process_extracted_record: 無関係な既存レコードと誤って比較しない ─────

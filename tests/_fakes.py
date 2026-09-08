@@ -1,5 +1,5 @@
 """
-サスティナビリティ専門家MVPのテスト用共通フェイク。
+サステナビリティ専門家MVPのテスト用共通フェイク。
 Supabase(PostgREST)への実アクセスをせず、article_crawler.SupabaseClient と
 同じインターフェース（select/insert/update）を持つ簡易フェイクを提供する。
 （ファイル名を conftest.py にしていないのは、pytestのfixture自動読込の仕組みと
@@ -14,6 +14,7 @@ class FakeSupabaseClient:
         self.tables = {k: [dict(row) for row in v] for k, v in (tables or {}).items()}
         self.inserted = {}
         self.updated = []
+        self.deleted = []
         self._id_counter = 0
 
     def _next_id(self, prefix: str) -> str:
@@ -50,6 +51,12 @@ class FakeSupabaseClient:
             elif value.startswith("lte."):
                 if self._stringify(row.get(key)) > value[4:]:
                     return False
+            elif value == "is.null":
+                if row.get(key) is not None:
+                    return False
+            elif value == "is.not.null":
+                if row.get(key) is None:
+                    return False
         return True
 
     def select(self, table: str, params: dict) -> list:
@@ -73,7 +80,18 @@ class FakeSupabaseClient:
                     "competitor_daily_alert_digests": "digest_id",
                     "monthly_reports": "report_id",
                     "monthly_report_companies": "monthly_report_company_id",
-                    "monthly_report_items": "monthly_report_item_id"}.get(table)
+                    "monthly_report_items": "monthly_report_item_id",
+                    "external_intelligence_calls": "id",
+                    "weekly_geo_intelligence_runs": "id",
+                    "weekly_geo_intelligence_items": "id",
+                    "filter_exclusion_log": "id",
+                    "sustainability_strategy_facts": "fact_id",
+                    "sustainability_strategic_questions": "question_id",
+                    "sustainability_strategic_question_options": "option_id",
+                    "sustainability_strategic_question_deliveries": "delivery_id",
+                    "sustainability_strategic_question_responses": "response_id",
+                    "sustainability_decision_insights": "insight_id",
+                    "article_analysis": "analysis_id"}.get(table)
         out = []
         for row in rows:
             r = dict(row)
@@ -90,6 +108,14 @@ class FakeSupabaseClient:
             if self._matches(row, params):
                 row.update(patch)
         self.updated.append((table, dict(params), dict(patch)))
+
+    def delete(self, table: str, params: dict) -> None:
+        """article_crawler.SupabaseClient.delete()と同じインターフェース。
+        条件に一致する行をtablesから物理的に取り除く（delete_filtered_article()等の
+        テストで使う）。"""
+        remaining = [row for row in self.tables.get(table, []) if not self._matches(row, params)]
+        self.tables[table] = remaining
+        self.deleted.append((table, dict(params)))
 
 
 class FakeKnowledgeStore:

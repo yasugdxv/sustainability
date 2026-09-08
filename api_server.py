@@ -1,9 +1,9 @@
 """
-サスティナビリティ記事ダッシュボード React版フロントエンド用バックエンドAPI。
+サステナビリティ記事ダッシュボード React版フロントエンド用バックエンドAPI。
 
-eco-digest-spark (React/Vite) から呼び出される。既存のStreamlit版
-(sustainability_dashboard_app.py) と同じデータ取得・翻訳・検索・チャットロジックを
-sustainability_dashboard_core.py 経由で共有する。
+eco-digest-spark (React/Vite) から呼び出される。データ取得・翻訳・検索・チャットロジックは
+sustainability_dashboard_core.py 経由で共有する。旧Streamlitプロトタイプ
+（sustainability_dashboard_app.py）は React 版へ機能移行済みのため _removed_20260827/ へ退避済み。
 
 起動: python api_server.py  (http://127.0.0.1:8000)
 """
@@ -14,8 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -24,6 +25,10 @@ from ai_client import make_openai_client  # noqa: E402
 import sustainability_expert_common as common  # noqa: E402
 from sustainability_knowledge_store import get_knowledge_store  # noqa: E402
 import sustainability_dashboard_core as core  # noqa: E402
+import sustainability_chat_geo_service  # noqa: E402
+import cross_domain_intelligence_service  # noqa: E402
+import strategic_question_responses as sqr  # noqa: E402
+import decision_insight_service  # noqa: E402
 
 DEFAULT_LOOKBACK_DAYS = 30
 ARTICLES_CACHE_TTL = 300
@@ -34,7 +39,16 @@ _expert_base = common.load_expert_base()
 _knowledge_store = get_knowledge_store(_config)
 _competitor_client = SupabaseClient(_config)
 
-_articles_cache = {"data": None, "fetched_at": 0.0}
+try:
+    _cached_translation_count = core.init_translation_cache(_config)
+    print(f"[起動] 翻訳キャッシュを{_cached_translation_count}件読み込みました")
+except Exception as e:
+    # translation_cacheテーブル未適用の環境でも起動自体は継続する（従来通りメモリのみで動作）
+    print(f"[起動] 翻訳キャッシュの読み込みをスキップしました: {type(e).__name__}: {e}")
+
+# since_days値ごとにキャッシュする（検索画面の期間フィルターで異なる日数が
+# 指定されるため、単一エントリのキャッシュだと常に同じ日数で上書きされてしまう）
+_articles_cache: dict = {}
 _translate_pool = ThreadPoolExecutor(max_workers=12)
 
 # 9テーマの表示用メタ情報（英語ラベル・カテゴリ色）。
@@ -82,32 +96,41 @@ CROSS_LABEL_EN = {
 }
 
 
-def _get_articles() -> list:
+def _get_articles(since_days: int = DEFAULT_LOOKBACK_DAYS) -> list:
     now = time.time()
-    if _articles_cache["data"] is None or now - _articles_cache["fetched_at"] > ARTICLES_CACHE_TTL:
-        _articles_cache["data"] = core.fetch_dashboard_articles(_config, DEFAULT_LOOKBACK_DAYS)
-        _articles_cache["fetched_at"] = now
-    return _articles_cache["data"]
+    entry = _articles_cache.get(since_days)
+    if entry is None or now - entry["fetched_at"] > ARTICLES_CACHE_TTL:
+        entry = {"data": core.fetch_dashboard_articles(_config, since_days), "fetched_at": now}
+        _articles_cache[since_days] = entry
+    return entry["data"]
 
 
 def _warm_translation_cache(articles: list, lang: str) -> None:
-    """一覧表示で必要なタイトル・要約の翻訳を並列実行してキャッシュを温める。
+    """一覧表示で必要なタイトル・要約の翻訳をバックグラウンドで並列実行しキャッシュを温める。
     翻訳はI/O待ちが支配的なため、逐次実行だと数百件で数分かかってしまう
-    （特にsummary_shortは常に日本語で生成されるため、英語UIでは実質全件が翻訳対象になる）。"""
-    futures = []
+    （特にsummary_shortは常に日本語で生成されるため、英語UIでは実質全件が翻訳対象になる）。
+
+    2026-08-27修正: 以前はここでfuture.result()を待っており、cold cache時に
+    /api/articles全体が数分ブロックされていた（実測: 非日本語タイトル2165件で約250秒）。
+    一覧表示（list_articles）は_to_ui_article(..., blocking=False)で「キャッシュに無ければ
+    原文のまま返す」経路に変えたため、ここではfire-and-forgetで投げるだけでよい
+    （このリクエストのレスポンスは原文のまま返り、次回以降のリクエストから翻訳済みで返る）。"""
     for a in articles:
         if ("title", lang, a["article_id"]) not in core._short_cache:
-            futures.append(_translate_pool.submit(
-                core.translate_title, _azure_client, _model, a["article_id"], a["title"], lang))
+            _translate_pool.submit(
+                core.translate_title, _azure_client, _model, a["article_id"], a["title"], lang)
         if ("summary", lang, a["article_id"]) not in core._short_cache:
             summary_raw = a.get("summary_short") or a.get("importance_reason") or ""
-            futures.append(_translate_pool.submit(
-                core.translate_summary, _azure_client, _model, a["article_id"], summary_raw, lang))
-    for f in futures:
-        f.result()
+            _translate_pool.submit(
+                core.translate_summary, _azure_client, _model, a["article_id"], summary_raw, lang)
 
 
-def _to_ui_article(a: dict, engagement: dict, lang: str = "ja", with_body: bool = False) -> dict:
+def _to_ui_article(a: dict, engagement: dict, lang: str = "ja", with_body: bool = False,
+                    blocking: bool = True) -> dict:
+    """blocking=False（一覧表示専用）の場合、タイトル・要約はキャッシュ済みならそれを、
+    未キャッシュなら原文をそのまま返す（LLM呼び出しをその場で待たない）。翻訳自体は
+    _warm_translation_cache()がバックグラウンドで進める。単一記事の詳細表示
+    （get_article、with_body=True）は従来通りblocking=True（既定）で確実に翻訳する。"""
     theme = a["themes"][0] if a.get("themes") else "その他"
     level = a.get("importance_level")
     eng = engagement.get(a["article_id"], {})
@@ -120,22 +143,46 @@ def _to_ui_article(a: dict, engagement: dict, lang: str = "ja", with_body: bool 
     else:
         sector = sector_ja
         tags = tags_ja
+    if blocking:
+        title = core.translate_title(_azure_client, _model, a["article_id"], a["title"], lang)
+        summary = core.translate_summary(_azure_client, _model, a["article_id"], summary_raw, lang)
+    else:
+        title = core.get_short_translation_nonblocking("title", a["article_id"], a["title"], lang)
+        summary = core.get_short_translation_nonblocking("summary", a["article_id"], summary_raw, lang)
+    scores = a.get("importance_scores") or {}
     out = {
         "id": a["article_id"],
-        "title": core.translate_title(_azure_client, _model, a["article_id"], a["title"], lang),
-        "summary": core.translate_summary(_azure_client, _model, a["article_id"], summary_raw, lang),
+        "title": title,
+        "summary": summary,
         "category": theme,
+        "categories": a.get("themes") or [theme],
         "source": a.get("publisher") or "",
         "sector": sector,
         "publishedAt": a.get("published_at") or "",
         "importance": IMPORTANCE_SCORE.get(level, 50),
         "importanceLevel": level or "",
+        "importanceTotal": a.get("importance_total_score"),
+        "importanceBreakdown": [{"id": k, "score": v} for k, v in scores.items()],
         "trending": level in ("S", "A"),
         "url": a.get("url") or "",
         "tags": tags,
+        "subThemes": a.get("theme_subtags", []),
         "materialityCodes": a.get("materiality_codes", []),
         "likesCount": eng.get("likes_count", 0),
         "readsCount": eng.get("reads_count", 0),
+        "provenance": {
+            "sourceDepartment": "sustainability",
+            "sourceAgent": None,
+            "sourceType": "article_analysis",
+            "assessmentTitle": None,
+            "requestQuestion": None,
+            "confidence": None,
+            "reviewStatus": "needs_review" if a.get("needs_review") else "ai_only",
+            "asOf": a.get("published_at") or "",
+            "references": [],
+            "externalCallId": None,
+            "reuseType": "none",
+        },
     }
     if with_body:
         body = a.get("extracted_text") or ""
@@ -166,9 +213,9 @@ def health():
 
 
 @app.get("/api/categories")
-def get_categories():
+def get_categories(since_days: int = DEFAULT_LOOKBACK_DAYS):
     names = core.theme_options(_config)
-    articles = _get_articles()
+    articles = _get_articles(since_days)
     counts: dict = {}
     for a in articles:
         for t in a.get("themes", []):
@@ -185,13 +232,42 @@ def get_categories():
     ]
 
 
+@app.get("/api/subcategories")
+def get_subcategories(since_days: int = DEFAULT_LOOKBACK_DAYS):
+    """テーマの小分類タグ一覧（検索画面の詳細タグ絞り込み用）。
+    英語対訳表は無い（121件と件数が多く、対訳表を作るとメンテコストが見合わないため）。
+    英語UIでも日本語タグ名のまま表示する"""
+    subthemes = core.subtheme_options(_config)
+    articles = _get_articles(since_days)
+    counts: dict = {}
+    for a in articles:
+        for st in a.get("theme_subtags", []):
+            counts[st] = counts.get(st, 0) + 1
+    return [
+        {
+            "id": s["id"], "label": s["label"], "labelJa": s["label"],
+            "parent": s["parent"], "count": counts.get(s["id"], 0),
+        }
+        for s in subthemes
+    ]
+
+
+@app.get("/api/importance-rubric")
+def get_importance_rubric():
+    """重要度スコアの内訳（7項目・各0-5点）の名称・説明・スコア別基準。
+    記事データではなく評価基準そのもの（更新頻度が低い静的参照データ）なので、
+    articlesキャッシュとは別枠でフロントエンド側の長めのstaleTimeに任せる"""
+    return core.importance_rubric(_config)
+
+
 @app.get("/api/articles")
 def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: str = "", lang: str = "ja"):
-    articles = _get_articles()
+    articles = _get_articles(since_days)
     selected_themes = [t for t in themes.split(",") if t]
     filtered = core.apply_tag_filter(articles, selected_themes)
 
     keywords, nl_themes = [], []
+    cross_domain_intelligence = []
     if q.strip():
         if _azure_client:
             intent = core.extract_search_intent(_azure_client, _model, q, core.theme_options(_config))
@@ -199,6 +275,18 @@ def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: 
         else:
             keywords = core.tokenize(q)
         filtered = core.apply_nl_search(filtered, keywords, nl_themes)
+
+        try:
+            # Phase B: Searchは人間が既存Cross-domain Intelligenceを直接見て判断するため、
+            # 十分性判定LLMは呼ばずGatewayの候補をそのまま返す（capability="search"の
+            # Kill SwitchはGateway自身が確認する。Failure Isolation: 失敗しても記事検索
+            # 本体には一切影響しない）。
+            sources = cross_domain_intelligence_service.retrieve_existing_intelligence(
+                _competitor_client, _config, domains=["geopolitics"], keywords=keywords,
+                themes=nl_themes, limit=10, capability="search")
+            cross_domain_intelligence = [core._to_cross_domain_item(s) for s in sources]
+        except Exception:
+            cross_domain_intelligence = []
 
     _warm_translation_cache(filtered, lang)
     engagement = core.fetch_engagement_map(_config, [a["article_id"] for a in filtered])
@@ -208,7 +296,8 @@ def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: 
         "filteredTotal": len(filtered),
         "keywords": keywords,
         "matchedThemes": nl_themes,
-        "articles": [_to_ui_article(a, engagement, lang) for a in filtered],
+        "articles": [_to_ui_article(a, engagement, lang, blocking=False) for a in filtered],
+        "crossDomainIntelligence": cross_domain_intelligence,
     }
 
 
@@ -250,7 +339,7 @@ class TranslateRequest(BaseModel):
 
 @app.post("/api/translate")
 def translate(req: TranslateRequest):
-    """記事に紐づかない任意テキスト（サスティナAIのチャット履歴など）の翻訳。
+    """記事に紐づかない任意テキスト（サステナAIのチャット履歴など）の翻訳。
     各テキストは既に対象言語であればそのまま返る（core.translate_plainの言語判定に依る）。"""
     if not _azure_client or not req.texts:
         return {"translations": req.texts}
@@ -276,7 +365,7 @@ class ChatRequest(BaseModel):
 @app.post("/api/chat")
 def chat(req: ChatRequest):
     if not common.is_enabled(_config):
-        raise HTTPException(status_code=400, detail="サスティナAIが無効化されています（config.jsonを確認してください）")
+        raise HTTPException(status_code=400, detail="サステナAIが無効化されています（config.jsonを確認してください）")
     if not _azure_client:
         raise HTTPException(status_code=400, detail="Azure OpenAI / OpenAI のAPIキーが設定されていません")
 
@@ -293,7 +382,30 @@ def chat(req: ChatRequest):
     except Exception:
         competitor_block = ""
 
-    system_prompt = core.build_chat_system_prompt(context_articles, _expert_base, retrieved_docs, competitor_block)
+    try:
+        # Phase B: 他部門（現状Geopolitics）Intelligenceがmateriallyに必要な質問の場合のみ
+        # 自動的に既存Intelligence優先で参照し、参考コンテキストとして追加する。
+        # Kill Switch OFF・判定「不要」・他部門障害等、いかなる場合も空文字列/使用なしが
+        # 返るだけでChat自体には影響しない（Failure Isolation）。
+        recent_history_text = "\n".join(f"{m.role}: {m.content}" for m in req.history[-4:])
+        geo_context_block, geo_meta = sustainability_chat_geo_service.get_geo_chat_context_with_meta(
+            _config, _competitor_client, _azure_client, _model, req.message, recent_history_text,
+            themes=req.themes)
+    except Exception:
+        geo_context_block, geo_meta = "", {"used": False}
+    cross_domain_intelligence = geo_meta.get("crossDomainIntelligence") or []
+
+    try:
+        # Weekly Strategic Question由来の「組織内の判断傾向」。正式方針とは明確に分離し、
+        # guardrail_label付きで参考情報としてのみ渡す（Failure Isolation）
+        decision_signal_block = decision_insight_service.build_decision_insight_chat_block(
+            _competitor_client, _config, themes=req.themes or None)
+    except Exception:
+        decision_signal_block = ""
+
+    system_prompt = core.build_chat_system_prompt(
+        context_articles, _expert_base, retrieved_docs, competitor_block, geo_context_block,
+        decision_signal_block)
     if req.lang == "en":
         system_prompt += (
             "\n\n# Response language\nRespond in English, regardless of the language of the "
@@ -310,7 +422,85 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
     sources = [d["title"] for d in retrieved_docs[:3]]
-    return {"reply": reply, "sources": sources}
+    return {"reply": reply, "sources": sources, "crossDomainIntelligence": cross_domain_intelligence}
+
+
+# ─── Weekly Strategic Question: 回答収集（本ファイル唯一のブラウザ向けHTMLエンドポイント） ───
+# トークン(t)は実質Bearer Tokenと同等に扱う。第三者JS・外部画像は置かず、Cache-Control/
+# Referrer-Policyでトークン付きURLの漏洩経路を塞ぐ。GETは記録しない
+# （メールセキュリティ製品によるリンク自動アクセスを回答として誤認しないための2段階方式:
+#  GET=確認ページ表示のみ、POST=実際の記録）。
+
+_NO_LEAK_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+
+_ERROR_MESSAGES = {
+    "not_found": ("質問が見つかりません", 404),
+    "invalid_token": ("このリンクは無効です", 404),
+    "invalid_option": ("選択肢が正しくありません", 400),
+    "closed": ("この質問は回答受付を終了しました", 410),
+}
+
+
+def _render_sq_page(title: str, body: str) -> str:
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>{title}</title></head>
+<body style="font-family:'Hiragino Sans','Meiryo',sans-serif;color:#0f172a;max-width:480px;
+margin:60px auto;padding:0 20px;">{body}</body></html>"""
+
+
+def _render_error_page(error: str) -> str:
+    message, _ = _ERROR_MESSAGES.get(error, ("エラーが発生しました", 500))
+    return _render_sq_page(message, f'<p style="font-size:15px;">{message}</p>')
+
+
+def _render_confirm_page(question: dict, chosen_option: dict, q: str, o: str, t: str) -> str:
+    return _render_sq_page("回答の確認", f"""
+    <h1 style="font-size:16px;">回答の確認</h1>
+    <p style="font-size:13px;color:#475569;">{question['question_text']}</p>
+    <p style="font-size:15px;font-weight:700;margin:16px 0;">
+      選択: {chosen_option['option_code']}. {chosen_option['label']}
+    </p>
+    <form method="post" action="/api/strategic-questions/respond">
+      <input type="hidden" name="q" value="{q}">
+      <input type="hidden" name="o" value="{o}">
+      <input type="hidden" name="t" value="{t}">
+      <label style="font-size:13px;color:#334155;">理由や条件があれば教えてください（任意）</label><br>
+      <textarea name="comment" rows="3" style="width:100%;margin:8px 0;padding:8px;
+        border:1px solid #cbd5e1;border-radius:6px;font-size:13px;"></textarea><br>
+      <button type="submit" style="padding:10px 20px;background:#0f766e;color:#fff;border:none;
+        border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;">この内容で回答する</button>
+    </form>""")
+
+
+def _render_thanks_page() -> str:
+    return _render_sq_page("回答ありがとうございました",
+                            '<p style="font-size:15px;">回答を受け付けました。ご協力ありがとうございました。</p>')
+
+
+@app.get("/api/strategic-questions/respond", response_class=HTMLResponse)
+def strategic_question_respond_confirm(q: str, o: str, t: str):
+    validation = sqr.validate_token(_competitor_client, q, t, is_get=True)
+    if "error" in validation:
+        _, status = _ERROR_MESSAGES.get(validation["error"], ("エラー", 500))
+        return HTMLResponse(_render_error_page(validation["error"]), status_code=status, headers=_NO_LEAK_HEADERS)
+    chosen = sqr.get_option_or_none(_competitor_client, q, o)
+    if chosen is None:
+        return HTMLResponse(_render_error_page("invalid_option"), status_code=400, headers=_NO_LEAK_HEADERS)
+    return HTMLResponse(_render_confirm_page(validation["question"], chosen, q, o, t), headers=_NO_LEAK_HEADERS)
+
+
+@app.post("/api/strategic-questions/respond", response_class=HTMLResponse)
+def strategic_question_respond_submit(q: str = Form(...), o: str = Form(...),
+                                       t: str = Form(...), comment: str = Form("")):
+    validation = sqr.validate_token(_competitor_client, q, t)
+    if "error" in validation:
+        _, status = _ERROR_MESSAGES.get(validation["error"], ("エラー", 500))
+        return HTMLResponse(_render_error_page(validation["error"]), status_code=status, headers=_NO_LEAK_HEADERS)
+    chosen = sqr.get_option_or_none(_competitor_client, q, o)
+    if chosen is None:
+        return HTMLResponse(_render_error_page("invalid_option"), status_code=400, headers=_NO_LEAK_HEADERS)
+    sqr.record_response(_competitor_client, validation, chosen["option_id"], comment.strip() or None)
+    return HTMLResponse(_render_thanks_page(), headers=_NO_LEAK_HEADERS)
 
 
 # ─── 競合サステナビリティモニタリング（読み取り専用、eco-digest-sparkの「競合モニタリング」メニュー用） ───
@@ -322,9 +512,15 @@ def _competitor_company_map() -> dict:
     return {c["company_id"]: c for c in rows}
 
 
-def _change_to_ui(e: dict, companies: dict, target_records: dict = None) -> dict:
+def _goal_category_map() -> dict:
+    rows = _competitor_client.select("goal_categories", {"select": "goal_category_id,name,major_theme"})
+    return {r["goal_category_id"]: r for r in rows}
+
+
+def _change_to_ui(e: dict, companies: dict, target_records: dict = None, goal_categories: dict = None) -> dict:
     company = companies.get(e["company_id"], {})
     after = (target_records or {}).get(e.get("after_record_id")) or {}
+    goal_category = (goal_categories or {}).get(after.get("goal_category_id"))
     return {
         "id": e["change_event_id"],
         "companyId": e["company_id"],
@@ -338,6 +534,9 @@ def _change_to_ui(e: dict, companies: dict, target_records: dict = None) -> dict
         "reasoningSummary": e.get("reasoning_summary"),
         "changedFields": e.get("changed_fields") or [],
         "themes": after.get("themes") or [],
+        "goalCategoryId": after.get("goal_category_id"),
+        "goalCategoryName": goal_category.get("name") if goal_category else None,
+        "goalCategoryTheme": goal_category.get("major_theme") if goal_category else None,
         "confidence": e.get("confidence"),
         "reviewRequired": e.get("review_required", False),
         "sourceUrl": after.get("source_url"),
@@ -346,8 +545,9 @@ def _change_to_ui(e: dict, companies: dict, target_records: dict = None) -> dict
     }
 
 
-def _initiative_to_ui(i: dict, companies: dict) -> dict:
+def _initiative_to_ui(i: dict, companies: dict, goal_categories: dict = None) -> dict:
     company = companies.get(i["company_id"], {})
+    goal_category = (goal_categories or {}).get(i.get("goal_category_id"))
     return {
         "id": i["initiative_id"],
         "companyId": i["company_id"],
@@ -357,28 +557,42 @@ def _initiative_to_ui(i: dict, companies: dict) -> dict:
         "title": i.get("title"),
         "summary": i.get("summary"),
         "themes": i.get("themes") or [],
+        "goalCategoryId": i.get("goal_category_id"),
+        "goalCategoryName": goal_category.get("name") if goal_category else None,
+        "goalCategoryTheme": goal_category.get("major_theme") if goal_category else None,
         "isNew": i.get("is_new", True),
         "detectedAt": i.get("detected_at"),
         "sourceUrl": i.get("source_url"),
     }
 
 
-def _target_record_to_ui(r: dict, companies: dict) -> dict:
+def _target_record_to_ui(r: dict, companies: dict, goal_categories: dict = None) -> dict:
     company = companies.get(r["company_id"], {})
     fields = r.get("structured_fields") or {}
+    goal_category = (goal_categories or {}).get(r.get("goal_category_id"))
     return {
         "id": r["record_id"],
         "companyId": r["company_id"],
         "companyName": company.get("company_name", "?"),
         "companyNameEn": company.get("company_name_en"),
         "companyCategory": company.get("industry_category", ""),
+        "isOwnCompany": company.get("is_own_company", False),
         "recordType": r["record_type"],
         "title": r.get("title"),
         "themes": r.get("themes") or [],
+        "goalCategoryId": r.get("goal_category_id"),
+        "goalCategoryName": goal_category.get("name") if goal_category else None,
+        "goalCategoryTheme": goal_category.get("major_theme") if goal_category else None,
         "targetValue": fields.get("target_value"),
+        "numericValue": fields.get("numeric_value"),
+        "unit": fields.get("unit"),
+        "reductionRate": fields.get("reduction_rate"),
         "baseYear": fields.get("base_year"),
         "targetYear": fields.get("target_year"),
         "scope": fields.get("scope"),
+        "boundary": fields.get("boundary"),
+        "targetRegion": fields.get("target_region"),
+        "targetMaterial": fields.get("target_material"),
         "kpiDefinition": fields.get("kpi_definition"),
         "achievementStatus": fields.get("achievement_status"),
         "sourceUrl": r.get("source_url"),
@@ -453,6 +667,7 @@ def competitor_overview():
     })
     report = reports[0] if reports else None
     companies = _competitor_company_map()
+    goal_categories = _goal_category_map()
 
     recent_events = _competitor_client.select("competitor_change_events", {
         "select": "*", "order": "created_at.desc", "limit": "5",
@@ -481,8 +696,8 @@ def competitor_overview():
         "reportMonth": report["report_month"] if report else None,
         "summary": summary,
         "crossCompanyTrends": trends,
-        "recentChanges": [_change_to_ui(e, companies) for e in recent_events],
-        "topInitiatives": [_initiative_to_ui(i, companies) for i in recent_initiatives],
+        "recentChanges": [_change_to_ui(e, companies, goal_categories=goal_categories) for e in recent_events],
+        "topInitiatives": [_initiative_to_ui(i, companies, goal_categories) for i in recent_initiatives],
     }
 
 
@@ -505,7 +720,7 @@ def competitor_changes(company_id: str = "", theme: str = "", record_type: str =
     target_records = {}
     if after_ids:
         rows = _competitor_client.select("competitor_target_records", {
-            "select": "record_id,source_url,title,themes,source_updated_at",
+            "select": "record_id,source_url,title,themes,source_updated_at,goal_category_id",
             "record_id": f"in.({','.join(after_ids)})",
         })
         target_records = {r["record_id"]: r for r in rows}
@@ -514,7 +729,8 @@ def competitor_changes(company_id: str = "", theme: str = "", record_type: str =
         events = [e for e in events
                   if theme in (target_records.get(e.get("after_record_id"), {}).get("themes") or [])]
 
-    changes = [_change_to_ui(e, _competitor_company_map(), target_records) for e in events]
+    changes = [_change_to_ui(e, _competitor_company_map(), target_records, _goal_category_map())
+               for e in events]
 
     # 掲載日(sourceUpdatedAt)は情報源にmetaタグが無ければNULLになりうるため、
     # 取得日(createdAt)と別軸として、DB側JOINではなくここでソート・期間フィルタする
@@ -529,25 +745,30 @@ def competitor_changes(company_id: str = "", theme: str = "", record_type: str =
 
 
 @app.get("/api/competitors/targets")
-def competitor_targets(company_id: str = "", theme: str = ""):
+def competitor_targets(company_id: str = "", theme: str = "", goal_category: str = ""):
     params = {
         "select": "*", "is_current": "eq.true",
         "record_type": "in.(TARGET,KPI)", "order": "extracted_at.desc",
     }
     if company_id:
         params["company_id"] = f"eq.{company_id}"
+    if goal_category:
+        params["goal_category_id"] = f"eq.{goal_category}"
     records = _competitor_client.select("competitor_target_records", params)
     if theme:
         records = [r for r in records if theme in (r.get("themes") or [])]
     companies = _competitor_company_map()
-    return {"targets": [_target_record_to_ui(r, companies) for r in records]}
+    goal_categories = _goal_category_map()
+    return {"targets": [_target_record_to_ui(r, companies, goal_categories) for r in records]}
 
 
 @app.get("/api/competitors/initiatives")
-def competitor_initiatives_list(company_id: str = "", theme: str = "", is_new: str = ""):
+def competitor_initiatives_list(company_id: str = "", theme: str = "", is_new: str = "", goal_category: str = ""):
     params = {"select": "*", "order": "detected_at.desc"}
     if company_id:
         params["company_id"] = f"eq.{company_id}"
+    if goal_category:
+        params["goal_category_id"] = f"eq.{goal_category}"
     rows = _competitor_client.select("competitor_initiatives", params)
     if theme:
         rows = [r for r in rows if theme in (r.get("themes") or [])]
@@ -556,13 +777,14 @@ def competitor_initiatives_list(company_id: str = "", theme: str = "", is_new: s
     elif is_new == "false":
         rows = [r for r in rows if not r.get("is_new")]
     companies = _competitor_company_map()
-    return {"initiatives": [_initiative_to_ui(r, companies) for r in rows]}
+    goal_categories = _goal_category_map()
+    return {"initiatives": [_initiative_to_ui(r, companies, goal_categories) for r in rows]}
 
 
 @app.get("/api/competitors/companies")
 def competitor_companies_list():
     companies = _competitor_client.select("competitor_companies", {
-        "select": "*", "is_own_company": "eq.false", "order": "display_order.asc",
+        "select": "*", "order": "display_order.asc",
     })
     targets = _competitor_client.select("competitor_target_records", {
         "select": "company_id", "is_current": "eq.true",
@@ -575,6 +797,7 @@ def competitor_companies_list():
         "companies": [{
             "id": c["company_id"], "name": c["company_name"], "nameEn": c.get("company_name_en"),
             "category": c.get("industry_category", ""), "displayOrder": c.get("display_order") or 0,
+            "isOwnCompany": c.get("is_own_company", False),
             "targetCount": target_counts.get(c["company_id"], 0),
             "initiativeCount": initiative_counts.get(c["company_id"], 0),
         } for c in companies],
@@ -590,6 +813,7 @@ def competitor_company_detail(company_id: str):
         raise HTTPException(status_code=404, detail="企業が見つかりません")
     company = companies[0]
     company_map = {company_id: company}
+    goal_categories = _goal_category_map()
 
     targets = _competitor_client.select("competitor_target_records", {
         "select": "*", "company_id": f"eq.{company_id}", "is_current": "eq.true",
@@ -608,9 +832,9 @@ def competitor_company_detail(company_id: str):
     return {
         "id": company["company_id"], "name": company["company_name"],
         "nameEn": company.get("company_name_en"), "category": company.get("industry_category", ""),
-        "targets": [_target_record_to_ui(r, company_map) for r in targets],
-        "initiatives": [_initiative_to_ui(i, company_map) for i in initiatives],
-        "changeHistory": [_change_to_ui(e, company_map) for e in events],
+        "targets": [_target_record_to_ui(r, company_map, goal_categories) for r in targets],
+        "initiatives": [_initiative_to_ui(i, company_map, goal_categories) for i in initiatives],
+        "changeHistory": [_change_to_ui(e, company_map, goal_categories=goal_categories) for e in events],
         "sources": [{"id": s["source_id"], "url": s["source_url"], "type": s["source_type"]} for s in sources],
     }
 

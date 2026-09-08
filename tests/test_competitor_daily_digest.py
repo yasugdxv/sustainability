@@ -14,13 +14,14 @@ def _iso(dt) -> str:
     return dt.isoformat()
 
 
-def _event(event_id, created_at, *, review_required=False, confidence=0.95, company_id="c-1"):
+def _event(event_id, created_at, *, review_required=False, confidence=0.95, company_id="c-1",
+           verification_status="VERIFIED"):
     return {
         "change_event_id": event_id, "company_id": company_id, "record_type": "TARGET",
         "change_type": "SCOPE_EXPANDED", "direction": "STRENGTHENED",
         "summary": "テスト変更", "reasoning_summary": "テスト根拠",
         "confidence": confidence, "review_required": review_required,
-        "created_at": created_at,
+        "created_at": created_at, "verification_status": verification_status,
     }
 
 
@@ -49,12 +50,12 @@ def test_build_digest_queues_review_when_not_auto_eligible(monkeypatch):
     client = FakeSupabaseClient({
         "competitor_change_events": [_event("e-1", _iso(now), review_required=True)],
         "competitor_companies": [_company()],
-        "competitor_recipients": [],
+        "email_recipients": [],
     })
 
     called = {}
 
-    def fake_send_email(subject, html_body, config):
+    def fake_send_email(subject, html_body, config, to_addresses):
         called["sent"] = True
         return {"ok": True, "mode": "preview"}
 
@@ -71,10 +72,11 @@ def test_build_digest_auto_sends_when_all_eligible(monkeypatch):
     client = FakeSupabaseClient({
         "competitor_change_events": [_event("e-1", _iso(now), confidence=0.95)],
         "competitor_companies": [_company()],
-        "competitor_recipients": [],
+        "email_recipients": [],
     })
 
-    monkeypatch.setattr(digest, "send_email", lambda subject, html_body, config: {"ok": True, "mode": "preview"})
+    monkeypatch.setattr(digest, "send_email",
+                         lambda subject, html_body, config, to_addresses: {"ok": True, "mode": "preview"})
 
     result = digest.build_digest(client, CONFIG)
     assert result["auto_send_eligible"] is True

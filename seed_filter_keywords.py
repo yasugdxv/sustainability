@@ -140,7 +140,7 @@ GROUPS = [
     ]),
     ("自社", "厳密語", [
         "Suntory", "サントリー", "Suntory Global Spirits", "サントリービバレッジ＆フード",
-        "Suntory Beverage & Food", "サントリービバレッジウエルネス",
+        "Suntory Beverage & Food", "サントリーウエルネス", "サントリーHD",
     ]),
     ("業界主要企業", "厳密語", [
         "Mars", "マース", "General Mills", "ゼネラル・ミルズ", "味の素", "Ajinomoto",

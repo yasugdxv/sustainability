@@ -25,9 +25,19 @@ node_modules/
 
 # ログ
 *.log
+logs/
+
+# 日次パイプラインの重複実行防止ロック
+run_daily.lock
 
 # 退避した旧ファイル（削除ではなく退避のため、追跡対象から外す）
 _removed_20260723/
+_removed_20260827/
+
+# 調査・デバッグ用の一時ファイル
+.scratch_*
+/*.txt
+email_html_full.html
 
 # 社内業務資料（コードのみ管理する方針。ソースコードとは別に社内で共有・保管する）
 uploads/

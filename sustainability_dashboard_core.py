@@ -1,13 +1,15 @@
 """
-サスティナビリティ記事ダッシュボードの共通ロジック（フレームワーク非依存）。
+サステナビリティ記事ダッシュボードの共通ロジック（フレームワーク非依存）。
 
-sustainability_dashboard_app.py（Streamlit版）と api_server.py（React版バックエンド）の
-両方から利用する。Streamlit固有のキャッシュ・UI呼び出しはここに含めない。
+api_server.py（React版バックエンド）から利用する。旧Streamlitプロトタイプ
+（sustainability_dashboard_app.py）は React 版へ機能移行済みのため
+_removed_20260827/ へ退避済み。
 """
 import json
 import re
 
 from article_crawler import SupabaseClient
+import sustainability_chat_geo_service as chat_geo
 import sustainability_expert_common as common
 
 IMPORTANCE_ORDER = {"S": 0, "A": 1, "B": 2, "C": 3, "D": 4}
@@ -33,8 +35,8 @@ SEARCH_INTENT_SCHEMA = {
     },
 }
 
-CHAT_SYSTEM_PROMPT_HEADER = """あなたは当社サスティナビリティ専門家AIです。
-以下の「当社サスティナビリティの重点領域・判断ルール」「当社公式コンテキスト」「参照記事一覧」
+CHAT_SYSTEM_PROMPT_HEADER = """あなたは当社サステナビリティ専門家AIです。
+以下の「当社サステナビリティの重点領域・判断ルール」「当社公式コンテキスト」「参照記事一覧」
 「競合各社の目標・KPI」「競合各社の取組事例」に書かれている情報をもとに、記事の内容だけでなく
 当社の方針・目標との関係、競合他社との比較についても回答してください。
 これらに無い情報を推測で補完しないでください。分からない場合は「手元の情報では分かりません」と
@@ -43,6 +45,25 @@ CHAT_SYSTEM_PROMPT_HEADER = """あなたは当社サスティナビリティ専�
 
 CHAT_CONTEXT_LIMIT = 30
 CHAT_CONTEXT_TOP_K = 5
+
+# Phase B: Department Intelligence AI — 他部門Intelligence（Geo等）を使った回答の統合指示。
+# geo_context_block（sustainability_chat_geo_service.get_geo_chat_context_with_meta()が
+# 返すコンテキスト文字列）が非空の場合のみbuild_chat_system_prompt()から追記される。
+# 4見出しを毎回強制せず、質問の複雑さに応じて統合してよいとする（簡潔な質問への冗長な
+# 回答を避けるため）。また回答本文で出典元を毎回明示させない（出典はUI側のProvenance
+# Badgeで示すため、本文が「複数AIの寄せ集め」に見えることを避ける）。
+CHAT_GEO_SYNTHESIS_INSTRUCTION = """
+# 他部門Intelligenceを使った回答の構成
+他部門Intelligenceの参考情報を実際に回答へ反映させる場合、(1) Sustainability評価
+(2) Cross-domainの参考情報 (3) Sustainability戦略・施策への示唆 (4) 未確認・不確実な点、
+を質問の複雑さに応じて回答に統合してください。込み入った分析が必要な質問では見出しで
+明確に分けてよく、単純な質問では見出しを省略し自然で簡潔な1つの回答にまとめてください。
+
+回答本文で出典元（部門名・AI名）をわざわざ明示する必要はありません（出典はUI側で
+別途表示されます）。ただし次の場合は本文でも明示してください: Sustainability側の
+評価と他部門の見解が食い違う場合／他部門側の確信度が低い場合／結論が他部門の
+判断に強く依存している場合。
+"""
 
 
 # ─── クライアント ───────────────────────────────────────────────────
@@ -87,20 +108,29 @@ def top_articles_for_carousel(articles: list, limit: int) -> list:
     return ranked[:limit]
 
 
+ENGAGEMENT_FETCH_CHUNK_SIZE = 150
+
+
 def fetch_engagement_map(config: dict, article_ids: list) -> dict:
     """記事ID一覧に対する いいね・読んだ 件数を取得する（React版ダッシュボード用）。
-    article_engagementテーブル未適用の環境でも落ちないよう、取得失敗時は空map。"""
+    article_engagementテーブル未適用の環境でも落ちないよう、取得失敗時は空map。
+    記事数が多いと in.(id1,id2,...) のURLが長くなりすぎてSupabase側に400で
+    拒否される（737件で発生確認済み）ため、チャンクに分けて取得する。"""
     if not article_ids:
         return {}
     client = get_client(config)
-    try:
-        rows = client.select("article_engagement", {
-            "select": "article_id,likes_count,reads_count",
-            "article_id": f"in.({','.join(article_ids)})",
-        })
-    except Exception:
-        return {}
-    return {r["article_id"]: r for r in rows}
+    result: dict = {}
+    for i in range(0, len(article_ids), ENGAGEMENT_FETCH_CHUNK_SIZE):
+        chunk = article_ids[i:i + ENGAGEMENT_FETCH_CHUNK_SIZE]
+        try:
+            rows = client.select("article_engagement", {
+                "select": "article_id,likes_count,reads_count",
+                "article_id": f"in.({','.join(chunk)})",
+            })
+        except Exception:
+            continue
+        result.update({r["article_id"]: r for r in rows})
+    return result
 
 
 def increment_engagement(config: dict, article_id: str, likes_delta: int = 0, reads_delta: int = 0) -> dict:
@@ -128,12 +158,65 @@ def theme_options(config: dict) -> list:
     return [r["tag_name"] for r in rows]
 
 
+def subtheme_options(config: dict) -> list:
+    """テーマ軸の小分類タグ一覧を、属する大分類テーマ名付きで返す
+    （検索画面でタグを大分類だけでなく小分類まで絞り込めるようにするため）。
+    TH-04-12-01（サトウキビ）のように親が小分類自体（TH-04-12）である
+    3階層構造のタグもあるため、tag_level='大分類'に達するまで親をたどる"""
+    client = get_client(config)
+    theme_tags = client.select("tag_reference", {
+        "select": "tag_id,tag_code,tag_name,tag_level,parent_tag_id",
+        "tag_axis": "eq.テーマ", "order": "tag_code",
+    })
+    by_id = {t["tag_id"]: t for t in theme_tags}
+
+    def _top_major_name(tag: dict) -> str:
+        seen = set()
+        while tag["tag_level"] != "大分類" and tag.get("parent_tag_id") in by_id \
+                and tag["tag_id"] not in seen:
+            seen.add(tag["tag_id"])
+            tag = by_id[tag["parent_tag_id"]]
+        return tag["tag_name"]
+
+    return [
+        {"id": t["tag_name"], "label": t["tag_name"], "parent": _top_major_name(t)}
+        for t in theme_tags if t["tag_level"] == "小分類"
+    ]
+
+
+def importance_rubric(config: dict) -> list:
+    """重要度スコアの内訳表示用に、7評価項目の名称・説明・スコア別の判定基準を返す
+    （article_analyzer.pyが記事ごとに0〜5点で採点する基準そのもの。
+    importance_criteria/importance_score_bandsはどちらも小さく更新頻度も低い
+    静的参照データのため、記事データのようなキャッシュは持たせず毎回取得する）"""
+    client = get_client(config)
+    criteria = client.select("importance_criteria", {"select": "*", "order": "display_order"})
+    bands = client.select("importance_score_bands", {"select": "*"})
+    bands_by_criterion: dict = {}
+    for b in bands:
+        bands_by_criterion.setdefault(b["criterion_id"], {})[b["score"]] = b["definition"]
+    return [
+        {
+            "id": c["criterion_id"],
+            "label": c["name_ja"],
+            "description": c["description"],
+            "maxScore": c["max_score"],
+            "bands": bands_by_criterion.get(c["criterion_id"], {}),
+        }
+        for c in criteria
+    ]
+
+
 # ─── 絞り込み ───────────────────────────────────────────────────────
 def apply_tag_filter(articles: list, selected_themes: list) -> list:
+    """選択されたタグ名（大分類・小分類どちらでもよい）のいずれかを持つ記事に絞り込む"""
     if not selected_themes:
         return articles
     selected = set(selected_themes)
-    return [a for a in articles if selected & set(a["themes"])]
+    return [
+        a for a in articles
+        if selected & set(a["themes"]) or selected & set(a.get("theme_subtags", []))
+    ]
 
 
 def tokenize(text: str) -> list:
@@ -189,14 +272,6 @@ def fmt_date(value: str) -> str:
         return str(value)[:10]
 
 
-def tag_caption(a: dict) -> str:
-    parts = a["themes"][:1] + a.get("cross_tags", [])[:2] + a.get("subject_tags", [])[:1]
-    line = "｜".join(parts)
-    if a.get("materiality_codes"):
-        line += ("｜" if line else "") + "/".join(a["materiality_codes"])
-    return line
-
-
 # ─── 翻訳（タイトル・要約・本文） ────────────────────────────────────
 # クロール元は海外メディアが多く原文が英語のことがあるため、日本語UIでは
 # 日本語に、英語UI（React版のEN切り替え）では英語に翻訳して表示する。
@@ -234,10 +309,43 @@ def repair_mojibake(text: str) -> str:
 
 _LANG_NAME = {"ja": "日本語", "en": "English"}
 
-# プロセス内メモリキャッシュ（記事ID・言語の組ごとに1回だけ翻訳すればよいため）
+# プロセス内メモリキャッシュ（記事ID・言語の組ごとに1回だけ翻訳すればよいため）。
+# 読み取りは常にこのメモリ上の辞書経由（レイテンシ最優先）。永続化はtranslation_cache
+# テーブルに書き込み側だけ反映し、起動時にinit_translation_cache()で全件読み込んで
+# このプロセスメモリキャッシュを温める（2026-09-02追加。以前はプロセスメモリのみで
+# api_server.py再起動のたびに翻訳済みキャッシュが全消去され、再起動直後は数千件規模の
+# 記事タイトル・要約が英語のまま表示される問題があった）
 # _short_cache: (namespace, target_lang, article_id) -> text  （namespace: "title"/"summary"）
 _short_cache: dict = {}
 _body_cache: dict = {}
+_translation_db_client = None
+
+
+def init_translation_cache(config: dict) -> int:
+    """translation_cacheテーブルの内容を全件読み込み、プロセスメモリキャッシュ
+    （_short_cache/_body_cache）を温める。api_server.py起動時に1回呼ぶ想定。
+    以後の書き込み（_translate_short/translate_body）もこのテーブルへ反映する。
+    戻り値は読み込んだ件数（起動ログ確認用）"""
+    global _translation_db_client
+    client = get_client(config)
+    _translation_db_client = client
+    rows = client.select("translation_cache", {"select": "namespace,target_lang,article_id,text"})
+    for r in rows:
+        key = (r["target_lang"], r["article_id"]) if r["namespace"] == "body" else \
+            (r["namespace"], r["target_lang"], r["article_id"])
+        cache = _body_cache if r["namespace"] == "body" else _short_cache
+        cache[key] = r["text"]
+    return len(rows)
+
+
+def _persist_translation(namespace: str, target_lang: str, article_id: str, text: str) -> None:
+    """翻訳結果をtranslation_cacheへ書き込む（失敗してもプロセスメモリの
+    キャッシュ自体には影響しないよう、呼び出し元で例外を吸収する）"""
+    if _translation_db_client is None:
+        return
+    _translation_db_client.insert("translation_cache", [{
+        "namespace": namespace, "target_lang": target_lang, "article_id": article_id, "text": text,
+    }], prefer="resolution=merge-duplicates,return=minimal")
 
 
 def is_japanese(text: str, threshold: float = 0.15) -> bool:
@@ -281,6 +389,17 @@ def split_text(text: str, max_len: int) -> list:
     return chunks
 
 
+def get_short_translation_nonblocking(namespace: str, article_id: str, text: str, target_lang: str) -> str:
+    """_short_cacheに既にあればそれを返し、無ければLLM呼び出しをせず原文をそのまま返す。
+    記事一覧のように大量記事を一度に返す場面で、未キャッシュの翻訳待ちによって
+    レスポンス全体がブロックされるのを避けるために使う（キャッシュ埋め自体は
+    呼び出し側がThreadPoolExecutorへfire-and-forgetで依頼する想定、_warm_translation_cache参照）。
+    単一記事の詳細表示等、確実に翻訳済みの文言を返したい場面ではtranslate_title/translate_summary
+    （ブロッキング）をそのまま使うこと。"""
+    key = (namespace, target_lang, article_id)
+    return _short_cache.get(key, text)
+
+
 def _translate_short(azure_client, model: str, namespace: str, article_id: str,
                       text: str, target_lang: str) -> str:
     key = (namespace, target_lang, article_id)
@@ -307,6 +426,10 @@ def _translate_short(azure_client, model: str, namespace: str, article_id: str,
     except Exception:
         result = text
     _short_cache[key] = result
+    try:
+        _persist_translation(namespace, target_lang, article_id, result)
+    except Exception:
+        pass  # DB書き込み失敗はプロセスメモリのキャッシュ自体には影響させない
     return result
 
 
@@ -383,15 +506,29 @@ def translate_body(azure_client, model: str, article_id: str, text: str, target_
             translated.append(chunk)
     result = "\n\n".join(translated)
     _body_cache[key] = result
+    try:
+        _persist_translation("body", target_lang, article_id, result)
+    except Exception:
+        pass  # DB書き込み失敗はプロセスメモリのキャッシュ自体には影響させない
     return result
 
 
-# ─── サスティナAIチャット ───────────────────────────────────────────
+# ─── サステナAIチャット ───────────────────────────────────────────
 def build_chat_system_prompt(
     context_articles: list, expert_base: dict, retrieved_docs: list, competitor_block: str = "",
+    geo_context_block: str = "", decision_signal_block: str = "",
 ) -> str:
     """絞り込み結果が多い場合、単純な先頭N件ではなく重要度優先で上位を渡す
-    （新しい順のままだとS/Aランクの重要記事が新着の低重要度記事に押し出されてしまうため）"""
+    （新しい順のままだとS/Aランクの重要記事が新着の低重要度記事に押し出されてしまうため）。
+
+    geo_context_block: Phase B、sustainability_chat_geo_service.get_geo_chat_context_with_meta()が
+    返す他部門（Geopolitics）コンテキスト（不要な場合は空文字列）。既に「参考データとして扱う」旨を
+    含めたテキストとして渡ってくるため、ここではそのまま末尾に追記するだけでよい。
+
+    decision_signal_block: Weekly Strategic Question機能、
+    decision_insight_service.build_decision_insight_chat_block()が返す「組織内の判断傾向」
+    （不要な場合は空文字列）。公式方針・外部情報とは明確に区別されたセクションとして
+    末尾に追記する。既にguardrail文言を含めたテキストとして渡ってくる。"""
     top = top_articles_for_carousel(context_articles, CHAT_CONTEXT_LIMIT)
     lines = []
     for a in top:
@@ -412,9 +549,28 @@ def build_chat_system_prompt(
 
     return (
         CHAT_SYSTEM_PROMPT_HEADER
-        + f"\n# 当社サスティナビリティの重点領域・判断ルール\n{company_context}\n"
+        + f"\n# 当社サステナビリティの重点領域・判断ルール\n{company_context}\n"
         + f"\n# 当社公式コンテキスト（質問に関連して検索されたもの）\n{knowledge_block}\n"
         + note
         + f"\n# 参照記事一覧（画面左側の検索・タグ絞り込みの結果）\n{articles_block}\n"
         + (f"\n{competitor_block}\n" if competitor_block else "")
+        + (geo_context_block if geo_context_block else "")
+        + (f"\n{CHAT_GEO_SYNTHESIS_INSTRUCTION}\n" if geo_context_block else "")
+        + (f"\n{decision_signal_block}\n" if decision_signal_block else "")
     )
+
+
+# ─── Phase B: Search用Cross-domain Intelligence整形 ────────────────────────
+def _to_cross_domain_item(source) -> dict:
+    """cross_domain_intelligence_service.CrossDomainIntelligenceSource 1件を、Search専用の
+    CrossDomainIntelligenceItem形（本文＋Provenance）へ変換する純粋関数。
+    Chatと違いSearchは人間が直接Intelligence本体を読むため、Provenanceだけでなく
+    title/assessment/whyRelevant/asOfも返す。"""
+    return {
+        "id": source.source_item_id or source.external_call_id,
+        "title": source.title,
+        "assessment": source.assessment,
+        "whyRelevant": source.why_relevant,
+        "asOf": source.as_of,
+        "provenance": chat_geo._to_provenance(source),
+    }

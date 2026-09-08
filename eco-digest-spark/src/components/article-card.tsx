@@ -22,6 +22,8 @@ import {
   useArticleLikeRead,
   useCategories,
   type Article,
+  type Category,
+  type Lang,
 } from "@/lib/api";
 import { useLanguage } from "@/lib/i18n";
 
@@ -107,6 +109,43 @@ function EngagementRow({ article, size = "sm" }: { article: Article; size?: "sm"
   );
 }
 
+// カードの限られた面積に収まるよう、大テーマは最大3件まで表示し、残りは「+N」で示す
+const MAX_VISIBLE_CATEGORIES = 3;
+
+function CategoryPills({
+  article,
+  categories,
+  lang,
+}: {
+  article: Article;
+  categories: Category[];
+  lang: Lang;
+}) {
+  const visible = article.categories.slice(0, MAX_VISIBLE_CATEGORIES);
+  const overflow = article.categories.length - visible.length;
+  return (
+    <>
+      {visible.map((catId) => {
+        const c = categoryMeta(categories, catId);
+        return (
+          <span
+            key={catId}
+            className="text-[10px] uppercase tracking-[0.15em] text-white px-1.5 py-0.5 rounded"
+            style={{ backgroundColor: c.hue }}
+          >
+            {categoryLabel(c, lang)}
+          </span>
+        );
+      })}
+      {overflow > 0 && (
+        <span className="text-[10px] text-white/90 bg-black/40 px-1.5 py-0.5 rounded">
+          +{overflow}
+        </span>
+      )}
+    </>
+  );
+}
+
 export function ArticleCard({
   article,
   variant = "default",
@@ -157,6 +196,17 @@ export function ArticleCard({
           <p className="text-sm text-muted-foreground mt-2 leading-relaxed line-clamp-2">
             {article.summary}
           </p>
+          <div className="flex flex-wrap items-center gap-1.5 mt-2.5">
+            <CategoryPills article={article} categories={categories} lang={lang} />
+            {[...article.subThemes, ...article.tags].slice(0, 4).map((tag) => (
+              <span
+                key={tag}
+                className="text-[10px] px-1.5 py-0.5 rounded border border-border text-muted-foreground"
+              >
+                {tag}
+              </span>
+            ))}
+          </div>
           <div className="flex items-center gap-4 mt-3">
             <EngagementRow article={article} />
             {article.sector && (
@@ -255,6 +305,17 @@ export function ArticleCard({
         <p className="text-xs text-muted-foreground mt-2 leading-relaxed line-clamp-2">
           {article.summary}
         </p>
+        <div className="flex flex-wrap items-center gap-1 mt-2">
+          <CategoryPills article={article} categories={categories} lang={lang} />
+          {[...article.subThemes, ...article.tags].slice(0, 3).map((tag) => (
+            <span
+              key={tag}
+              className="text-[10px] px-1.5 py-0.5 rounded border border-border text-muted-foreground"
+            >
+              {tag}
+            </span>
+          ))}
+        </div>
         <div className="flex items-center justify-between mt-3 pt-3 border-t border-border/70">
           <EngagementRow article={article} />
           <span className="text-[11px] text-muted-foreground">{relativeTime(article.publishedAt, lang)}</span>

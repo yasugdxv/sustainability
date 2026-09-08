@@ -2,6 +2,7 @@ import { createFileRoute, Link, notFound } from "@tanstack/react-router";
 import { useState } from "react";
 import { Bookmark, Share2, Sparkles, ArrowLeft, ExternalLink, TrendingUp, Heart, BookOpen } from "lucide-react";
 import { TopBar } from "@/components/top-bar";
+import { ImportanceBreakdown } from "@/components/importance-breakdown";
 import {
   articleQueryOptions,
   categoryLabel,
@@ -63,13 +64,19 @@ function ArticleDetail() {
         <div className="grid grid-cols-[1fr_320px] gap-12">
           {/* Article body */}
           <article>
-            <div className="flex items-center gap-2 text-xs">
-              <span
-                className="text-[10px] uppercase tracking-[0.2em] text-white px-2 py-1 rounded"
-                style={{ backgroundColor: cat.hue }}
-              >
-                {categoryLabel(cat, lang)}
-              </span>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              {article.categories.map((catId) => {
+                const c = categoryMeta(categories, catId);
+                return (
+                  <span
+                    key={catId}
+                    className="text-[10px] uppercase tracking-[0.2em] text-white px-2 py-1 rounded"
+                    style={{ backgroundColor: c.hue }}
+                  >
+                    {categoryLabel(c, lang)}
+                  </span>
+                );
+              })}
               {article.trending && (
                 <span className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-destructive">
                   <TrendingUp className="h-3 w-3" /> {t("card.trending")}
@@ -125,8 +132,53 @@ function ArticleDetail() {
                   <div className="mt-0.5 font-medium text-primary">
                     {t("article.importanceScoreValue", { score: article.importance, level: article.importanceLevel })}
                   </div>
+                  {article.importanceTotal !== null && (
+                    <div className="text-muted-foreground mt-0.5">
+                      {t("article.importanceTotalValue", { total: article.importanceTotal })}
+                    </div>
+                  )}
                 </div>
               </div>
+
+              {(article.categories.length > 1 || article.subThemes.length > 0 ||
+                article.tags.length > 0 || article.materialityCodes.length > 0) && (
+                <div className="mt-4 pt-4 border-t border-border/70">
+                  <div className="text-muted-foreground uppercase tracking-wider text-[10px] mb-1.5">
+                    {t("article.allTags")}
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {article.categories.map((catId) => {
+                      const c = categoryMeta(categories, catId);
+                      return (
+                        <span
+                          key={`cat-${catId}`}
+                          className="text-[11px] px-2 py-0.5 rounded-full text-white"
+                          style={{ backgroundColor: c.hue }}
+                        >
+                          {categoryLabel(c, lang)}
+                        </span>
+                      );
+                    })}
+                    {[...article.subThemes, ...article.tags, ...article.materialityCodes].map((tag) => (
+                      <span
+                        key={tag}
+                        className="text-[11px] px-2 py-0.5 rounded-full border border-border text-muted-foreground"
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {article.importanceBreakdown.length > 0 && (
+                <div className="mt-4 pt-4 border-t border-border/70">
+                  <div className="text-muted-foreground uppercase tracking-wider text-[10px] mb-2.5">
+                    {t("article.importanceBreakdown")}
+                  </div>
+                  <ImportanceBreakdown breakdown={article.importanceBreakdown} />
+                </div>
+              )}
             </section>
 
             <div className="prose prose-sm max-w-none mt-8 space-y-5 text-[15px] leading-[1.8] text-foreground/90">

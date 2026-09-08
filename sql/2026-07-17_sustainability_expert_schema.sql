@@ -2,7 +2,7 @@
 -- [新規構築時はsql/build/sustainability_expert/01_create_schema.sqlを使用]
 -- 本ファイルは変更履歴として残置。内容は新規構築版と同一（ALTER無しの新設テーブルのため）。
 -- =====================================================================
--- 当社サスティナビリティ専門家MVP 用スキーマ（新規追加のみ・既存テーブル無変更）
+-- 当社サステナビリティ専門家MVP 用スキーマ（新規追加のみ・既存テーブル無変更）
 -- 作成日: 2026-07-17
 -- 対象: Supabase（Supabase SQL Editorで実行）
 --
@@ -60,7 +60,7 @@ create unique index expert_runs_dedup_idx
     where status = 'success';
 
 comment on table public.expert_runs is
-    'サスティナビリティ専門家MVP: 記事選定/コンテンツ生成それぞれのLLM呼び出し1回を1行で記録する実行ログ';
+    'サステナビリティ専門家MVP: 記事選定/コンテンツ生成それぞれのLLM呼び出し1回を1行で記録する実行ログ';
 comment on column public.expert_runs.article_cluster_id is
     '事象クラスタの代表URL。実体は public.article_urls(article_url_id) を流用（専用クラスタテーブルは新設しない）';
 comment on column public.expert_runs.context_chunk_ids is
@@ -112,7 +112,7 @@ create trigger expert_contents_set_updated_at
     for each row execute function public.set_updated_at();
 
 comment on table public.expert_contents is
-    'サスティナビリティ専門家MVP: publish_candidateから生成したコンテンツ候補。自動公開せず review_required で保存する';
+    'サステナビリティ専門家MVP: publish_candidateから生成したコンテンツ候補。自動公開せず review_required で保存する';
 comment on column public.expert_contents.content_json is
     '構造化コンテンツ本体（title/what_happened/why_it_matters/company_watchpoints/affected_themes/impact_pathways/questions_to_confirm/monitoring_signals/evidence/uncertainties）';
 comment on column public.expert_contents.reviewer_feedback is

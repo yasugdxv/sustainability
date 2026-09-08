@@ -9,9 +9,12 @@ competitor_sources（企業ごとの公式情報源）を巡回し、各URLの�
 取得に成功した本文はその場で competitor_classifier.classify_and_extract() に渡して分類・構造化し、
 続けて competitor_change_detector.process_extracted_record() で過去DBとの差分判定・保存を行う
 （Azure OpenAI / OpenAI のAPIキーが未設定の場合は分類以降をスキップし、取得・ログ記録のみ行う）。
-変更イベントは1件ごとに即時配信せず、全情報源の処理が終わった後に
-competitor_daily_digest.build_digest() を1回だけ呼び、その日確定した変更イベントを
-まとめた日次ダイジェストを作成する（PMOレビュー、または確信度が高ければ自動配信）。
+一次開示照合（変更後の内容が本文に実際に書かれているか）は、process_extracted_record()の内部で
+今回取得済みの本文（result["text"]）を使ってその場で行う（再取得しない。2026-08-24統合）。
+変更イベントは1件ごとに即時配信せず、全情報源の処理が終わった後にcompetitor_daily_digest.
+build_digest() を1回だけ呼び、その日確定した変更イベントのうち一次開示で確認できたもの
+(verification_status='VERIFIED')だけをまとめた日次ダイジェストを作成する
+（PMOレビュー、または確信度が高ければ自動配信）。
 
 使い方:
     python competitor_crawler.py          # 全competitor_sourcesを処理
@@ -91,16 +94,23 @@ def process_source(source: dict, client: SupabaseClient, proxies: dict, verify: 
 
 
 def process_records(client: SupabaseClient, azure_client, model: str,
-                     company: dict, source: dict, records: list, source_updated_at=None) -> list:
+                     company: dict, source: dict, records: list, source_updated_at=None,
+                     source_text: str = None) -> list:
     """classifier.classify_and_extract()が返したレコード一覧を変更検知に通す。
+    source_text（今回取得済みの本文）は一次開示照合にそのまま使われる（再取得しない）。
     変更イベントの配信判定はここでは行わず、main()の最後にdaily_digest.build_digest()で
-    まとめて行う"""
-    return [
-        change_detector.process_extracted_record(
-            client, azure_client, model, company=company, source=source, extracted=extracted,
-            source_updated_at=source_updated_at)
-        for extracted in records
-    ]
+    まとめて行う。1レコードの処理でプロキシ瞬断等の想定外エラーが起きても、残りの
+    レコード・情報源の処理を止めない（従来はここで例外がmain()のループ全体まで伝播し、
+    数十件処理済みでも1件のエラーで最初からやり直しになっていたため）"""
+    outcomes = []
+    for extracted in records:
+        try:
+            outcomes.append(change_detector.process_extracted_record(
+                client, azure_client, model, company=company, source=source, extracted=extracted,
+                source_updated_at=source_updated_at, source_text=source_text))
+        except Exception as e:
+            outcomes.append({"kind": "error", "error": f"{type(e).__name__}: {e}"})
+    return outcomes
 
 
 def main(limit: int = None):
@@ -112,6 +122,8 @@ def main(limit: int = None):
     if not azure_client:
         print("  ⚠ Azure OpenAI / OpenAI のAPIキーが未設定です。取得・ログ記録のみ行い、"
               "分類・変更検知はスキップします。")
+    else:
+        classifier.load_goal_categories(client)
 
     sources = list_sources(client)
     if limit:
@@ -154,19 +166,26 @@ def main(limit: int = None):
             continue
 
         outcomes = process_records(client, azure_client, model, company, source, records,
-                                    source_updated_at=result.get("source_updated_at"))
+                                    source_updated_at=result.get("source_updated_at"),
+                                    source_text=result["text"])
         kinds = [o.get("kind") for o in outcomes]
         print(f" / レコード{len(records)}件抽出 → {kinds}")
 
     print(f"取得完了: {len(fetched)}/{len(sources)}件")
 
     if azure_client:
-        digest = daily_digest.build_digest(client, config)
-        if digest is None:
-            print("本日の変更イベントは0件のため、日次ダイジェストは作成しませんでした。")
+        try:
+            digest = daily_digest.build_digest(client, config)
+        except Exception as e:
+            # プロキシ瞬断等でここだけ失敗しても、既に保存済みの変更イベントは無駄にならない
+            # （次回実行時にbuild_digest()を再試行すればよい）
+            print(f"日次ダイジェスト生成でエラー（次回実行時に再試行してください）: {type(e).__name__}: {e}")
         else:
-            print(f"日次ダイジェストを更新しました（digest_id={digest['digest_id']}, "
-                  f"review_status={digest.get('review_status', '?')}）")
+            if digest is None:
+                print("本日の変更イベントは0件のため、日次ダイジェストは作成しませんでした。")
+            else:
+                print(f"日次ダイジェストを更新しました（digest_id={digest['digest_id']}, "
+                      f"review_status={digest.get('review_status', '?')}）")
 
     return fetched
 

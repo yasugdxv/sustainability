@@ -1,5 +1,5 @@
 """
-当社サスティナビリティ専門家MVP: レビュー画面（Streamlitプロトタイプ）
+当社サステナビリティ専門家MVP: レビュー画面（Streamlitプロトタイプ）
 
 生成されたコンテンツ候補(review_required)を一覧・確認し、承認/却下/修正と
 レビューフィードバックを記録する。自動公開はしない（承認までがこのMVPの範囲）。
@@ -20,6 +20,7 @@ import weekly_email_report as wer  # noqa: E402
 import monthly_competitor_report as monthly_competitor  # noqa: E402
 import competitor_source_discovery as source_discovery  # noqa: E402
 import competitor_daily_digest as daily_digest  # noqa: E402
+import strategic_question_service as sq_service  # noqa: E402
 
 CANDIDATE_URL_TYPES = ["SUSTAINABILITY_HOME", "TARGETS", "PROGRESS", "REPORTS", "NEWS", "DISCLOSURE", "OTHER"]
 
@@ -59,6 +60,32 @@ def _get_client(config: dict) -> SupabaseClient:
     return SupabaseClient(config)
 
 
+def _render_geo_intelligence_summary(report: dict, config: dict):
+    """Geo Intelligence（Phase S2）実行結果の簡易表示のみ。大規模UIは作らない。
+    weekly_geo_intelligence_runs/itemsが無い（未適用/Kill Switch OFF）場合は何も表示しない"""
+    period_start, period_end = report.get("period_start"), report.get("period_end")
+    if not period_start or not period_end:
+        return
+    try:
+        client = _get_client(config)
+        runs = client.select("weekly_geo_intelligence_runs", {
+            "select": "*", "period_start": f"eq.{period_start}", "period_end": f"eq.{period_end}",
+            "order": "created_at.desc", "limit": "1",
+        })
+        if not runs:
+            return
+        run = runs[0]
+        items = client.select("weekly_geo_intelligence_items", {"select": "*", "run_id": f"eq.{run['id']}"})
+        same_event = sum(1 for i in items if i.get("dedup_classification") == "same_event")
+        related = sum(1 for i in items if i.get("dedup_classification") == "related_context")
+        independent_selected = sum(1 for i in items if i.get("dedup_classification") == "independent"
+                                    and i.get("selection_status") == "selected")
+        st.caption(f"🌏 Geo Intelligence: 取得{len(items)}件 / 採用{independent_selected}件（independent） / "
+                   f"記事へ紐付け{same_event}件（same_event） / 背景情報{related}件（related_context）")
+    except Exception:
+        pass  # 取得に失敗してもレビュー画面自体は継続する（大規模UIは作らない最小追加のため）
+
+
 def _render_weekly_report_card(report: dict, config: dict):
     """1週分のドラフト全体を1カードとして表示する。表示内容は送信される
     メール本文そのもの（html_bodyのプレビュー）のみとし、概況・注目ポイント・
@@ -81,6 +108,8 @@ def _render_weekly_report_card(report: dict, config: dict):
             st.components.v1.html(report["html_body"], height=700, scrolling=True)
         else:
             st.info("メール本文がまだ生成されていません。")
+
+        _render_geo_intelligence_summary(report, config)
 
         st.divider()
         st.markdown("**レビュー**")
@@ -359,11 +388,88 @@ def _render_candidate_view(config: dict):
         _render_candidate_card(candidate, config)
 
 
+def _render_strategic_question_view(config: dict):
+    """Weekly Strategic Questionの閲覧画面。承認アクションは持たない（承認は
+    週次メールレビュー画面のJSON編集にバンドルされている）。質問の履歴と、
+    LLM失敗でinsight_status='error'のまま残っている質問への注意喚起、
+    蓄積されたDecision Insight（組織内の判断傾向）の一覧を表示する"""
+    client = _get_client(config)
+
+    st.markdown("### 戦略質問の履歴")
+    try:
+        questions = sq_service.list_questions(client)
+    except Exception as e:
+        st.error(f"sustainability_strategic_questions の取得に失敗しました: {e}"
+                 "（sql/2026-09-01_strategic_question_schema.sql の適用が必要な可能性があります）")
+        return
+
+    error_questions = [q for q in questions if q.get("insight_status") == "error"]
+    if error_questions:
+        st.warning(f"⚠️ Decision Insight生成が失敗したまま残っている質問が{len(error_questions)}件あります。"
+                   "`python generate_strategic_question.py insights` を再実行してください。")
+        for q in error_questions:
+            st.caption(f"  - {q['period_start']} {q['title']}: {q.get('insight_error_message', '')}")
+
+    if not questions:
+        st.info("まだ戦略質問がありません。`python generate_strategic_question.py build` を実行してください。")
+    for q in questions:
+        lifecycle = {"draft": "📝 下書き（未embedded）", "embedded": "📨 週次メールに埋め込み済み（承認待ち）",
+                     "open": "🟢 回答受付中", "closed": "📊 クローズ済み"}.get(q["question_status"], q["question_status"])
+        with st.expander(f"{lifecycle}　{q.get('period_start', '')}　[{q.get('theme', '')}] {q.get('title', '')}"):
+            st.caption(f"question_id: {q['question_id']}　対立軸: {q.get('decision_dimension_label', '')}"
+                       f"（{q.get('decision_dimension_key', '')}）")
+            st.markdown(f"**{q.get('question_text', '')}**")
+            for o in q.get("_options", []):
+                badge = "（現状維持寄り）" if o.get("is_status_quo") else ""
+                st.write(f"- {o['option_code']}. {o['label']}{badge}: {o.get('description', '')}")
+            with st.expander("分析の根拠（Signal→示唆→当社戦略関連→競合比較→対立軸）"):
+                st.json(q.get("analysis_json", {}))
+            with st.expander("他の候補・ランキング根拠"):
+                st.json({"candidates": q.get("candidates_json", []), "ranking_score": q.get("ranking_score"),
+                         "ranking_reasons": q.get("ranking_reasons", [])})
+            if q["question_status"] in ("open", "closed"):
+                try:
+                    import strategic_question_responses as sqr
+                    agg = sqr.aggregate_results(client, q["question_id"])
+                    st.caption(f"回答数: {agg['total_responses']} / 配信数: {agg['delivery_count']} "
+                               f"/ 回答率: {agg['response_rate']*100:.1f}%")
+                except Exception:
+                    pass
+
+    st.divider()
+    st.markdown("### 組織判断ナレッジ一覧（Decision Insight）")
+    st.caption("いずれも「観測された傾向」であり、会社の正式方針ではありません。")
+    insights = client.select("sustainability_decision_insights", {"select": "*", "order": "observed_at.desc"})
+    if not insights:
+        st.info("蓄積された組織判断ナレッジがまだありません。")
+    for ins in insights:
+        publishable = "🟢 掲載条件を満たす" if _is_publishable(ins, config) else "⚪ 回答数/回答率が閾値未満（非掲載）"
+        with st.expander(f"{publishable}　[{ins.get('theme', '')}] {ins.get('decision_dimension_label', '')}"):
+            st.caption(f"observed_at: {ins.get('observed_at', '')}　回答数: {ins.get('response_count')} / "
+                       f"配信数: {ins.get('delivery_count')}　confidence: {ins.get('confidence')}")
+            st.warning(ins.get("guardrail_label", ""))
+            st.write(ins.get("observed_tendency", ""))
+            st.json(ins.get("distribution_json", {}))
+            st.write("**理由の要約**:", ins.get("reasoning_summary", ""))
+            if ins.get("representative_reasoning"):
+                st.write("**代表的な理由づけパターン**:")
+                for r in ins["representative_reasoning"]:
+                    st.write(f"- {r}")
+
+
+def _is_publishable(insight: dict, config: dict) -> bool:
+    import decision_insight_service as insight_service
+    try:
+        return insight_service.publishable(insight, config)
+    except Exception:
+        return False
+
+
 def main():
-    st.set_page_config(page_title="サスティナビリティ専門家レビュー", page_icon="🌿", layout="wide")
+    st.set_page_config(page_title="サステナビリティ専門家レビュー", page_icon="🌿", layout="wide")
     config = _load_config()
 
-    st.title("🌿 サスティナビリティ専門家 レビュー")
+    st.title("🌿 サステナビリティ専門家 レビュー")
 
     if not common.is_enabled(config):
         st.warning("⚠️ SUSTAINABILITY_EXPERT_ENABLED が無効です。config.json の "
@@ -373,7 +479,7 @@ def main():
     with st.sidebar:
         view = st.radio("表示", [
             "週次メールレビュー", "競合アラート日次ダイジェスト", "競合月次レビュー",
-            "競合クロール候補管理",
+            "競合クロール候補管理", "戦略質問・組織判断ナレッジ",
         ])
 
     if view == "週次メールレビュー":
@@ -387,6 +493,10 @@ def main():
         st.caption("競合サステナビリティ月次レポートのドラフトは自動送信されません。"
                    "内容を確認のうえ、承認して送信/却下してください。")
         _render_competitor_monthly_view(config)
+    elif view == "戦略質問・組織判断ナレッジ":
+        st.caption("戦略質問の承認は週次メールレビュー画面のJSON編集にバンドルされています"
+                   "（このページは閲覧専用です）。")
+        _render_strategic_question_view(config)
     else:
         st.caption("サステナビリティ起点ページから自動発見された候補URLです。"
                    "種別を確認・修正し、問題なければ有効化して監視対象に追加してください。")

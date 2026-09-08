@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Download } from "lucide-react";
 import { TopBar } from "@/components/top-bar";
 import { useCompetitorCompanies, useCompetitorInitiatives } from "@/lib/api";
@@ -17,24 +17,39 @@ function CompetitorInitiativesPage() {
   const { lang, t } = useLanguage();
   const [companyId, setCompanyId] = useState("");
   const [theme, setTheme] = useState("");
+  const [goalCategory, setGoalCategory] = useState("");
   const { data: companiesData } = useCompetitorCompanies();
   const { data, isLoading } = useCompetitorInitiatives({
     companyId: companyId || undefined,
     theme: theme || undefined,
   });
   const companies = companiesData?.companies ?? [];
-  const initiatives = data?.initiatives ?? [];
+  const allInitiatives = data?.initiatives ?? [];
+
+  // 目標カテゴリの選択肢は、選択中のテーマ・企業に紐づくものだけを動的に出す
+  const goalCategoryOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const ini of allInitiatives) {
+      if (ini.goalCategoryId && ini.goalCategoryName) seen.set(ini.goalCategoryId, ini.goalCategoryName);
+    }
+    return [...seen.entries()];
+  }, [allInitiatives]);
+  const initiatives = goalCategory
+    ? allInitiatives.filter((ini) => ini.goalCategoryId === goalCategory)
+    : allInitiatives;
 
   const exportCsv = () => {
     downloadCsv(
       `competitor_initiatives_${new Date().toISOString().slice(0, 10)}.csv`,
       [
-        t("csv.col.company"), t("csv.col.theme"), t("csv.col.title"), t("csv.col.summary"),
+        t("csv.col.company"), t("csv.col.theme"), t("competitor.targets.goalCategory"),
+        t("csv.col.title"), t("csv.col.summary"),
         t("csv.col.status"), t("csv.col.detectedAt"), t("csv.col.url"),
       ],
       initiatives.map((ini) => [
         companyDisplayName(ini.companyName, ini.companyNameEn, lang),
         themeListLabel(ini.themes, lang),
+        ini.goalCategoryName ?? "",
         ini.title,
         ini.summary,
         ini.isNew ? t("competitor.initiatives.new") : t("competitor.initiatives.updated"),
@@ -71,7 +86,13 @@ function CompetitorInitiativesPage() {
                 ))}
               </SelectContent>
             </Select>
-            <Select value={theme || "all"} onValueChange={(v) => setTheme(v === "all" ? "" : v)}>
+            <Select
+              value={theme || "all"}
+              onValueChange={(v) => {
+                setTheme(v === "all" ? "" : v);
+                setGoalCategory("");
+              }}
+            >
               <SelectTrigger className="w-48">
                 <SelectValue placeholder={t("competitor.filter.allThemes")} />
               </SelectTrigger>
@@ -79,6 +100,17 @@ function CompetitorInitiativesPage() {
                 <SelectItem value="all">{t("competitor.filter.allThemes")}</SelectItem>
                 {COMPETITOR_THEMES.map((th) => (
                   <SelectItem key={th} value={th}>{themeLabel(th, lang)}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={goalCategory || "all"} onValueChange={(v) => setGoalCategory(v === "all" ? "" : v)}>
+              <SelectTrigger className="w-56">
+                <SelectValue placeholder={t("competitor.filter.allGoalCategories")} />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">{t("competitor.filter.allGoalCategories")}</SelectItem>
+                {goalCategoryOptions.map(([id, name]) => (
+                  <SelectItem key={id} value={id}>{name}</SelectItem>
                 ))}
               </SelectContent>
             </Select>
@@ -119,6 +151,11 @@ function CompetitorInitiativesPage() {
                       {themeLabel(th, lang)}
                     </span>
                   ))}
+                  {ini.goalCategoryName && (
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-primary/10 text-primary">
+                      {ini.goalCategoryName}
+                    </span>
+                  )}
                 </div>
                 {ini.sourceUrl && (
                   <a

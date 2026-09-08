@@ -1,8 +1,8 @@
 """
-当社サスティナビリティ知識ベース: 検索・投入モジュール
+当社サステナビリティ知識ベース: 検索・投入モジュール
 
 `knowledge/sustainability_expert/knowledge_documents.jsonl` を初期データとして、
-当社サスティナビリティの公式方針・目標・テーマ文脈をキーワード検索/ベクトル検索できる
+当社サステナビリティの公式方針・目標・テーマ文脈をキーワード検索/ベクトル検索できる
 ようにする。Azure AI Searchが使えない開発環境では、同じインターフェースで動く
 ローカル簡易実装（`LocalJsonlKnowledgeStore`）にフォールバックする。
 
@@ -318,7 +318,7 @@ def get_knowledge_store(config: dict):
 def main():
     from article_crawler import load_config
 
-    parser = argparse.ArgumentParser(description="サスティナビリティ知識ベースの投入・検索")
+    parser = argparse.ArgumentParser(description="サステナビリティ知識ベースの投入・検索")
     parser.add_argument("command", choices=["ingest", "search"])
     parser.add_argument("query", nargs="?", default="")
     parser.add_argument("--mode", choices=["local", "azure_ai_search"], default=None)

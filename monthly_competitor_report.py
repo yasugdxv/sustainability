@@ -412,9 +412,10 @@ def build_text(report_month: str, companies_data: list, trends: list) -> str:
 
 
 # ─── DB読み書き ─────────────────────────────────────────────────────
-def list_recipients(client: SupabaseClient) -> list:
-    rows = client.select("competitor_recipients", {
+def list_recipients(client: SupabaseClient, test_mode: bool = False) -> list:
+    rows = client.select("email_recipients", {
         "select": "email", "active": "eq.true", "notify_monthly_report": "eq.true",
+        "is_test": f"eq.{'true' if test_mode else 'false'}",
     })
     return [r["email"] for r in rows]
 
@@ -513,7 +514,7 @@ def reject_report(client: SupabaseClient, report_id: str, reviewer_id: str,
 
 
 def approve_and_send(client: SupabaseClient, config: dict, report_id: str, reviewer_id: str,
-                      reviewer_feedback: dict = None) -> dict:
+                      reviewer_feedback: dict = None, test_mode: bool = False) -> dict:
     rows = client.select("monthly_reports", {"report_id": f"eq.{report_id}", "limit": "1"})
     report = rows[0] if rows else None
     if report is None:
@@ -527,8 +528,8 @@ def approve_and_send(client: SupabaseClient, config: dict, report_id: str, revie
         "approved_by": reviewer_id, "approved_at": now_iso,
     })
 
-    recipients = list_recipients(client)
-    result = send_email(report["subject"], report["html_body"], config)
+    recipients = list_recipients(client, test_mode=test_mode)
+    result = send_email(report["subject"], report["html_body"], config, recipients)
     patch = {
         "send_mode": result.get("mode"), "recipients": recipients,
         "send_status": "success" if result.get("ok") else "error",
@@ -619,6 +620,8 @@ if __name__ == "__main__":
     p_send = subparsers.add_parser("send", help="承認済みドラフトを送信する（運用フォールバック）")
     p_send.add_argument("--report-id", required=True)
     p_send.add_argument("--reviewer-id", default="cli")
+    p_send.add_argument("--mode", choices=["test", "production"], default="production",
+                         help="test指定時はemail_recipientsのis_test=true受信者のみに送信する")
 
     cli_args = parser.parse_args()
     if cli_args.cmd == "build":
@@ -626,5 +629,6 @@ if __name__ == "__main__":
     else:
         _config = load_config()
         _client = SupabaseClient(_config)
-        _result = approve_and_send(_client, _config, cli_args.report_id, reviewer_id=cli_args.reviewer_id)
+        _result = approve_and_send(_client, _config, cli_args.report_id, reviewer_id=cli_args.reviewer_id,
+                                    test_mode=(cli_args.mode == "test"))
         print(_result)

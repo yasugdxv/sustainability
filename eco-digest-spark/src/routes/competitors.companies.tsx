@@ -3,6 +3,7 @@ import { TopBar } from "@/components/top-bar";
 import { useCompetitorCompanies } from "@/lib/api";
 import { companyCategoryLabel, companyDisplayName, useLanguage } from "@/lib/i18n";
 import { Building2 } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 
 export const Route = createFileRoute("/competitors/companies")({
   component: CompetitorCompaniesPage,
@@ -40,11 +41,16 @@ function CompetitorCompaniesPage() {
                 key={c.id}
                 to="/competitors/companies/$companyId"
                 params={{ companyId: c.id }}
-                className="card-paper rounded-lg p-4 hover:bg-sidebar-accent/20 transition-colors"
+                className={`card-paper rounded-lg p-4 hover:bg-sidebar-accent/20 transition-colors ${
+                  c.isOwnCompany ? "border-2 border-primary/40" : ""
+                }`}
               >
-                <div className="flex items-center gap-2 text-muted-foreground">
-                  <Building2 className="h-4 w-4" />
-                  <span className="text-[10px] uppercase tracking-wider">{companyCategoryLabel(c.category, lang)}</span>
+                <div className="flex items-center justify-between gap-2 text-muted-foreground">
+                  <div className="flex items-center gap-2">
+                    <Building2 className="h-4 w-4" />
+                    <span className="text-[10px] uppercase tracking-wider">{companyCategoryLabel(c.category, lang)}</span>
+                  </div>
+                  {c.isOwnCompany && <Badge>{t("competitor.companies.ownBadge")}</Badge>}
                 </div>
                 <div className="text-editorial text-lg mt-2">{companyDisplayName(c.name, c.nameEn, lang)}</div>
                 <div className="flex items-center gap-4 mt-3 text-xs text-muted-foreground">

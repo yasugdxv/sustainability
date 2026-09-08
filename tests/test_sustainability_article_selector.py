@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -9,6 +10,14 @@ import json  # noqa: E402
 import sustainability_article_selector as sas  # noqa: E402
 import sustainability_expert_common as common  # noqa: E402
 from tests._fakes import FakeSupabaseClient, FakeKnowledgeStore  # noqa: E402
+
+
+def _days_ago_iso(days: int) -> str:
+    """list_weekly_picks()のsince_days判定は実行時刻(datetime.now())基準の相対値なので、
+    テスト側も絶対日付をハードコードせず「実行時点から何日前か」で表現する
+    （ハードコードすると、テスト作成時から日数が経つにつれ「直近since_days日以内」の
+    条件を満たさなくなり、テストが日付依存で壊れるバグを防ぐため）。"""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
 EXPERT_VERSION = "test-0.1.0"
 
@@ -109,6 +118,70 @@ def test_duplicate_articles_resolve_to_single_cluster():
     assert [m["article_id"] for m in cluster["members"]] == ["a2"]
 
 
+def test_list_candidate_cluster_ids_excludes_suppressed_duplicate():
+    """一次情報の要約に留まると判定された二次記事(representative_role=suppressed_duplicate)は、
+    選定候補のクラスタから除外されること。一次情報側は通常通り候補に残ること"""
+    urls = [
+        {"article_url_id": "u1", "article_url": "https://a.example.com/1",
+         "duplicate_of_article_url_id": None},
+        {"article_url_id": "u2", "article_url": "https://b.example.com/1",
+         "duplicate_of_article_url_id": None},
+    ]
+    articles = [
+        {"article_id": "a1", "article_url_id": "u1", "title": "一次情報",
+         "extracted_text": "本文1", "published_at": "2026-07-10T00:00:00+00:00",
+         "final_url": "https://a.example.com/1", "fetched_url": "https://a.example.com/1",
+         "crawl_target_id": "t1", "is_current": True},
+        {"article_id": "a2", "article_url_id": "u2", "title": "単純要約の二次記事",
+         "extracted_text": "本文2", "published_at": "2026-07-10T01:00:00+00:00",
+         "final_url": "https://b.example.com/1", "fetched_url": "https://b.example.com/1",
+         "crawl_target_id": "t1", "is_current": True},
+    ]
+    tables = _base_tables(urls, articles)
+    tables["article_analysis"] = [
+        {"article_id": "a1", "primary_source_status": "一次情報", "summary_short": "要約",
+         "is_current": True, "representative_role": "representative"},
+        {"article_id": "a2", "primary_source_status": "解釈・分析", "summary_short": "要約",
+         "is_current": True, "representative_role": "suppressed_duplicate"},
+    ]
+    client = FakeSupabaseClient(tables)
+
+    cluster_ids = sas.list_candidate_cluster_ids(client)
+    assert cluster_ids == ["u1"]
+
+
+def test_list_theme_prioritized_cluster_ids_excludes_suppressed_duplicate():
+    """本番パイプライン(run_daily.py --top-n-per-theme)が使う経路でも、
+    suppressed_duplicateのクラスタがTier0選定から除外されること"""
+    tag_rows = [
+        {"tag_id": "TH-02", "tag_axis": "テーマ", "tag_level": "大分類", "parent_tag_id": None},
+    ]
+    articles = [
+        {"article_id": "a1", "article_url_id": "u1", "crawl_target_id": "t1", "is_current": True},
+        {"article_id": "a2", "article_url_id": "u2", "crawl_target_id": "t1", "is_current": True},
+    ]
+    client = FakeSupabaseClient({
+        "tag_reference": tag_rows,
+        "crawl_targets": [{"crawl_target_id": "t1", "publisher_tag_id": None}],
+        "articles": articles,
+        "article_analysis": [
+            {"article_id": "a1", "importance_level": "S", "importance_total_score": 30,
+             "representative_role": "representative"},
+            {"article_id": "a2", "importance_level": "S", "importance_total_score": 32,
+             "representative_role": "suppressed_duplicate"},
+        ],
+        "article_tags": [
+            {"article_id": "a1", "tag_id": "TH-02"},
+            {"article_id": "a2", "tag_id": "TH-02"},
+        ],
+    })
+    all_urls = {"u1": {"article_url_id": "u1", "duplicate_of_article_url_id": None},
+                "u2": {"article_url_id": "u2", "duplicate_of_article_url_id": None}}
+
+    cluster_ids = sas.list_theme_prioritized_cluster_ids(client, all_urls, top_n=10)
+    assert cluster_ids == ["u1"]
+
+
 def test_select_cluster_important_article_becomes_publish_candidate():
     """結合テストケース1: 当社目標に直接関係する重要記事はpublish_candidateとして保存されること"""
     client = FakeSupabaseClient(_single_article_tables())
@@ -176,9 +249,9 @@ def _expert_run_row(run_id, cluster_id, decision, total_score, created_at, exper
 
 def test_list_weekly_picks_excludes_not_selected_and_sorts_by_score():
     client = FakeSupabaseClient({"expert_runs": [
-        _expert_run_row("r1", "c1", "publish_candidate", 90, "2026-07-20T00:00:00+00:00"),
-        _expert_run_row("r2", "c2", "not_selected", 99, "2026-07-20T00:00:00+00:00"),
-        _expert_run_row("r3", "c3", "watch_or_archive", 60, "2026-07-20T00:00:00+00:00"),
+        _expert_run_row("r1", "c1", "publish_candidate", 90, _days_ago_iso(2)),
+        _expert_run_row("r2", "c2", "not_selected", 99, _days_ago_iso(2)),
+        _expert_run_row("r3", "c3", "watch_or_archive", 60, _days_ago_iso(2)),
     ]})
     picks = sas.list_weekly_picks(client, since_days=7, target_max=20)
     assert [p["article_cluster_id"] for p in picks] == ["c1", "c3"]
@@ -186,7 +259,7 @@ def test_list_weekly_picks_excludes_not_selected_and_sorts_by_score():
 
 
 def test_list_weekly_picks_truncates_to_target_max():
-    rows = [_expert_run_row(f"r{i}", f"c{i}", "publish_candidate", 100 - i, "2026-07-20T00:00:00+00:00")
+    rows = [_expert_run_row(f"r{i}", f"c{i}", "publish_candidate", 100 - i, _days_ago_iso(2))
             for i in range(10)]
     client = FakeSupabaseClient({"expert_runs": rows})
     picks = sas.list_weekly_picks(client, since_days=7, target_max=3)
@@ -196,8 +269,8 @@ def test_list_weekly_picks_truncates_to_target_max():
 
 def test_list_weekly_picks_keeps_only_latest_run_per_cluster():
     client = FakeSupabaseClient({"expert_runs": [
-        _expert_run_row("r1", "c1", "not_selected", 20, "2026-07-18T00:00:00+00:00"),
-        _expert_run_row("r2", "c1", "publish_candidate", 88, "2026-07-20T00:00:00+00:00"),
+        _expert_run_row("r1", "c1", "not_selected", 20, _days_ago_iso(4)),
+        _expert_run_row("r2", "c1", "publish_candidate", 88, _days_ago_iso(2)),
     ]})
     picks = sas.list_weekly_picks(client, since_days=7, target_max=20)
     assert len(picks) == 1
@@ -207,9 +280,9 @@ def test_list_weekly_picks_keeps_only_latest_run_per_cluster():
 
 def test_list_weekly_picks_filters_by_expert_version():
     client = FakeSupabaseClient({"expert_runs": [
-        _expert_run_row("r1", "c1", "publish_candidate", 90, "2026-07-20T00:00:00+00:00",
+        _expert_run_row("r1", "c1", "publish_candidate", 90, _days_ago_iso(2),
                          expert_version="0.1.0"),
-        _expert_run_row("r2", "c2", "publish_candidate", 95, "2026-07-20T00:00:00+00:00",
+        _expert_run_row("r2", "c2", "publish_candidate", 95, _days_ago_iso(2),
                          expert_version="0.2.0"),
     ]})
     picks = sas.list_weekly_picks(client, since_days=7, expert_version="0.2.0", target_max=20)
@@ -218,8 +291,8 @@ def test_list_weekly_picks_filters_by_expert_version():
 
 def test_list_weekly_picks_excludes_stale_runs_outside_since_days():
     client = FakeSupabaseClient({"expert_runs": [
-        _expert_run_row("r1", "c1", "publish_candidate", 90, "2020-01-01T00:00:00+00:00"),
-        _expert_run_row("r2", "c2", "publish_candidate", 80, "2026-07-20T00:00:00+00:00"),
+        _expert_run_row("r1", "c1", "publish_candidate", 90, _days_ago_iso(365)),
+        _expert_run_row("r2", "c2", "publish_candidate", 80, _days_ago_iso(2)),
     ]})
     picks = sas.list_weekly_picks(client, since_days=7, target_max=20)
     assert [p["article_cluster_id"] for p in picks] == ["c2"]

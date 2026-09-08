@@ -1,18 +1,23 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
-import { Download, Search as SearchIcon, SlidersHorizontal } from "lucide-react";
+import { useMemo, useState } from "react";
+import { ChevronDown, ChevronUp, Download, Search as SearchIcon, SlidersHorizontal } from "lucide-react";
 import { TopBar } from "@/components/top-bar";
 import { ArticleCard } from "@/components/article-card";
-import { categoryLabel, categoryMeta, useArticles, useCategories } from "@/lib/api";
+import { categoryLabel, categoryMeta, useArticles, useCategories, useSubcategories } from "@/lib/api";
 import { searchSuggestions, useLanguage } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 import { downloadCsv } from "@/lib/csv";
+import { ProvenanceBadge } from "@/components/provenance-badge";
 
 export const Route = createFileRoute("/search")({
   component: SearchPage,
 });
 
 const SORT_IDS = ["importance", "latest", "trending", "likes", "reads"] as const;
+// 全期間は「非常に長い日数」として扱う（バックエンドはsince_daysの単純な
+// 日数指定のみ受け付けるため、明示的な「無制限」モードは持たせていない）
+const PERIOD_OPTIONS = [7, 30, 90, 36500] as const;
+const SUBTAGS_COLLAPSED_GROUPS = 3;
 
 function SearchPage() {
   const { lang, t } = useLanguage();
@@ -21,10 +26,29 @@ function SearchPage() {
   const [sort, setSort] = useState<(typeof SORT_IDS)[number]>("importance");
   const [selectedCats, setSelectedCats] = useState<string[]>([]);
   const [minImportance, setMinImportance] = useState(0);
+  const [sinceDays, setSinceDays] = useState<(typeof PERIOD_OPTIONS)[number]>(30);
+  const [subtagsOpen, setSubtagsOpen] = useState(false);
+  const [showAllSubtagGroups, setShowAllSubtagGroups] = useState(false);
 
   const { data: categories = [] } = useCategories();
-  const { data: result, isFetching } = useArticles({ themes: selectedCats, q: submittedQ, lang });
+  const { data: subcategories = [] } = useSubcategories();
+  const { data: result, isFetching } = useArticles({ themes: selectedCats, q: submittedQ, lang, sinceDays });
   const articles = result?.articles ?? [];
+
+  const subtagsByParent = useMemo(() => {
+    const groups = new Map<string, typeof subcategories>();
+    for (const s of subcategories) {
+      if (s.count === 0) continue;
+      const list = groups.get(s.parent) ?? [];
+      list.push(s);
+      groups.set(s.parent, list);
+    }
+    return groups;
+  }, [subcategories]);
+  const subtagParents = [...subtagsByParent.keys()];
+  const visibleSubtagParents = showAllSubtagGroups
+    ? subtagParents
+    : subtagParents.slice(0, SUBTAGS_COLLAPSED_GROUPS);
 
   const filtered = articles
     .filter((a) => a.importance >= minImportance)
@@ -107,6 +131,24 @@ function SearchPage() {
               <div className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground flex items-center gap-1.5 mb-3">
                 <SlidersHorizontal className="h-3 w-3" /> {t("search.filters")}
               </div>
+
+              <div className="text-xs font-medium text-foreground mb-2">{t("search.period")}</div>
+              <div className="flex flex-wrap gap-1.5 mb-5">
+                {PERIOD_OPTIONS.map((days) => (
+                  <button
+                    key={days}
+                    onClick={() => setSinceDays(days)}
+                    className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${
+                      sinceDays === days
+                        ? "bg-primary text-primary-foreground border-primary"
+                        : "border-border text-muted-foreground hover:bg-muted"
+                    }`}
+                  >
+                    {t(days === 36500 ? "search.period.all" : `search.period.${days}`)}
+                  </button>
+                ))}
+              </div>
+
               <div className="text-xs font-medium text-foreground mb-2">{t("sidebar.categories")}</div>
               <div className="space-y-1.5">
                 {categories.map((c) => {
@@ -132,6 +174,53 @@ function SearchPage() {
                 })}
               </div>
             </div>
+
+            {subtagParents.length > 0 && (
+              <div>
+                <button
+                  onClick={() => setSubtagsOpen((v) => !v)}
+                  className="w-full flex items-center justify-between text-xs font-medium text-foreground mb-2"
+                >
+                  {t("search.subtags")}
+                  {subtagsOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                </button>
+                {subtagsOpen && (
+                  <div className="space-y-3">
+                    {visibleSubtagParents.map((parent) => (
+                      <div key={parent}>
+                        <div className="text-[10px] text-muted-foreground mb-1">{parent}</div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {(subtagsByParent.get(parent) ?? []).map((s) => {
+                            const active = selectedCats.includes(s.id);
+                            return (
+                              <button
+                                key={s.id}
+                                onClick={() => toggleCat(s.id)}
+                                className={`text-[11px] px-2 py-1 rounded-full border transition-colors ${
+                                  active
+                                    ? "bg-primary/10 text-primary border-primary/40"
+                                    : "border-border text-muted-foreground hover:bg-muted"
+                                }`}
+                              >
+                                {s.label} <span className="tabular-nums">{s.count}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                    {subtagParents.length > SUBTAGS_COLLAPSED_GROUPS && (
+                      <button
+                        onClick={() => setShowAllSubtagGroups((v) => !v)}
+                        className="text-[11px] text-primary hover:underline"
+                      >
+                        {showAllSubtagGroups ? t("search.subtags.showLess") : t("search.subtags.showMore")}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div>
               <div className="text-xs font-medium text-foreground mb-2">{t("search.importance")}</div>
@@ -220,6 +309,37 @@ function SearchPage() {
                     t("search.noKeywords")
                   )}
                 </p>
+              </div>
+            )}
+
+            {submittedQ && (result?.crossDomainIntelligence?.length ?? 0) > 0 && (
+              <div className="card-paper rounded-lg p-4 mb-6">
+                <div className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground mb-3">
+                  {t("search.relatedIntelligence")}
+                </div>
+                <div className="space-y-4">
+                  {result!.crossDomainIntelligence.map((item) => (
+                    <div
+                      key={item.id}
+                      className="border-t border-border pt-3 first:border-t-0 first:pt-0"
+                    >
+                      {item.title && <div className="text-sm font-medium">{item.title}</div>}
+                      {item.assessment && (
+                        <p className="text-sm mt-1 leading-relaxed text-foreground/90">
+                          {item.assessment}
+                        </p>
+                      )}
+                      {item.whyRelevant && (
+                        <p className="text-xs mt-1 text-muted-foreground">
+                          {t("search.whyRelevant")}: {item.whyRelevant}
+                        </p>
+                      )}
+                      <div className="mt-2">
+                        <ProvenanceBadge provenance={item.provenance} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
 

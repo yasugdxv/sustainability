@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "http://127.0.0.1:8010";
 
 export type Lang = "ja" | "en";
 
@@ -13,24 +13,76 @@ export interface Category {
   count: number;
 }
 
+export interface Subcategory {
+  id: string;
+  label: string;
+  labelJa: string;
+  parent: string;
+  count: number;
+}
+
+export interface ImportanceScoreEntry {
+  id: string;
+  score: number;
+}
+
+// Phase B: Department Intelligence AI — 出典(Provenance)。Chat/Search共通の形。
+// sourceDepartmentは"sustainability"|"geopolitics"（将来"scm"|"pa"|"erm"等が増える想定）。
+export interface Provenance {
+  sourceDepartment: string;
+  sourceAgent: string | null;
+  sourceType: string;
+  assessmentTitle: string | null;
+  requestQuestion: string | null;
+  confidence: string | number | null;
+  reviewStatus: "human_reviewed" | "needs_review" | "ai_only";
+  asOf: string | null;
+  references: unknown[];
+  externalCallId: string | null;
+  reuseType: "none" | "exact_cache" | "retrieved";
+}
+
+// Search専用: Provenanceに加え、人間が直接読むためのIntelligence本体を持つ。
+export interface CrossDomainIntelligenceItem {
+  id: string;
+  title: string | null;
+  assessment: string | null;
+  whyRelevant: string | null;
+  asOf: string | null;
+  provenance: Provenance;
+}
+
 export interface Article {
   id: string;
   title: string;
   summary: string;
-  category: string;
+  category: string; // 大テーマ(先頭1件、既存のアイコン・色・パンくず用)
+  categories: string[]; // 記事が持つ大テーマ全件
   source: string;
   sector: string;
   publishedAt: string;
-  importance: number; // 0-100（S/A/B/C/Dランクから変換した目安値）
+  importance: number; // 0-100（S/A/B/C/Dランクから変換した目安値。カード表示用）
   importanceLevel: string; // S/A/B/C/D
+  importanceTotal: number | null; // 7項目合計の実点数（0-35）
+  importanceBreakdown: ImportanceScoreEntry[]; // 評価項目ごとの点数（0-5）
   trending: boolean; // 重要度S・Aランクの記事を「注目」として扱う
   url: string;
   tags: string[];
+  subThemes: string[];
   materialityCodes: string[];
   cover: string;
   body?: string[];
   likesCount: number;
   readsCount: number;
+  provenance: Provenance;
+}
+
+export interface ImportanceCriterion {
+  id: string;
+  label: string;
+  description: string;
+  maxScore: number;
+  bands: Record<string, string>;
 }
 
 const covers = [
@@ -107,25 +159,50 @@ export function useCategories() {
   return useQuery(categoriesQueryOptions);
 }
 
+export const subcategoriesQueryOptions = {
+  queryKey: ["subcategories"] as const,
+  queryFn: () => fetchJson<Subcategory[]>("/api/subcategories"),
+  staleTime: 5 * 60_000,
+};
+
+export function useSubcategories() {
+  return useQuery(subcategoriesQueryOptions);
+}
+
+export const importanceRubricQueryOptions = {
+  queryKey: ["importanceRubric"] as const,
+  queryFn: () => fetchJson<ImportanceCriterion[]>("/api/importance-rubric"),
+  staleTime: 60 * 60_000, // 評価基準そのものはめったに変わらない静的データ
+};
+
+export function useImportanceRubric() {
+  return useQuery(importanceRubricQueryOptions);
+}
+
 export interface ArticlesResult {
   total: number;
   filteredTotal: number;
   keywords: string[];
   matchedThemes: string[];
   articles: Article[];
+  crossDomainIntelligence: CrossDomainIntelligenceItem[];
 }
 
-export function articlesQueryOptions(params: { themes?: string[]; q?: string; lang?: Lang } = {}) {
+export function articlesQueryOptions(
+  params: { themes?: string[]; q?: string; lang?: Lang; sinceDays?: number } = {},
+) {
   const themes = (params.themes ?? []).join(",");
   const q = params.q ?? "";
   const lang = params.lang ?? "ja";
+  const sinceDays = params.sinceDays;
   return {
-    queryKey: ["articles", themes, q, lang] as const,
+    queryKey: ["articles", themes, q, lang, sinceDays] as const,
     queryFn: async (): Promise<ArticlesResult> => {
       const usp = new URLSearchParams();
       if (themes) usp.set("themes", themes);
       if (q) usp.set("q", q);
       usp.set("lang", lang);
+      if (sinceDays) usp.set("since_days", String(sinceDays));
       const data = await fetchJson<Omit<ArticlesResult, "articles"> & { articles: Omit<Article, "cover">[] }>(
         `/api/articles?${usp.toString()}`,
       );
@@ -135,7 +212,9 @@ export function articlesQueryOptions(params: { themes?: string[]; q?: string; la
   };
 }
 
-export function useArticles(params: { themes?: string[]; q?: string; lang?: Lang } = {}) {
+export function useArticles(
+  params: { themes?: string[]; q?: string; lang?: Lang; sinceDays?: number } = {},
+) {
   return useQuery(articlesQueryOptions(params));
 }
 
@@ -154,6 +233,7 @@ export interface ChatMsg {
   role: "user" | "assistant";
   content: string;
   sources?: string[];
+  crossDomainIntelligence?: Provenance[];
 }
 
 export function useTranslateTexts(texts: string[], targetLang: Lang, enabled: boolean) {
@@ -203,7 +283,11 @@ export function useChatSend() {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.detail || `API error ${res.status}`);
       }
-      return res.json() as Promise<{ reply: string; sources: string[] }>;
+      return res.json() as Promise<{
+        reply: string;
+        sources: string[];
+        crossDomainIntelligence: Provenance[];
+      }>;
     },
   });
 }
@@ -337,6 +421,9 @@ export interface CompetitorChange {
   reasoningSummary: string | null;
   changedFields: CompetitorChangedField[];
   themes: string[];
+  goalCategoryId: string | null;
+  goalCategoryName: string | null;
+  goalCategoryTheme: string | null;
   confidence: number | null;
   reviewRequired: boolean;
   sourceUrl: string | null;
@@ -353,6 +440,9 @@ export interface CompetitorInitiative {
   title: string;
   summary: string;
   themes: string[];
+  goalCategoryId: string | null;
+  goalCategoryName: string | null;
+  goalCategoryTheme: string | null;
   isNew: boolean;
   detectedAt: string;
   sourceUrl: string | null;
@@ -364,13 +454,23 @@ export interface CompetitorTarget {
   companyName: string;
   companyNameEn: string | null;
   companyCategory: string;
+  isOwnCompany: boolean;
   recordType: "TARGET" | "KPI";
   title: string | null;
   themes: string[];
+  goalCategoryId: string | null;
+  goalCategoryName: string | null;
+  goalCategoryTheme: string | null;
   targetValue: string | number | null;
+  numericValue: string | number | null;
+  unit: string | number | null;
+  reductionRate: string | number | null;
   baseYear: string | number | null;
   targetYear: string | number | null;
   scope: string | number | null;
+  boundary: string | number | null;
+  targetRegion: string | number | null;
+  targetMaterial: string | number | null;
   kpiDefinition: string | number | null;
   achievementStatus: string | number | null;
   sourceUrl: string | null;
@@ -383,6 +483,7 @@ export interface CompetitorCompany {
   nameEn: string | null;
   category: string;
   displayOrder: number;
+  isOwnCompany: boolean;
   targetCount: number;
   initiativeCount: number;
 }
@@ -465,38 +566,47 @@ export function useCompetitorChanges(params: CompetitorChangesParams = {}) {
   return useQuery(competitorChangesQueryOptions(params));
 }
 
-export function competitorTargetsQueryOptions(params: { companyId?: string; theme?: string } = {}) {
+export function competitorTargetsQueryOptions(
+  params: { companyId?: string; theme?: string; goalCategory?: string } = {},
+) {
   const usp = new URLSearchParams();
   if (params.companyId) usp.set("company_id", params.companyId);
   if (params.theme) usp.set("theme", params.theme);
+  if (params.goalCategory) usp.set("goal_category", params.goalCategory);
   return {
-    queryKey: ["competitorTargets", params.companyId ?? "", params.theme ?? ""] as const,
+    queryKey: ["competitorTargets", params.companyId ?? "", params.theme ?? "",
+      params.goalCategory ?? ""] as const,
     queryFn: () => fetchJson<{ targets: CompetitorTarget[] }>(`/api/competitors/targets?${usp.toString()}`),
     staleTime: 60_000,
   };
 }
 
-export function useCompetitorTargets(params: { companyId?: string; theme?: string } = {}) {
+export function useCompetitorTargets(
+  params: { companyId?: string; theme?: string; goalCategory?: string } = {},
+) {
   return useQuery(competitorTargetsQueryOptions(params));
 }
 
 export function competitorInitiativesQueryOptions(
-  params: { companyId?: string; theme?: string; isNew?: boolean } = {},
+  params: { companyId?: string; theme?: string; isNew?: boolean; goalCategory?: string } = {},
 ) {
   const usp = new URLSearchParams();
   if (params.companyId) usp.set("company_id", params.companyId);
   if (params.theme) usp.set("theme", params.theme);
   if (params.isNew !== undefined) usp.set("is_new", String(params.isNew));
+  if (params.goalCategory) usp.set("goal_category", params.goalCategory);
   return {
     queryKey: ["competitorInitiatives", params.companyId ?? "", params.theme ?? "",
-      params.isNew ?? ""] as const,
+      params.isNew ?? "", params.goalCategory ?? ""] as const,
     queryFn: () =>
       fetchJson<{ initiatives: CompetitorInitiative[] }>(`/api/competitors/initiatives?${usp.toString()}`),
     staleTime: 60_000,
   };
 }
 
-export function useCompetitorInitiatives(params: { companyId?: string; theme?: string; isNew?: boolean } = {}) {
+export function useCompetitorInitiatives(
+  params: { companyId?: string; theme?: string; isNew?: boolean; goalCategory?: string } = {},
+) {
   return useQuery(competitorInitiativesQueryOptions(params));
 }
 

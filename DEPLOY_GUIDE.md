@@ -128,7 +128,7 @@ CMD ["python", "docker_entrypoint.py"]
 | `OPENAI_API_KEY` | - | Azure OpenAI未設定時のフォールバック |
 | `SSL_VERIFY` | 推奨 | `false`に設定（社内プロキシのSSL対応） |
 | `HTTPS_PROXY` / `HTTP_PROXY` | 推奨 | 社内プロキシ URL |
-| `SUSTAINABILITY_EXPERT_ENABLED` | - | サスティナビリティ専門家MVP機能の有効化（`true`/`false`） |
+| `SUSTAINABILITY_EXPERT_ENABLED` | - | サステナビリティ専門家MVP機能の有効化（`true`/`false`） |
 
 ---
 

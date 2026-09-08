@@ -7,7 +7,8 @@
   },
   "api_keys": {
     "openai": "sk-proj-ここにOpenAI APIキーを入力（azureがあれば不要）",
-    "marinetraffic": "ここにMarineTraffic APIキーを入力（船舶追跡に必要・marinetraffic.com で無料登録）"
+    "marinetraffic": "ここにMarineTraffic APIキーを入力（船舶追跡に必要・marinetraffic.com で無料登録）",
+    "regulations_gov": "ここにRegulations.gov APIキーを入力（open.gsa.gov で無料登録）"
   },
   "proxy": {
     "enabled": true,
@@ -34,6 +35,29 @@
       "embedding_deployment": "（任意。ベクトル検索を使う場合のみAzure OpenAIのembeddingデプロイ名を入力）"
     }
   },
+  "geo_intelligence": {
+    "enabled": false,
+    "base_url": "https://YOUR-GEO-INTELLIGENCE-APP/",
+    "query_path": "/api/v1/geo-intelligence/query",
+    "timeout_seconds": 20,
+    "api_key": "ここにGeo Intelligence APIのAPIキーを入力（X-API-Keyヘッダーで送信。現時点はAPIキー方式）",
+    "max_retries": 2,
+    "weekly_monitoring": {
+      "enabled": false,
+      "scope_version": "v1",
+      "max_independent_topics": 3,
+      "dedup_candidate_pool_max": 200
+    },
+    "chat": {
+      "enabled": false,
+      "reuse_enabled": true,
+      "reuse_max_age_hours": 24,
+      "reuse_max_age_hours_high_freshness": 2
+    },
+    "search": {
+      "enabled": false
+    }
+  },
   "weekly_digest": {
     "since_days": 7,
     "target_min": 15,
@@ -46,6 +70,19 @@
   "monthly_competitor_digest": {
     "since_days": 30
   },
+  "strategic_question": {
+    "enabled": false,
+    "since_days_signals": 14,
+    "since_days_competitor": 14,
+    "response_window_days": 5,
+    "duplicate_lookback_weeks": 10,
+    "min_responses_for_publish": 10,
+    "min_response_rate_for_publish": 0.15,
+    "chat_max_age_days": 180,
+    "chat_max_items": 3,
+    "hmac_secret": "ここにランダムな秘密文字列を生成して入力（recipient_key/response tokenの導出に使う。他のAPIキーと同様、絶対に外部出力・コミットしないこと。例: python -c \"import secrets; print(secrets.token_urlsafe(32))\"）",
+    "app_base_url": "https://YOUR-PRODUCTION-HOST/（社員がメールのリンクをクリックしてアクセスできる本番ホスト名。127.0.0.1では社外/他端末から届かないため本番化時に必須）"
+  },
   "email": {
     "enabled": false,
     "smtp_host": "（例: 社内SMTPリレーのホスト名、またはsmtp.office365.com）",
@@ -53,7 +90,7 @@
     "use_starttls": true,
     "smtp_user": "（認証が必要な場合のみ）",
     "smtp_password": "（認証が必要な場合のみ）",
-    "from_address": "sustainability-report@example.com",
-    "to_addresses": ["recipient1@example.com", "recipient2@example.com"]
+    "from_address": "sustainability-report@example.com"
   }
 }
+

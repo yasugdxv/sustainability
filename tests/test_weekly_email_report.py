@@ -194,7 +194,7 @@ def test_build_email_handles_empty_results():
 def test_send_email_falls_back_to_preview_when_not_configured(tmp_path, monkeypatch):
     """email.enabledがfalse、またはsmtp_host未設定なら、SMTP送信せずプレビュー保存すること"""
     monkeypatch.setattr(wer, "CACHE_DIR", tmp_path)
-    result = wer.send_email("件名", "<p>本文</p>", {"email": {"enabled": False}})
+    result = wer.send_email("件名", "<p>本文</p>", {"email": {"enabled": False}}, [])
 
     assert result["ok"] is True
     assert result["mode"] == "preview"

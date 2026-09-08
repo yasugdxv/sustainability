@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { useChatSend, useTranslateTexts, type ChatMsg, type Lang } from "@/lib/api";
 import { chatSuggestions, useLanguage } from "@/lib/i18n";
+import { ProvenanceBadge } from "@/components/provenance-badge";
 
 export function AiChatPanel({
   compact = false,
@@ -58,7 +59,12 @@ export function AiChatPanel({
           updateMessages([
             ...history,
             { role: "user", content: text },
-            { role: "assistant", content: data.reply, sources: data.sources },
+            {
+              role: "assistant",
+              content: data.reply,
+              sources: data.sources,
+              crossDomainIntelligence: data.crossDomainIntelligence,
+            },
           ]);
         },
         onError: (err: Error) => {
@@ -129,6 +135,13 @@ export function AiChatPanel({
                       >
                         {s}
                       </span>
+                    ))}
+                  </div>
+                )}
+                {m.crossDomainIntelligence && m.crossDomainIntelligence.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {m.crossDomainIntelligence.map((p, idx) => (
+                      <ProvenanceBadge key={idx} provenance={p} />
                     ))}
                   </div>
                 )}

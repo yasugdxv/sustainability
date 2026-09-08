@@ -4,7 +4,7 @@
 -- 対象: Supabase（PostgreSQL）。既存の weekly_email_reports への ALTER。
 --
 -- 背景: これまで weekly_email_report.py は「ドラフト生成→即送信」を1回のCLI実行で
--- 行い、人によるレビューを挟まずに配信していた。サスティナビリティ専門家MVP
+-- 行い、人によるレビューを挟まずに配信していた。サステナビリティ専門家MVP
 -- （sustainability_article_selector.py / sustainability_content_generator.py）と
 -- 二重運用になっていたのを1本のパイプラインに統合するにあたり、週次メールも
 -- expert_contentsと同じ「review_required→approved/rejected→送信」のレビュー
@@ -39,6 +39,6 @@ comment on column public.weekly_email_reports.html_body is
      承認時にそのまま送信本文として使う）';
 comment on column public.weekly_email_reports.review_status is
     'review_required→approved/rejected→sent の状態遷移。
-     サスティナビリティ専門家MVPのexpert_contents.statusと同じ考え方';
+     サステナビリティ専門家MVPのexpert_contents.statusと同じ考え方';
 comment on column public.weekly_email_reports.send_status is
     '実際の送信（SMTP/プレビュー保存）が成功したか。ドラフト生成の成否を表すstatusとは別イベント';

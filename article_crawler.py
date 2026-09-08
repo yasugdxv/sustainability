@@ -6,6 +6,8 @@ Supabaseの crawl_targets（クロール先マスタ）を巡回し、直近 loo
 実行結果は crawl_logs に1クロール先1行で記録する。
 
 対応クロール手法: RSS, HTML（汎用本文抽出）, ブラウザ操作（Playwright、bot対策サイト向け）。
+※ブラウザ操作は本番バッチ(run_daily.py)の実行環境では使用不可のため、
+  2026-08-24以降は新規クロール先に設定しない（手動実行での検証用途のみ残置）。
 API・メール・手動は対象外（サイトごとに個別実装が必要なため今回は範囲外）。
 
 その他の処理:
@@ -39,7 +41,7 @@ from pypdf import PdfReader
 from config_utils import load_config, make_proxies  # noqa: F401 (load_configは他モジュールもここ経由でimportする)
 
 DEFAULT_LOOKBACK_DAYS = 7
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 45  # 20秒だと重いページ(JS/トラッカー多数等)で正常応答なのに時間切れになる例が多発したため延長
 MAX_HTML_LINKS_PER_TARGET = 30   # HTML一覧ページから拾う候補リンクの上限
 ARTICLE_FETCH_SLEEP = 0.3        # 記事ページ取得の間隔（相手サーバへの配慮）
 BROWSER_NAV_TIMEOUT_MS = 25000   # Playwrightのページ遷移タイムアウト
@@ -66,6 +68,62 @@ _BOILERPLATE_LINE_PATTERNS = [
     re.compile(r"^(advertisement|広告|スポンサー)$", re.IGNORECASE),
     re.compile(r"^(read more|続きを読む)$", re.IGNORECASE),
 ]
+
+# 有料会員限定記事で、本文プレビューの途中から会員登録・ログイン誘導の定型文に
+# 切り替わるサイト（例: sustainablejapan.jp）向け。この種の定型文は一致箇所から
+# 記事末尾まで続くブロックのため、_BOILERPLATE_LINE_PATTERNSの1行単位の除去では
+# 対応できず、一致箇所以降を丸ごと切り捨てる（_truncate_at_paywall参照）
+_PAYWALL_TRUNCATE_PATTERNS = [
+    re.compile(r"この記事は有料会員限定です"),
+    re.compile(r"無料会員に登録すると"),
+    re.compile(r"有料記事の「閲覧チケット」"),
+]
+
+
+def _truncate_at_paywall(text: str) -> str:
+    if not text:
+        return text
+    earliest = min(
+        (m.start() for pat in _PAYWALL_TRUNCATE_PATTERNS if (m := pat.search(text))),
+        default=None,
+    )
+    return text[:earliest].rstrip() if earliest is not None else text
+
+# Bot対策（人間認証・アクセス拒否）ページの検知パターン。
+# 誤検知を避けるため、本文の大半を占める短文でのマッチのみを対象とする（本文中の
+# 一部にたまたま含まれるケースを除外するため、文字数チェックと組み合わせて使う）。
+_BOT_BLOCK_MAX_CHARS = 1000  # このチェックは短い本文にのみ適用する
+_BOT_BLOCK_URL_DOMAINS = (
+    "perfdrive.com",       # Radware Bot Manager の人間検証ページ
+    "distilnetworks.com",
+    "captcha-delivery.com",  # DataDome
+    "hcaptcha.com",
+)
+_BOT_BLOCK_TEXT_PATTERNS = [
+    re.compile(r"you are a bot", re.IGNORECASE),
+    re.compile(r"verify you are (a )?human", re.IGNORECASE),
+    re.compile(r"are you a robot", re.IGNORECASE),
+    re.compile(r"unusual traffic", re.IGNORECASE),
+    re.compile(r"automated (queries|access)", re.IGNORECASE),
+    re.compile(r"access to this page has been denied", re.IGNORECASE),
+    re.compile(r"ロボットではないことを確認"),
+    re.compile(r"アクセスが拒否されました"),
+]
+
+
+def _detect_bot_block(final_url: str, text: str) -> str | None:
+    """本文がBot対策（人間認証・アクセス拒否）ページと判定できれば、その理由文字列を返す。
+    該当しなければNone。"""
+    domain = urlparse(final_url).netloc.lower()
+    for blocked_domain in _BOT_BLOCK_URL_DOMAINS:
+        if blocked_domain in domain:
+            return f"Bot対策検証ページへのリダイレクトを検知（{blocked_domain}）"
+    if text and len(text) <= _BOT_BLOCK_MAX_CHARS:
+        for pat in _BOT_BLOCK_TEXT_PATTERNS:
+            if pat.search(text):
+                return f"Bot対策の定型文を検知（\"{pat.pattern}\"）"
+    return None
+
 
 # URL正規化で取り除くトラッキングパラメータ
 _TRACKING_PARAM_PREFIXES = ("utm_",)
@@ -122,12 +180,46 @@ class SupabaseClient:
         self.verify = config.get("ssl", {}).get("verify", True)
 
     def select(self, table: str, params: dict) -> list:
-        resp = requests.get(
-            f"{self.base_url}/rest/v1/{table}", headers=self.headers,
-            params=params, proxies=self.proxies, verify=self.verify, timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        """呼び出し側がlimit/offsetを指定していない場合は「全件取得」の意図とみなし、
+        PostgRESTの1リクエストあたりの上限（既定1000件）を超えないよう自動でページングする。
+        （この上限に気づかず一部の行だけを取得してしまうバグを防ぐため）
+
+        ORDER BYを指定しないままoffsetページングすると、PostgREST/Postgres側の行順が
+        リクエストごとに変わることがあり、同じ条件で問い合わせても取りこぼし・重複が
+        発生する（実際に発生を確認: 書き込みが無い状態でも同一クエリを連続実行すると
+        結果セットが変わった）。そのためorder未指定時は、selectで指定された最初の列
+        （このコードベースでは慣例的に主キー列を先頭に書く）を昇順の並び替えキーとして
+        補い、ページ間の順序を安定させる。select="*"等で列名が分からない場合は、
+        取得件数が1000件を超えるほど大きいテーブルでない前提として何もしない。"""
+        if "limit" in params or "offset" in params:
+            resp = requests.get(
+                f"{self.base_url}/rest/v1/{table}", headers=self.headers,
+                params=params, proxies=self.proxies, verify=self.verify, timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        if "order" not in params:
+            first_col = (params.get("select") or "").split(",")[0].strip()
+            if first_col and first_col != "*":
+                params = {**params, "order": f"{first_col}.asc"}
+
+        page_size = 1000
+        all_rows = []
+        offset = 0
+        while True:
+            resp = requests.get(
+                f"{self.base_url}/rest/v1/{table}", headers=self.headers,
+                params={**params, "limit": page_size, "offset": offset},
+                proxies=self.proxies, verify=self.verify, timeout=30,
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            all_rows.extend(rows)
+            if len(rows) < page_size:
+                break
+            offset += page_size
+        return all_rows
 
     def insert(self, table: str, rows: list, prefer: str = "return=representation"):
         resp = requests.post(
@@ -255,7 +347,10 @@ def _extract_updated_at(tree):
 
 
 def _clean_text(text: str) -> str:
-    """trafilatura抽出後に残る定型文（Cookie通知・シェア誘導等）を簡易除去する"""
+    """trafilatura抽出後に残る定型文（Cookie通知・シェア誘導等）を簡易除去する。
+    有料会員限定記事の登録・ログイン誘導ブロックは、先に一致箇所以降を丸ごと
+    切り捨ててから（_truncate_at_paywall）、残りに通常の行単位除去を適用する"""
+    text = _truncate_at_paywall(text)
     if not text:
         return text
     lines = []
@@ -386,6 +481,24 @@ def _fetch_with_browser(url: str, proxies: dict, verify: bool):
         context.close()
 
 
+def _decoded_html(resp: requests.Response) -> str:
+    """Content-TypeヘッダーにcharsetがないHTML（<meta charset>頼みのページ）では、
+    requestsがHTTP仕様のデフォルトであるISO-8859-1と誤判定し文字化けすることがあるため、
+    その場合は実データから判定するapparent_encodingを優先する"""
+    content_type = resp.headers.get("Content-Type", "")
+    if "charset" not in content_type.lower() and resp.apparent_encoding:
+        resp.encoding = resp.apparent_encoding
+    return resp.text
+
+
+def _safe_lxml_parse(html: str):
+    """デコード済み文字列の先頭にXML宣言(<?xml ... encoding=...?>)が残っていると、
+    lxmlは「Unicode strings with encoding declaration are not supported」で例外を
+    出す（デコード済みなので宣言のencodingは既に無関係）。パース前に宣言を除去する"""
+    html = re.sub(r"^\s*<\?xml[^>]*\?>", "", html, count=1)
+    return lxml_html.fromstring(html)
+
+
 def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool):
     """通常HTTPまたはブラウザでページを取得する。(html, final_url, status_code)を返す"""
     if use_browser:
@@ -393,13 +506,43 @@ def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool):
     resp = requests.get(url, proxies=proxies, verify=verify,
                          timeout=REQUEST_TIMEOUT, headers=_HEADERS)
     resp.raise_for_status()
-    return resp.text, resp.url, resp.status_code
+    return _decoded_html(resp), resp.url, resp.status_code
+
+
+# 社内プロキシ越しの通信が稀に瞬断・破損し、UTF-8バイト列がLatin-1として誤デコード
+# されたような文字化けタイトル・本文がそのまま保存されてしまうことがある
+# （sustainability_dashboard_core._looks_garbledと同種のヒューリスティック。
+# 取得直後にここで検知してリトライすることで、破損データがDBに入る前に防ぐ）
+ENCODING_CORRUPTION_MAX_RETRIES = 2
+ENCODING_CORRUPTION_RETRY_DELAY_SEC = 2
+_ENCODING_CORRUPTION_PAT = re.compile("[ -ÿ]")
+
+def _looks_encoding_corrupted(text: str, threshold: float = 0.2) -> bool:
+    if not text:
+        return False
+    return len(_ENCODING_CORRUPTION_PAT.findall(text)) / len(text) > threshold
 
 
 # ─── 記事本文抽出（RSS・HTML共通） ────────────────────────────────
 def extract_article(url: str, proxies: dict, verify: bool, use_browser: bool = False) -> dict:
     """記事URLから本文・タイトル・公開日を抽出する。PDF/.docxは専用抽出、
-    それ以外はtrafilaturaでHTMLから抽出する"""
+    それ以外はtrafilaturaでHTMLから抽出する。取得結果のタイトル・本文が
+    文字化けして見える場合、ENCODING_CORRUPTION_MAX_RETRIES回まで再取得を試みる
+    （プロキシ瞬断による破損を、リトライで正常な応答に置き換えるため）"""
+    for attempt in range(ENCODING_CORRUPTION_MAX_RETRIES + 1):
+        result = _extract_article_once(url, proxies, verify, use_browser)
+        if not result.get("ok"):
+            return result
+        if not (_looks_encoding_corrupted(result.get("title", "")) or
+                _looks_encoding_corrupted(result.get("text", "")[:500])):
+            return result
+        if attempt < ENCODING_CORRUPTION_MAX_RETRIES:
+            time.sleep(ENCODING_CORRUPTION_RETRY_DELAY_SEC)
+    result["encoding_suspect"] = True  # 全リトライ後も文字化けが疑われる（呼び出し元の判断に委ねる）
+    return result
+
+
+def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bool = False) -> dict:
     doc_kind = _detect_document_kind(url)
     if doc_kind:
         use_browser = False  # 文書ファイルはブラウザ経由で扱わない（PDFビューア化を避ける）
@@ -412,7 +555,7 @@ def extract_article(url: str, proxies: dict, verify: bool, use_browser: bool = F
             resp = requests.get(url, proxies=proxies, verify=verify,
                                  timeout=REQUEST_TIMEOUT, headers=_HEADERS)
             resp.raise_for_status()
-            html, final_url, status_code = resp.text, resp.url, resp.status_code
+            html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
             content_type, raw_content = resp.headers.get("Content-Type", ""), resp.content
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "http_status": None}
@@ -425,7 +568,7 @@ def extract_article(url: str, proxies: dict, verify: bool, use_browser: bool = F
         return _extract_document(doc_kind, raw_content, final_url, status_code)
 
     try:
-        tree = lxml_html.fromstring(html)
+        tree = _safe_lxml_parse(html)
     except Exception:
         tree = None
 
@@ -444,6 +587,10 @@ def extract_article(url: str, proxies: dict, verify: bool, use_browser: bool = F
     text = _clean_text((data.get("text") or "").strip())
     if not text:
         return {"ok": False, "error": "本文抽出に失敗（空）", "http_status": status_code}
+
+    bot_block_reason = _detect_bot_block(final_url, text)
+    if bot_block_reason:
+        return {"ok": False, "error": bot_block_reason, "http_status": status_code}
 
     canonical_url = normalize_url(_extract_canonical_url(tree, final_url))
 
@@ -483,6 +630,51 @@ def list_rss_candidates(target: dict, proxies: dict, verify: bool) -> list:
     return candidates, resp.status_code
 
 
+# ─── XMLサイトマップ ─────────────────────────────────────────────
+def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
+    """XMLサイトマップ(<url><loc>...</loc><lastmod>...</lastmod></url>)から候補記事を
+    一覧する。<a href>を汎用収集するlist_html_candidates()とは構造が異なる
+    （例: Paboco等、更新頻度は低いがJS一覧の代わりにsitemap.xmlで全ページを把握できるサイト向け）"""
+    url = target["target_url"]
+    domain = target.get("domain") or urlparse(url).netloc
+    include_paths = [p.strip() for p in (target.get("include_paths") or "").split(",") if p.strip()]
+    exclude_paths = [p.strip() for p in (target.get("exclude_paths") or "").split(",") if p.strip()]
+
+    resp = requests.get(url, proxies=proxies, verify=verify, timeout=REQUEST_TIMEOUT, headers=_HEADERS)
+    resp.raise_for_status()
+
+    candidates = []
+    for block in re.findall(r"<url>(.*?)</url>", resp.text, re.S):
+        loc_match = re.search(r"<loc>(.*?)</loc>", block)
+        if not loc_match:
+            continue
+        loc = loc_match.group(1).strip()
+        parsed = urlparse(loc)
+        if not parsed.scheme.startswith("http") or domain not in parsed.netloc:
+            continue
+        path = parsed.path
+        if path.lower().endswith(NON_ARTICLE_EXTENSIONS):
+            continue
+        if include_paths and not any(path.startswith(p) for p in include_paths):
+            continue
+        if exclude_paths and any(path.startswith(p) for p in exclude_paths):
+            continue
+
+        pub_dt = None
+        lastmod_match = re.search(r"<lastmod>(.*?)</lastmod>", block)
+        if lastmod_match:
+            try:
+                pub_dt = dateutil_parser.parse(lastmod_match.group(1).strip())
+                pub_dt = pub_dt.astimezone(timezone.utc) if pub_dt.tzinfo else pub_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                pub_dt = None
+
+        candidates.append({"url": loc, "title": None, "published_at": pub_dt})
+        if len(candidates) >= MAX_HTML_LINKS_PER_TARGET:
+            break
+    return candidates, resp.status_code
+
+
 # ─── HTML（汎用） ─────────────────────────────────────────────────
 def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser: bool = False) -> list:
     """HTML一覧ページから候補記事リンクを抽出する（<a>を汎用的に収集し、
@@ -494,7 +686,7 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
 
     html, final_url, status_code = _fetch_page(url, proxies, verify, use_browser)
 
-    tree = lxml_html.fromstring(html)
+    tree = _safe_lxml_parse(html)
     seen = set()
     candidates = []
     for href in tree.xpath("//a/@href"):
@@ -505,14 +697,23 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
         if domain not in parsed.netloc:
             continue
         path = parsed.path
-        if path.lower().endswith(NON_ARTICLE_EXTENSIONS):
-            continue
-        if include_paths and not any(path.startswith(p) for p in include_paths):
-            continue
-        if exclude_paths and any(path.startswith(p) for p in exclude_paths):
-            continue
+        # WWF(panda.org)のような旧CMSは記事識別子自体をクエリに埋め込む
+        # （例: /?15703966/slug）ため、パスが空でクエリが数字始まりのものは
+        # 通常のinclude_paths/exclude_paths判定（パスベース）を素通りさせて
+        # 無条件で記事候補として扱う（このパターン以外はパスが空でも記事ではないため対象外）
+        is_query_id_article = (path.rstrip("/") or "/") == "/" and re.match(r"^\d+/", parsed.query)
+        if not is_query_id_article:
+            if path.lower().endswith(NON_ARTICLE_EXTENSIONS):
+                continue
+            if include_paths and not any(path.startswith(p) for p in include_paths):
+                continue
+            if exclude_paths and any(path.startswith(p) for p in exclude_paths):
+                continue
         normalized_path = path.rstrip("/") or "/"
-        normalized = f"{parsed.scheme}://{parsed.netloc}{normalized_path}"
+        if is_query_id_article:
+            normalized = f"{parsed.scheme}://{parsed.netloc}/?{parsed.query}"
+        else:
+            normalized = f"{parsed.scheme}://{parsed.netloc}{normalized_path}"
         if normalized in seen or normalized == url.rstrip("/"):
             continue
         seen.add(normalized)
@@ -645,7 +846,9 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
         if method == "RSS":
             candidates, http_status = list_rss_candidates(target, proxies, verify)
         elif method in ("HTML", "ブラウザ操作"):
-            if endpoint_type in LISTING_ENDPOINT_TYPES:
+            if endpoint_type == "サイトマップ":
+                candidates, http_status = list_sitemap_candidates(target, proxies, verify)
+            elif endpoint_type in LISTING_ENDPOINT_TYPES:
                 candidates, http_status = list_html_candidates(target, proxies, verify, use_browser=use_browser)
             else:
                 # SINGLE_PAGE_ENDPOINT_TYPES、および未知のendpoint_typeは安全側で単一ページ扱い
@@ -660,6 +863,7 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
     new_items = 0
     updated_items = 0
     extraction_failures = 0
+    bot_block_detections = 0
 
     if error_message is None:
         for cand in candidates:
@@ -671,6 +875,8 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
 
             if not extracted["ok"]:
                 extraction_failures += 1
+                if (extracted.get("error") or "").startswith("Bot対策"):
+                    bot_block_detections += 1
                 continue
 
             # RSSは一覧取得の時点で候補ごとの正確な日付(published_parsed)を持っている
@@ -715,9 +921,10 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
     else:
         run_result = "更新なし"
 
+    crawl_notes = f"Bot対策検知{bot_block_detections}件" if bot_block_detections else None
     save_crawl_log(client, target, started_at, finished_at, run_result, http_status,
                     items_detected, new_items, updated_items, extraction_failures, error_message,
-                    notes=None)
+                    notes=crawl_notes)
 
     return {
         "run_result": run_result,
@@ -726,7 +933,43 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
         "updated_items": updated_items,
         "extraction_failures": extraction_failures,
         "error_message": error_message,
+        "bot_block_detections": bot_block_detections,
     }
+
+
+# ─── Bot対策検知によるクロール先の自動降格 ───────────────────────────
+BOT_BLOCK_DOWNGRADE_STREAK = 3  # 直近何回連続でBot対策検知が続いたら降格するか
+_CRAWL_METHOD_DOWNGRADE_PATH = {"HTML": "手動"}
+
+
+def downgrade_bot_blocked_targets(client: SupabaseClient, targets: list) -> None:
+    """直近BOT_BLOCK_DOWNGRADE_STREAK回連続でBot対策検知だったクロール先について、
+    crawl_methodを段階的に降格する（HTML→ブラウザ操作→手動）。
+    新しいステータス用カラムは設けず、既存のcrawl_method/crawl_notesのみを使う。"""
+    for target in targets:
+        current_method = target["crawl_method"]
+        next_method = _CRAWL_METHOD_DOWNGRADE_PATH.get(current_method)
+        if not next_method:
+            continue
+        recent_logs = client.select("crawl_logs", {
+            "select": "notes",
+            "crawl_target_id": f"eq.{target['crawl_target_id']}",
+            "order": "started_at.desc",
+            "limit": BOT_BLOCK_DOWNGRADE_STREAK,
+        })
+        if len(recent_logs) < BOT_BLOCK_DOWNGRADE_STREAK:
+            continue
+        if not all((log.get("notes") or "").startswith("Bot対策検知") for log in recent_logs):
+            continue
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        existing_notes = (target.get("crawl_notes") or "").strip()
+        history_line = (f"[{today}] Bot対策検知が{BOT_BLOCK_DOWNGRADE_STREAK}回連続のため"
+                         f"{current_method}→{next_method}へ自動変更")
+        new_notes = f"{existing_notes}\n{history_line}" if existing_notes else history_line
+        client.update("crawl_targets", {"crawl_target_id": f"eq.{target['crawl_target_id']}"},
+                      {"crawl_method": next_method, "crawl_notes": new_notes})
+        print(f"  [自動降格] {target.get('target_name')}: {current_method} → {next_method}")
 
 
 # ─── メイン ───────────────────────────────────────────────────────
@@ -763,6 +1006,8 @@ def main(limit: int = None, methods=SUPPORTED_METHODS):
 
     print("─" * 40)
     print("集計:", totals)
+
+    downgrade_bot_blocked_targets(client, targets)
 
 
 if __name__ == "__main__":
