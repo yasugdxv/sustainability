@@ -1,0 +1,27 @@
+﻿source_id,title,url,document_type,themes,priority,refresh_cadence,intended_use
+SRC-001,サステナビリティTOP,https://www.suntory.co.jp/sustainability/,overview,all,P1,weekly,全体構造、最新ストーリー、2030目標の入口
+SRC-002,サステナビリティ経営,https://www.suntory.co.jp/sustainability/management/,strategy,all,P0,monthly,企業理念、7テーマ、マテリアリティ、推進体制
+SRC-003,2030年目標,https://www.suntory.co.jp/sustainability/targets/,targets,water|climate|packaging,P0,monthly,水・気候変動・容器包装の中長期目標と進捗
+SRC-004,Our Focus Areas 水,https://www.suntory.co.jp/sustainability/esg/theme1/,theme_context,water,P0,monthly,背景、戦略、リスク、指標・目標
+SRC-005,Our Focus Areas 気候変動,https://www.suntory.co.jp/sustainability/esg/theme2/,theme_context,climate,P0,monthly,事業リスク・機会、ガバナンス、戦略
+SRC-006,Our Focus Areas 容器・包装,https://www.suntory.co.jp/sustainability/esg/theme3/,theme_context,packaging,P0,monthly,循環経済、規制、技術、指標・目標
+SRC-007,Our Focus Areas 原料,https://www.suntory.co.jp/sustainability/esg/theme4/,theme_context,raw_materials,P0,monthly,気候・人権・水・生物多様性を含む調達文脈
+SRC-008,Our Focus Areas 人権,https://www.suntory.co.jp/sustainability/esg/theme5/,theme_context,human_rights,P0,monthly,人権方針、人権DD、救済
+SRC-009,Our Focus Areas 健康,https://www.suntory.co.jp/sustainability/esg/theme6/,theme_context,health,P0,monthly,健康貢献、アルコール、責任あるマーケティング
+SRC-010,Our Focus Areas 生活文化,https://www.suntory.co.jp/sustainability/esg/theme7/,theme_context,living_culture,P1,quarterly,新価値創造、文化支援、コミュニティ共創
+SRC-011,環境マネジメント,https://www.suntory.co.jp/sustainability/env_management/,policy_strategy,environment,P0,monthly,環境基本方針、推進体制、目標と進捗
+SRC-012,TNFD/TCFD統合開示,https://www.suntory.co.jp/sustainability/env_tcfd/,disclosure,climate|nature|water|biodiversity,P0,monthly,リスク・機会、シナリオ、財務影響接続
+SRC-013,水資源,https://www.suntory.co.jp/sustainability/env_water/,evidence,water,P1,monthly,節水、水源涵養、水リスク、地域連携
+SRC-014,生物多様性,https://www.suntory.co.jp/sustainability/env_biodiversity/,evidence,biodiversity,P1,monthly,自然資本・生態系保全再生
+SRC-015,気候変動,https://www.suntory.co.jp/sustainability/env_climate/,evidence,climate,P1,monthly,排出削減施策、再エネ、バリューチェーン
+SRC-016,資源循環,https://www.suntory.co.jp/sustainability/env_circular/,evidence,packaging|circularity,P1,monthly,2R+B、ボトルtoボトル、他容器
+SRC-017,人権の尊重,https://www.suntory.co.jp/sustainability/soc_human-rights/,evidence,human_rights,P1,monthly,人権DDの実施内容
+SRC-018,サントリーグループ人権方針,https://www.suntory.co.jp/sustainability/soc_human-rights/policy/,policy,human_rights,P0,quarterly,人権に関する公式方針
+SRC-019,サステナブル調達,https://www.suntory.co.jp/sustainability/soc_procurement/,evidence,raw_materials|human_rights,P1,monthly,調達方針、サプライチェーンDD
+SRC-020,健康への取り組み,https://www.suntory.co.jp/sustainability/soc_health/,evidence,health,P1,monthly,製品・サービスによる健康貢献
+SRC-021,アルコール関連問題への取り組み,https://www.suntory.co.jp/sustainability/soc_alcohol/,policy_evidence,health|responsible_marketing,P0,monthly,適正飲酒、責任あるマーケティング
+SRC-022,コーポレート・ガバナンス,https://www.suntory.co.jp/sustainability/gov_governance/,governance,governance,P1,quarterly,監督・意思決定体制
+SRC-023,リスクマネジメント,https://www.suntory.co.jp/sustainability/gov_risk/,governance,risk,P1,quarterly,全社リスクとの接続
+SRC-024,データ一覧,https://www.suntory.co.jp/sustainability/data/data/,metrics,all,P0,monthly,定量実績・KPI
+SRC-025,サイト情報ダウンロード,https://www.suntory.co.jp/sustainability/data/report/,report_archive,all,P2,quarterly,PDF版、バックナンバー、補足資料
+SRC-026,方針一覧,https://www.suntory.co.jp/sustainability/policy/,policy_registry,all,P0,monthly,公式方針・規範類の正本一覧

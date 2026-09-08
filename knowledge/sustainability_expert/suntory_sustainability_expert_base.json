@@ -1,0 +1,305 @@
+{
+  "metadata": {
+    "name": "Suntory Sustainability Expert MVP Base",
+    "version": "0.1.0",
+    "retrieved_at": "2026-07-17",
+    "scope": "Public information from Suntory sustainability website; seed base for article selection and content generation",
+    "limitations": [
+      "This seed base summarizes core public pages and is not a complete mirror of every page or PDF.",
+      "Internal strategies, confidential business exposure and owner judgments must be added separately with access control.",
+      "Current HTML pages should be treated as more current than archived annual PDF compilations."
+    ]
+  },
+  "expert_identity": {
+    "role": "当社サスティナビリティ専門家（MVP）",
+    "mission": "外部記事の中から当社にとって見る価値がある変化を選定し、事実と解釈を分離したうえで、当社として確認すべき観点・影響経路・次のモニタリング論点を提示する。",
+    "not_responsible_for": [
+      "会社の正式見解や対外開示の確定",
+      "法務・規制適合性の最終判断",
+      "根拠のない影響額・確率の断定",
+      "公開情報だけでは判断できない社内影響の断定"
+    ],
+    "answering_principles": [
+      "事実、外部主体の見解、AIによる推論、提案を区別する",
+      "重要な主張には出典URLと根拠箇所を付ける",
+      "一般的なESG重要性ではなく、当社の事業依存・目標・方針との接続を説明する",
+      "水、気候、原料、生物多様性、人権、健康、容器包装の相互作用を見る",
+      "不確実な点は追加確認事項として明示する",
+      "リスクだけでなく機会、先行対応、ルールメーキング余地も見る"
+    ]
+  },
+  "company_context": {
+    "corporate_philosophy": "人と自然と響きあい、豊かな生活文化を創造し、「人間の生命の輝き」をめざす。",
+    "sustainability_view": "水や農作物など自然の恵みに支えられる食品・酒類総合企業として、人々の生活を潤い豊かにすることと、自然環境を守り育むことの共存を目指す。",
+    "governance_context": "7つの重要テーマについてグローバルサステナビリティ委員会が戦略・進捗・リスク・成長機会を扱い、重要事項を取締役会へ報告する。",
+    "focus_areas": [
+      {
+        "id": "water",
+        "name": "水",
+        "core_company_dependency": "最重要原料・工場操業・流域・原料生産",
+        "watch_connections": [
+          "気候変動",
+          "生物多様性",
+          "原料調達",
+          "地域社会"
+        ]
+      },
+      {
+        "id": "climate",
+        "name": "気候変動",
+        "core_company_dependency": "操業エネルギー・物流・容器・農作物・水",
+        "watch_connections": [
+          "水",
+          "原料",
+          "容器包装",
+          "需要変化"
+        ]
+      },
+      {
+        "id": "packaging",
+        "name": "容器包装",
+        "core_company_dependency": "商品品質・製品設計・調達・回収リサイクル・規制",
+        "watch_connections": [
+          "GHG",
+          "資源循環",
+          "消費者受容",
+          "コスト"
+        ]
+      },
+      {
+        "id": "raw_materials",
+        "name": "原料",
+        "core_company_dependency": "農作物の安定調達・品質・価格・産地",
+        "watch_connections": [
+          "気候",
+          "水",
+          "生物多様性",
+          "人権",
+          "トレーサビリティ"
+        ]
+      },
+      {
+        "id": "human_rights",
+        "name": "人権",
+        "core_company_dependency": "自社・サプライチェーン・移民労働者・救済",
+        "watch_connections": [
+          "原料調達",
+          "調達DD",
+          "規制",
+          "レピュテーション"
+        ]
+      },
+      {
+        "id": "health",
+        "name": "健康",
+        "core_company_dependency": "飲料・食品・酒類ポートフォリオ、表示、責任あるマーケティング",
+        "watch_connections": [
+          "アルコール",
+          "砂糖・栄養",
+          "責任あるマーケティング",
+          "消費者価値観"
+        ]
+      },
+      {
+        "id": "living_culture",
+        "name": "生活文化",
+        "core_company_dependency": "新価値創造、文化支援、コミュニティ共創",
+        "watch_connections": [
+          "消費者価値観",
+          "健康",
+          "地域社会",
+          "ブランド"
+        ]
+      }
+    ],
+    "environmental_policy_axes": [
+      "水のサステナビリティ",
+      "生態系の保全と再生",
+      "循環経済",
+      "脱炭素",
+      "社会とのコミュニケーション"
+    ],
+    "headline_targets": [
+      {
+        "theme": "water",
+        "horizon": 2030,
+        "target": "自社工場の水使用量原単位をグローバルで35%削減（基準条件は公式ページ参照）"
+      },
+      {
+        "theme": "water",
+        "horizon": 2030,
+        "target": "自社工場の半数以上で、使用する水の100%以上を水源涵養活動により還元"
+      },
+      {
+        "theme": "water",
+        "horizon": 2030,
+        "target": "水ストレス地域の重要原料についてサプライヤーと水使用効率改善を推進"
+      },
+      {
+        "theme": "climate",
+        "horizon": 2030,
+        "target": "自社拠点のGHG排出量50%削減（2019年比）"
+      },
+      {
+        "theme": "climate",
+        "horizon": 2030,
+        "target": "バリューチェーン全体のGHG排出量30%削減（2019年比）"
+      },
+      {
+        "theme": "climate",
+        "horizon": 2050,
+        "target": "バリューチェーン全体でGHG排出量実質ゼロ"
+      },
+      {
+        "theme": "packaging",
+        "horizon": 2030,
+        "target": "グローバルで使用するすべてのペットボトルをリサイクル素材・植物由来素材等100%へ転換し、化石由来原料の新規使用ゼロ"
+      }
+    ]
+  },
+  "article_selection_framework": {
+    "process": [
+      "対象外・重複・本文不足の機械除外",
+      "記事単位ではなく事象クラスタ単位で評価",
+      "一次情報または最も権威ある情報を代表ソース化",
+      "当社関連性・重要性・緊急性を構造化評価",
+      "掲載候補・継続監視・非掲載へ分類"
+    ],
+    "score_dimensions": [
+      {
+        "name": "strategy_relevance",
+        "weight": 25,
+        "question": "7テーマ、マテリアリティ、2030/2050目標、公式方針に直接関係するか"
+      },
+      {
+        "name": "business_impact",
+        "weight": 20,
+        "question": "操業、原料、商品設計、販売、調達、ブランド、開示に具体的な影響経路があるか"
+      },
+      {
+        "name": "urgency",
+        "weight": 15,
+        "question": "施行・決定・市場変化が近く、準備時間を要するか"
+      },
+      {
+        "name": "exposure",
+        "weight": 15,
+        "question": "主要事業・地域・原料・容器・バリューチェーンに関係するか"
+      },
+      {
+        "name": "signal_strength",
+        "weight": 10,
+        "question": "規制採択、公式目標改定、大規模投資、複数主体の動きなど強いシグナルか"
+      },
+      {
+        "name": "actionability",
+        "weight": 10,
+        "question": "担当者が確認・対応・対話・シナリオ検討に使えるか"
+      },
+      {
+        "name": "source_quality",
+        "weight": 5,
+        "question": "一次情報または信頼できる根拠があるか"
+      }
+    ],
+    "penalties": [
+      {
+        "condition": "既掲載事象の実質重複",
+        "points": -20
+      },
+      {
+        "condition": "重要な事実主張の一次情報が未確認",
+        "points": -10
+      },
+      {
+        "condition": "推測中心で根拠が弱い",
+        "points": -5
+      },
+      {
+        "condition": "当社との影響経路が一般論にとどまる",
+        "points": -10
+      }
+    ],
+    "initial_thresholds": {
+      "publish_candidate": "70-100",
+      "watch_or_archive": "55-69",
+      "not_selected": "0-54"
+    },
+    "mandatory_selection_triggers": [
+      "当社の2030/2050目標達成条件を変える規制・市場・技術変化",
+      "主要地域での新規規制、採択、施行、執行強化、重要判決",
+      "競合・業界の目標撤回、加速、標準化につながる動き",
+      "主要原料・水・エネルギー・容器の供給制約や構造的コスト変化",
+      "人権DD・環境表示・責任あるマーケティングの要求水準変化",
+      "複数テーマ間のトレードオフを生む変化"
+    ]
+  },
+  "content_generation_framework": {
+    "required_sections": [
+      "title",
+      "what_happened",
+      "why_it_matters",
+      "company_watchpoints",
+      "affected_themes",
+      "impact_pathways",
+      "questions_to_confirm",
+      "monitoring_signals",
+      "evidence",
+      "uncertainties"
+    ],
+    "company_watchpoint_categories": [
+      "目標達成への影響",
+      "事業・地域・商品・原料への影響",
+      "規制・開示・評価への影響",
+      "コスト・投資・技術選択",
+      "サプライチェーン・パートナー対応",
+      "ブランド・消費者・社会受容",
+      "テーマ間トレードオフ",
+      "先行対応・機会"
+    ],
+    "language_rules": [
+      "会社として確定していない内容は「可能性」「確認が必要」と表現",
+      "外部記事の主張には発信主体を付ける",
+      "AI提案を会社方針として断定しない",
+      "重要な数値・日付・義務は原典と照合する"
+    ]
+  },
+  "source_precedence": [
+    {
+      "rank": 1,
+      "types": [
+        "policy",
+        "targets",
+        "strategy",
+        "official_disclosure",
+        "metrics"
+      ],
+      "use": "当社の判断軸・目標・公式立場"
+    },
+    {
+      "rank": 2,
+      "types": [
+        "theme_context",
+        "governance",
+        "risk"
+      ],
+      "use": "テーマ別の事業接続・リスク機会"
+    },
+    {
+      "rank": 3,
+      "types": [
+        "evidence",
+        "case_study",
+        "story"
+      ],
+      "use": "具体事例・実績・説明補助"
+    },
+    {
+      "rank": 4,
+      "types": [
+        "external_analysis"
+      ],
+      "use": "検知・文脈。事実の典拠には一次情報を優先"
+    }
+  ]
+}

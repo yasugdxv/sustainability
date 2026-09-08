@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SustainabilityArticleAssessment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "article_id",
+    "decision",
+    "total_score",
+    "score_breakdown",
+    "facts",
+    "company_relevance",
+    "affected_themes",
+    "impact_pathways",
+    "selection_reasons",
+    "evidence",
+    "uncertainties",
+    "confidence",
+    "human_review_required"
+  ],
+  "properties": {
+    "article_id": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "publish_candidate",
+        "watch_or_archive",
+        "not_selected"
+      ]
+    },
+    "total_score": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "score_breakdown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy_relevance",
+        "business_impact",
+        "urgency",
+        "exposure",
+        "signal_strength",
+        "actionability",
+        "source_quality",
+        "penalty"
+      ],
+      "properties": {
+        "strategy_relevance": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 25
+        },
+        "business_impact": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20
+        },
+        "urgency": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15
+        },
+        "exposure": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15
+        },
+        "signal_strength": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "actionability": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "source_quality": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "penalty": {
+          "type": "integer",
+          "minimum": -50,
+          "maximum": 0
+        }
+      }
+    },
+    "facts": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "string",
+        "maxLength": 150
+      }
+    },
+    "company_relevance": {
+      "type": "string",
+      "maxLength": 300
+    },
+    "affected_themes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "water",
+          "climate",
+          "packaging",
+          "raw_materials",
+          "biodiversity",
+          "human_rights",
+          "health",
+          "responsible_marketing",
+          "living_culture",
+          "disclosure",
+          "governance"
+        ]
+      }
+    },
+    "affected_business_areas": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "string",
+        "maxLength": 100
+      }
+    },
+    "impact_pathways": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "string",
+        "maxLength": 150
+      }
+    },
+    "selection_reasons": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "string",
+        "maxLength": 150
+      }
+    },
+    "questions_to_confirm": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "string",
+        "maxLength": 150
+      }
+    },
+    "monitoring_signals": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "string",
+        "maxLength": 150
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "claim",
+          "source_url",
+          "source_type"
+        ],
+        "properties": {
+          "claim": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "source_url": {
+            "type": "string"
+          },
+          "source_type": {
+            "type": "string",
+            "enum": [
+              "primary",
+              "official_company",
+              "secondary_analysis"
+            ]
+          }
+        }
+      }
+    },
+    "uncertainties": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "string",
+        "maxLength": 150
+      }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "human_review_required": {
+      "type": "boolean"
+    }
+  }
+}

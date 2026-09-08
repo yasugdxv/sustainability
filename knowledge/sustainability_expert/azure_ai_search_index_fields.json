@@ -1,0 +1,107 @@
+{
+  "index_name": "suntory-sustainability-expert-v1",
+  "note": "Conceptual field definition. Set vector dimensions to match the embedding deployment.",
+  "fields": [
+    {
+      "name": "id",
+      "type": "Edm.String",
+      "key": true,
+      "filterable": true
+    },
+    {
+      "name": "title",
+      "type": "Edm.String",
+      "searchable": true
+    },
+    {
+      "name": "content",
+      "type": "Edm.String",
+      "searchable": true
+    },
+    {
+      "name": "source_url",
+      "type": "Edm.String",
+      "filterable": true
+    },
+    {
+      "name": "source_id",
+      "type": "Edm.String",
+      "filterable": true
+    },
+    {
+      "name": "document_type",
+      "type": "Edm.String",
+      "filterable": true,
+      "facetable": true
+    },
+    {
+      "name": "theme_ids",
+      "type": "Collection(Edm.String)",
+      "filterable": true,
+      "facetable": true
+    },
+    {
+      "name": "section_type",
+      "type": "Edm.String",
+      "filterable": true,
+      "facetable": true
+    },
+    {
+      "name": "authority_level",
+      "type": "Edm.Int32",
+      "filterable": true,
+      "sortable": true
+    },
+    {
+      "name": "effective_date",
+      "type": "Edm.DateTimeOffset",
+      "filterable": true,
+      "sortable": true
+    },
+    {
+      "name": "retrieved_at",
+      "type": "Edm.DateTimeOffset",
+      "filterable": true,
+      "sortable": true
+    },
+    {
+      "name": "content_hash",
+      "type": "Edm.String",
+      "filterable": true
+    },
+    {
+      "name": "language",
+      "type": "Edm.String",
+      "filterable": true
+    },
+    {
+      "name": "access_level",
+      "type": "Edm.String",
+      "filterable": true
+    },
+    {
+      "name": "content_vector",
+      "type": "Collection(Edm.Single)",
+      "searchable": true,
+      "dimensions": "MATCH_EMBEDDING_MODEL"
+    }
+  ],
+  "recommended_section_types": [
+    "philosophy",
+    "materiality",
+    "target",
+    "metric",
+    "policy",
+    "risk",
+    "opportunity",
+    "governance",
+    "initiative",
+    "case_study"
+  ],
+  "recommended_authority_levels": {
+    "1": "official policy/target/metric",
+    "2": "official theme context/governance",
+    "3": "official initiative/case study",
+    "4": "external analysis"
+  }
+}
