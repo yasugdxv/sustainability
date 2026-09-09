@@ -43,7 +43,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BASE = Path(__file__).parent
-PYTHON = BASE.parent.parent / ".venv" / "Scripts" / "python.exe"
+# 現在このスクリプトを実行しているPythonインタプリタをそのまま子プロセスにも使う
+# （Windows開発環境の.venvとAzure App Service(Linux)のantenvでパス構造が異なるため、
+# 環境依存のパスをハードコードせずsys.executableで解決する）
+PYTHON = Path(sys.executable)
 LOG_DIR = BASE / "logs" / "daily"
 LOCK_PATH = BASE / "run_daily.lock"
 MAX_LOCK_AGE_HOURS = 6  # これを超えて残っているロックは前回異常終了とみなし上書きする
