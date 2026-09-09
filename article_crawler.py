@@ -724,11 +724,27 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
 
 
 # ─── 保存 ─────────────────────────────────────────────────────────
+_FIGURE_CAPTION_RE = re.compile(r"^\s*(?:Figure|図)\s*[0-9０-９]+\s*[:：]", re.IGNORECASE)
+
+
+def strip_figure_captions(text: str) -> str:
+    """本文抽出時に元記事の画像キャプション（例:「Figure 1: ...」「図1：...」）が
+    独立した段落としてそのまま地の文に混入することがあるため、段落（改行区切り）の
+    先頭がこのパターンに一致する段落だけを除去する。「(see Figure 1)」のように文中に
+    自然に出てくる言及は文脈を壊すため残す。"""
+    if not text:
+        return text
+    paragraphs = text.split("\n")
+    kept = [p for p in paragraphs if not _FIGURE_CAPTION_RE.match(p)]
+    return "\n".join(kept)
+
+
 def save_article(client: SupabaseClient, target: dict, article_url: str, fetched_url: str,
                   final_url: str, title: str, pub_dt, updated_dt, text: str,
                   document_info: dict = None) -> tuple:
     """article_urls / articles へ保存する。document_info(PDF/.docx用)があれば
     article_filesにも本文ファイルとして記録する。(is_new_url, is_new_version)を返す"""
+    text = strip_figure_captions(text)
     now_iso = datetime.now(timezone.utc).isoformat()
 
     existing = client.select("article_urls", {"select": "*", "article_url": f"eq.{article_url}"})
