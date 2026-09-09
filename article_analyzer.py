@@ -284,12 +284,12 @@ def build_redundancy_user_prompt(article: dict, candidates: list) -> str:
 
 
 def classify_secondary_redundancy(azure_client, model: str, article: dict, candidates: list) -> dict:
-    """common.call_llm_structuredを再利用。temperature=0（同一性判定という性質上、
-    competitor_change_detector.match_existing_recordと同じ理由でブレを避ける）"""
+    """common.call_llm_structuredを再利用。temperature未指定（一部モデルがtemperature=0を
+    受け付けないため。同一性判定という性質上ブレは避けたいが、モデル互換性を優先する）"""
     user_prompt = build_redundancy_user_prompt(article, candidates)
     result = common.call_llm_structured(
         azure_client, model, SECONDARY_REDUNDANCY_SYSTEM_PROMPT, user_prompt,
-        SECONDARY_REDUNDANCY_SCHEMA, "SecondaryRedundancyClassification", temperature=0)
+        SECONDARY_REDUNDANCY_SCHEMA, "SecondaryRedundancyClassification")
     return result["data"]
 
 

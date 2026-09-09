@@ -296,7 +296,7 @@ def judge_geo_intelligence_sufficiency(azure_client, model: str, geo_question: s
     try:
         result = common.call_llm_structured(
             azure_client, model, GEO_SUFFICIENCY_SYSTEM_PROMPT, user_prompt,
-            GEO_SUFFICIENCY_SCHEMA, "GeoIntelligenceSufficiencyJudgment", temperature=0)
+            GEO_SUFFICIENCY_SCHEMA, "GeoIntelligenceSufficiencyJudgment")
         return result["data"]
     except common.ExpertLLMError:
         return {"sufficient": False, "freshness_sufficient": False, "selected_item_ids": [],

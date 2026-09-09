@@ -422,7 +422,7 @@ def _usage_dict(resp) -> dict:
 
 
 def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str,
-                         schema: dict, schema_name: str, temperature: float = 0.2) -> dict:
+                         schema: dict, schema_name: str, temperature: float | None = None) -> dict:
     """schemaに準拠したJSONを1個取得する。
 
     Azure OpenAIの構造化出力(response_format=json_schema)が使える場合はそれを使う。
@@ -430,13 +430,17 @@ def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str
     サーバー側でSchema検証 → 検証失敗時に最大1回だけ修正再実行、という流れにフォールバックする。
     それでも失敗した場合は ExpertLLMError を送出する（呼び出し側でexpert_runsにエラー記録する）。
 
-    temperatureは既定0.2（従来通り）。競合目標DB抽出のように「同じ入力からは毎回同じ
-    構造化結果を返してほしい」タスクでは、呼び出し側でより低い値（例: 0）を指定できる
-    （2026-08-24追加。既定値は変更していないため既存呼び出し元の挙動は変わらない）。
+    temperatureは既定None（未指定）。一部のモデル（gpt-5.5系）はデフォルト値(1)以外の
+    temperatureを受け付けずBadRequestErrorになるため、指定しない場合はAPIリクエストに
+    temperatureパラメータ自体を含めない。呼び出し側で明示的に指定した場合のみ渡す
+    （2026-09-09、以前は既定0.2・呼び出し側で0を指定するケースがあり、gpt-5.5系で
+    全滅していたことが判明したための変更。既定値をNoneに変えたため、temperature未指定の
+    既存呼び出し元は挙動が変わる＝モデルのデフォルト値(通常1)が使われるようになる）。
 
     戻り値: {"data": dict, "mode": str, "token_usage": dict, "latency_ms": int}
     """
     started = time.monotonic()
+    temp_kwargs = {} if temperature is None else {"temperature": temperature}
 
     # ── まず構造化出力を試す ──
     try:
@@ -450,7 +454,7 @@ def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str
                 "type": "json_schema",
                 "json_schema": {"name": schema_name, "schema": schema, "strict": False},
             },
-            temperature=temperature,
+            **temp_kwargs,
         )
         data = json.loads(resp.choices[0].message.content)
         jsonschema.validate(data, schema)
@@ -465,7 +469,7 @@ def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str
         {"role": "system", "content": system_prompt + "\n\n必ずJSON1個のみを出力すること。説明文・Markdown装飾は不要。"},
         {"role": "user", "content": user_prompt},
     ]
-    resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+    resp = client.chat.completions.create(model=model, messages=messages, **temp_kwargs)
     raw = resp.choices[0].message.content
     try:
         data = extract_json_object(raw)
@@ -483,7 +487,7 @@ def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str
         "content": f"前回の出力はJSON Schema検証に失敗しました: {first_error}\n"
                     f"Schemaに厳密に従うJSON1個のみを再出力してください。",
     })
-    resp2 = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
+    resp2 = client.chat.completions.create(model=model, messages=messages, **temp_kwargs)
     raw2 = resp2.choices[0].message.content
     latency_ms = int((time.monotonic() - started) * 1000)
     try:

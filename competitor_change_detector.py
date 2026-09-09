@@ -154,7 +154,7 @@ def judge_change(azure_client, model: str, company_name: str, record_type: str,
     )
     result = common.call_llm_structured(
         azure_client, model, CHANGE_JUDGE_SYSTEM_PROMPT, user_prompt,
-        CHANGE_JUDGE_SCHEMA, "CompetitorChangeJudgement", temperature=0)
+        CHANGE_JUDGE_SCHEMA, "CompetitorChangeJudgement")
     return result["data"]
 
 
@@ -212,11 +212,13 @@ def match_existing_record(azure_client, model: str, company_name: str, record_ty
         f"source_url={new_source_url or '(不明)'} / "
         f"structured_fields={new_extraction.get('structured_fields')}\n"
     )
-    # temperature=0: 同一性判定がクロール毎にブレると、無関係な目標同士を比較して
-    # 誤った変更検知を生む（水資源目標を別ページの目標と誤って同一視した実例あり）
+    # temperature未指定（一部モデルがtemperature=0を受け付けないため）。同一性判定が
+    # クロール毎にブレると、無関係な目標同士を比較して誤った変更検知を生む
+    # （水資源目標を別ページの目標と誤って同一視した実例あり）ため本来は低温度が望ましいが、
+    # モデル互換性を優先する
     result = common.call_llm_structured(
         azure_client, model, MATCH_EXISTING_SYSTEM_PROMPT, user_prompt,
-        MATCH_EXISTING_SCHEMA, "CompetitorRecordMatch", temperature=0)
+        MATCH_EXISTING_SCHEMA, "CompetitorRecordMatch")
     return result["data"].get("matched_record_id")
 
 
@@ -309,12 +311,15 @@ def process_extracted_record(client: SupabaseClient, azure_client, model: str, *
         return {"kind": "skipped"}
 
     if record_type == "INITIATIVE":
+        # source_text(クロール本文全体)ではなくevidence_quote(この取組事例に関する
+        # 本文該当箇所のみ)を使う。同じsource_urlから複数の取組事例が抽出される
+        # ことがあり、本文全体を使うと詳細ページがどれも同じ内容になってしまうため
         initiative = save_initiative(
             client, company_id=company_id, source_id=source["source_id"],
             title=extracted["title"], summary=extracted["summary"],
             source_url=source["source_url"], themes=extracted.get("themes"),
             goal_category_id=extracted.get("goal_category_id"),
-            source_text=source_text,
+            source_text=extracted.get("evidence_quote") or None,
         )
         audit.log_action(client, "initiative", initiative["initiative_id"],
                           "initiative_saved", "system", {"is_new": initiative["is_new"]})

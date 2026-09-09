@@ -85,7 +85,7 @@ TARGET/KPIとして抽出してよいのは、具体的な達成内容が本文�
 
 1つの本文から複数レコードが抽出されることを許容する。TARGET/KPI/ACTUAL/ESG_RATINGについては、
 本文に明記された情報のみをstructured_fieldsに埋め、無い項目はnullにする（推測で補完しない）。
-INITIATIVEについては title/summary のみを埋める。
+INITIATIVEについては title/summary/evidence_quote を埋める。
 
 重要（抽出の一貫性）: 本文中に具体的な数値・年限・対象範囲が明記されている場合は、
 迷わず正確にそのままstructured_fieldsへ書き写すこと。同じ内容を後から抽象化・要約したり、
@@ -101,10 +101,16 @@ TARGET/KPI/ACTUAL/ESG_RATING/INITIATIVEについては、themesのうち主目�
 複数選ばない）。該当が薄い場合はそのテーマの「その他」を選ぶ。OTHERの場合やthemesが空の場合は
 goal_category_idをnullにする。
 
-evidence_quote（自己検証用、TARGET/KPI/ACTUAL/ESG_RATINGのみ）: structured_fieldsに埋めた
-数値・年限・対象範囲等を裏付ける、本文からの引用または近い言い回しを1〜2文で書くこと。
-structured_fieldsの各項目は、このevidence_quoteの中に必ず裏付けが見つかる内容だけを埋めること
-（裏付けが無い項目はnullのままにする）。INITIATIVE/OTHERは空文字列でよい。
+evidence_quote:
+- TARGET/KPI/ACTUAL/ESG_RATING（自己検証用）: structured_fieldsに埋めた数値・年限・対象範囲等を
+  裏付ける、本文からの引用または近い言い回しを1〜2文で書くこと。structured_fieldsの各項目は、
+  このevidence_quoteの中に必ず裏付けが見つかる内容だけを埋めること（裏付けが無い項目はnullの
+  ままにする）。
+- INITIATIVE（詳細表示用）: この取組事例について本文中に書かれている記述を、他のレコード
+  （同じ本文から抽出される別の取組事例・目標等）の内容を混ぜずに、この取組事例に関する部分だけ
+  まとめて引用すること。要約用のsummaryとは別に、詳細ページで読める分量（目安3〜8文程度）で
+  できるだけ具体的に書く。本文に該当箇所が乏しい場合はsummaryと同程度の短さでもよい。
+- OTHERは空文字列でよい。
 
 # サステナ目標カテゴリ一覧
 {_GOAL_CATEGORY_PROMPT_TEXT}
@@ -197,11 +203,12 @@ def classify_and_extract(azure_client, model: str, company_name: str, text: str)
     goal_category_idはその親テーマがthemesに含まれていない場合、防御的にnullへ落とす
     （LLMの選択ミスがtag整合性を壊さないようにする）"""
     user_prompt = f"# 対象企業\n{company_name}\n\n# 本文\n{text[:MAX_TEXT_CHARS]}\n"
-    # temperature=0: 同じページを別日にクロールした際、内容が変わっていないのに
-    # 抽出結果だけがブレて変更検知側で誤検知を起こすのを避けるため、抽出は極力決定的に行う
+    # temperature未指定（一部モデルがtemperature=0を受け付けないため）。同じページを
+    # 別日にクロールした際、内容が変わっていないのに抽出結果だけがブレて変更検知側で
+    # 誤検知を起こすのを避けたく本来は低温度が望ましいが、モデル互換性を優先する
     result = common.call_llm_structured(
         azure_client, model, _build_classify_system_prompt(), user_prompt,
-        _build_classify_schema(), "CompetitorContentClassification", temperature=0)
+        _build_classify_schema(), "CompetitorContentClassification")
     records = result["data"]["records"]
 
     by_id = {r["goal_category_id"]: r for r in (_GOAL_CATEGORIES or [])}
