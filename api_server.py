@@ -730,10 +730,11 @@ def competitor_changes(company_id: str = "", theme: str = "", record_type: str =
     after_ids = list({e["after_record_id"] for e in events if e.get("after_record_id")})
     target_records = {}
     if after_ids:
-        rows = _competitor_client.select("competitor_target_records", {
+        # after_idsが多いと1つのin.(...)クエリのURLが長くなりすぎて414 URI Too Longに
+        # なるため、chunk分割して取得する（article_analysisで実際に発生した問題と同種）
+        rows = common._select_in_chunks(_competitor_client, "competitor_target_records", {
             "select": "record_id,source_url,title,themes,source_updated_at,goal_category_id",
-            "record_id": f"in.({','.join(after_ids)})",
-        })
+        }, "record_id", after_ids)
         target_records = {r["record_id"]: r for r in rows}
 
     if theme:
