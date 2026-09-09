@@ -550,10 +550,11 @@ def _change_to_ui(e: dict, companies: dict, target_records: dict = None, goal_ca
     }
 
 
-def _initiative_to_ui(i: dict, companies: dict, goal_categories: dict = None) -> dict:
+def _initiative_to_ui(i: dict, companies: dict, goal_categories: dict = None,
+                       lang: str = "ja", with_body: bool = False) -> dict:
     company = companies.get(i["company_id"], {})
     goal_category = (goal_categories or {}).get(i.get("goal_category_id"))
-    return {
+    out = {
         "id": i["initiative_id"],
         "companyId": i["company_id"],
         "companyName": company.get("company_name", "?"),
@@ -569,6 +570,11 @@ def _initiative_to_ui(i: dict, companies: dict, goal_categories: dict = None) ->
         "detectedAt": i.get("detected_at"),
         "sourceUrl": i.get("source_url"),
     }
+    if with_body:
+        body = i.get("source_text") or ""
+        body_translated = core.translate_body(_azure_client, _model, i["initiative_id"], body, lang) if body else ""
+        out["body"] = [p for p in body_translated.split("\n") if p.strip()]
+    return out
 
 
 def _target_record_to_ui(r: dict, companies: dict, goal_categories: dict = None) -> dict:
@@ -784,6 +790,18 @@ def competitor_initiatives_list(company_id: str = "", theme: str = "", is_new: s
     companies = _competitor_company_map()
     goal_categories = _goal_category_map()
     return {"initiatives": [_initiative_to_ui(r, companies, goal_categories) for r in rows]}
+
+
+@app.get("/api/competitors/initiatives/{initiative_id}")
+def competitor_initiative_detail(initiative_id: str, lang: str = "ja"):
+    rows = _competitor_client.select("competitor_initiatives", {
+        "select": "*", "initiative_id": f"eq.{initiative_id}",
+    })
+    if not rows:
+        raise HTTPException(status_code=404, detail="取組事例が見つかりません")
+    companies = _competitor_company_map()
+    goal_categories = _goal_category_map()
+    return _initiative_to_ui(rows[0], companies, goal_categories, lang=lang, with_body=True)
 
 
 @app.get("/api/competitors/companies")

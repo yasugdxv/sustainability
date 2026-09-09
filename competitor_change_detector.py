@@ -276,9 +276,10 @@ def save_change_event(client: SupabaseClient, *, company_id: str, record_type: s
 
 def save_initiative(client: SupabaseClient, *, company_id: str, source_id: str,
                      title: str, summary: str, source_url: str, themes: list = None,
-                     goal_category_id: str = None) -> dict:
+                     goal_category_id: str = None, source_text: str = None) -> dict:
     """既存タイトルと完全一致すれば更新扱い(is_new=False)、それ以外は新規として登録する
-    （骨組み段階の簡易判定。表記ゆれの類似判定は今後の拡張余地）"""
+    （骨組み段階の簡易判定。表記ゆれの類似判定は今後の拡張余地）。
+    source_textは詳細ページでの本文表示用（2026-09-09追加）"""
     existing = client.select("competitor_initiatives", {
         "select": "initiative_id,title", "company_id": f"eq.{company_id}",
     })
@@ -286,7 +287,7 @@ def save_initiative(client: SupabaseClient, *, company_id: str, source_id: str,
     rows = client.insert("competitor_initiatives", [{
         "company_id": company_id, "source_id": source_id, "is_new": is_new,
         "title": title, "summary": summary, "source_url": source_url, "themes": themes or [],
-        "goal_category_id": goal_category_id,
+        "goal_category_id": goal_category_id, "source_text": source_text,
     }])
     return rows[0]
 
@@ -313,6 +314,7 @@ def process_extracted_record(client: SupabaseClient, azure_client, model: str, *
             title=extracted["title"], summary=extracted["summary"],
             source_url=source["source_url"], themes=extracted.get("themes"),
             goal_category_id=extracted.get("goal_category_id"),
+            source_text=source_text,
         )
         audit.log_action(client, "initiative", initiative["initiative_id"],
                           "initiative_saved", "system", {"is_new": initiative["is_new"]})

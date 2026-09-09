@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { Download } from "lucide-react";
 import { TopBar } from "@/components/top-bar";
@@ -143,7 +143,13 @@ function CompetitorInitiativesPage() {
                     {ini.isNew ? t("competitor.initiatives.new") : t("competitor.initiatives.updated")}
                   </Badge>
                 </div>
-                <div className="text-editorial text-lg mt-2">{ini.title}</div>
+                <Link
+                  to="/competitors/initiatives/$id"
+                  params={{ id: ini.id }}
+                  className="text-editorial text-lg mt-2 block hover:text-primary transition-colors"
+                >
+                  {ini.title}
+                </Link>
                 <p className="text-sm text-muted-foreground mt-2 leading-relaxed">{ini.summary}</p>
                 <div className="flex flex-wrap gap-1 mt-3">
                   {ini.themes.map((th) => (

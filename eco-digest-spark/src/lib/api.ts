@@ -446,6 +446,7 @@ export interface CompetitorInitiative {
   isNew: boolean;
   detectedAt: string;
   sourceUrl: string | null;
+  body?: string[];
 }
 
 export interface CompetitorTarget {
@@ -608,6 +609,17 @@ export function useCompetitorInitiatives(
   params: { companyId?: string; theme?: string; isNew?: boolean; goalCategory?: string } = {},
 ) {
   return useQuery(competitorInitiativesQueryOptions(params));
+}
+
+export function competitorInitiativeQueryOptions(id: string, lang: Lang = "ja") {
+  return {
+    queryKey: ["competitorInitiative", id, lang] as const,
+    queryFn: () => fetchJson<CompetitorInitiative>(`/api/competitors/initiatives/${id}?lang=${lang}`),
+  };
+}
+
+export function useCompetitorInitiative(id: string | undefined, lang: Lang = "ja") {
+  return useQuery({ ...competitorInitiativeQueryOptions(id ?? "", lang), enabled: !!id });
 }
 
 export const competitorCompaniesQueryOptions = {

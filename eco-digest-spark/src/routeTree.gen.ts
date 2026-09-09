@@ -20,6 +20,7 @@ import { Route as CompetitorsInitiativesRouteImport } from './routes/competitors
 import { Route as CompetitorsOverviewRouteImport } from './routes/competitors.overview'
 import { Route as CompetitorsTargetsRouteImport } from './routes/competitors.targets'
 import { Route as CompetitorsCompaniesCompanyIdRouteImport } from './routes/competitors.companies.$companyId'
+import { Route as CompetitorsInitiativesIdRouteImport } from './routes/competitors.initiatives.$id'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -77,6 +78,12 @@ const CompetitorsCompaniesCompanyIdRoute =
     path: '/$companyId',
     getParentRoute: () => CompetitorsCompaniesRoute,
   } as any)
+const CompetitorsInitiativesIdRoute =
+  CompetitorsInitiativesIdRouteImport.update({
+    id: '/$id',
+    path: '/$id',
+    getParentRoute: () => CompetitorsInitiativesRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -86,10 +93,11 @@ export interface FileRoutesByFullPath {
   '/category/$slug': typeof CategorySlugRoute
   '/competitors/changes': typeof CompetitorsChangesRoute
   '/competitors/companies': typeof CompetitorsCompaniesRouteWithChildren
-  '/competitors/initiatives': typeof CompetitorsInitiativesRoute
+  '/competitors/initiatives': typeof CompetitorsInitiativesRouteWithChildren
   '/competitors/overview': typeof CompetitorsOverviewRoute
   '/competitors/targets': typeof CompetitorsTargetsRoute
   '/competitors/companies/$companyId': typeof CompetitorsCompaniesCompanyIdRoute
+  '/competitors/initiatives/$id': typeof CompetitorsInitiativesIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -99,10 +107,11 @@ export interface FileRoutesByTo {
   '/category/$slug': typeof CategorySlugRoute
   '/competitors/changes': typeof CompetitorsChangesRoute
   '/competitors/companies': typeof CompetitorsCompaniesRouteWithChildren
-  '/competitors/initiatives': typeof CompetitorsInitiativesRoute
+  '/competitors/initiatives': typeof CompetitorsInitiativesRouteWithChildren
   '/competitors/overview': typeof CompetitorsOverviewRoute
   '/competitors/targets': typeof CompetitorsTargetsRoute
   '/competitors/companies/$companyId': typeof CompetitorsCompaniesCompanyIdRoute
+  '/competitors/initiatives/$id': typeof CompetitorsInitiativesIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -113,10 +122,11 @@ export interface FileRoutesById {
   '/category/$slug': typeof CategorySlugRoute
   '/competitors/changes': typeof CompetitorsChangesRoute
   '/competitors/companies': typeof CompetitorsCompaniesRouteWithChildren
-  '/competitors/initiatives': typeof CompetitorsInitiativesRoute
+  '/competitors/initiatives': typeof CompetitorsInitiativesRouteWithChildren
   '/competitors/overview': typeof CompetitorsOverviewRoute
   '/competitors/targets': typeof CompetitorsTargetsRoute
   '/competitors/companies/$companyId': typeof CompetitorsCompaniesCompanyIdRoute
+  '/competitors/initiatives/$id': typeof CompetitorsInitiativesIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -132,6 +142,7 @@ export interface FileRouteTypes {
     | '/competitors/overview'
     | '/competitors/targets'
     | '/competitors/companies/$companyId'
+    | '/competitors/initiatives/$id'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -145,6 +156,7 @@ export interface FileRouteTypes {
     | '/competitors/overview'
     | '/competitors/targets'
     | '/competitors/companies/$companyId'
+    | '/competitors/initiatives/$id'
   id:
     | '__root__'
     | '/'
@@ -158,6 +170,7 @@ export interface FileRouteTypes {
     | '/competitors/overview'
     | '/competitors/targets'
     | '/competitors/companies/$companyId'
+    | '/competitors/initiatives/$id'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -168,7 +181,7 @@ export interface RootRouteChildren {
   CategorySlugRoute: typeof CategorySlugRoute
   CompetitorsChangesRoute: typeof CompetitorsChangesRoute
   CompetitorsCompaniesRoute: typeof CompetitorsCompaniesRouteWithChildren
-  CompetitorsInitiativesRoute: typeof CompetitorsInitiativesRoute
+  CompetitorsInitiativesRoute: typeof CompetitorsInitiativesRouteWithChildren
   CompetitorsOverviewRoute: typeof CompetitorsOverviewRoute
   CompetitorsTargetsRoute: typeof CompetitorsTargetsRoute
 }
@@ -252,6 +265,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof CompetitorsCompaniesCompanyIdRouteImport
       parentRoute: typeof CompetitorsCompaniesRoute
     }
+    '/competitors/initiatives/$id': {
+      id: '/competitors/initiatives/$id'
+      path: '/$id'
+      fullPath: '/competitors/initiatives/$id'
+      preLoaderRoute: typeof CompetitorsInitiativesIdRouteImport
+      parentRoute: typeof CompetitorsInitiativesRoute
+    }
   }
 }
 
@@ -266,6 +286,20 @@ const CompetitorsCompaniesRouteChildren: CompetitorsCompaniesRouteChildren = {
 const CompetitorsCompaniesRouteWithChildren =
   CompetitorsCompaniesRoute._addFileChildren(CompetitorsCompaniesRouteChildren)
 
+interface CompetitorsInitiativesRouteChildren {
+  CompetitorsInitiativesIdRoute: typeof CompetitorsInitiativesIdRoute
+}
+
+const CompetitorsInitiativesRouteChildren: CompetitorsInitiativesRouteChildren =
+  {
+    CompetitorsInitiativesIdRoute: CompetitorsInitiativesIdRoute,
+  }
+
+const CompetitorsInitiativesRouteWithChildren =
+  CompetitorsInitiativesRoute._addFileChildren(
+    CompetitorsInitiativesRouteChildren,
+  )
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ChatRoute: ChatRoute,
@@ -274,7 +308,7 @@ const rootRouteChildren: RootRouteChildren = {
   CategorySlugRoute: CategorySlugRoute,
   CompetitorsChangesRoute: CompetitorsChangesRoute,
   CompetitorsCompaniesRoute: CompetitorsCompaniesRouteWithChildren,
-  CompetitorsInitiativesRoute: CompetitorsInitiativesRoute,
+  CompetitorsInitiativesRoute: CompetitorsInitiativesRouteWithChildren,
   CompetitorsOverviewRoute: CompetitorsOverviewRoute,
   CompetitorsTargetsRoute: CompetitorsTargetsRoute,
 }
