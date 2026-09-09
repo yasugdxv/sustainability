@@ -741,7 +741,12 @@ def competitor_changes(company_id: str = "", theme: str = "", record_type: str =
         events = [e for e in events
                   if theme in (target_records.get(e.get("after_record_id"), {}).get("themes") or [])]
 
-    changes = [_change_to_ui(e, _competitor_company_map(), target_records, _goal_category_map())
+    # companies/goal_categoriesはイベント件数分ループの中で毎回問い合わせるとDB呼び出しが
+    # 件数倍に膨れ上がる（1710件で3420回の追加クエリになり応答が数十秒〜タイムアウトして
+    # いた）ため、ループの外で1回だけ取得する
+    companies = _competitor_company_map()
+    goal_categories = _goal_category_map()
+    changes = [_change_to_ui(e, companies, target_records, goal_categories)
                for e in events]
 
     # 掲載日(sourceUpdatedAt)は情報源にmetaタグが無ければNULLになりうるため、
