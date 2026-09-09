@@ -739,11 +739,44 @@ def strip_figure_captions(text: str) -> str:
     return "\n".join(kept)
 
 
+_LISTING_PAGE_RE = re.compile(
+    r"Results?\s+\d+\s*(?:to|-|–)\s*\d+\s+of\s+\d+"
+    r"|Ergebnisse?\s+\d+\s*(?:bis|-)\s*\d+\s+von\s+\d+"
+    r"|結果\s*\d+\s*[〜~\-]\s*\d+\s*件"
+    r"|全\s*\d+\s*件"
+    r"|\d+\s*件中\s*\d+"
+    r"|Page\s+\d+\s+of\s+\d+"
+    r"|Showing\s+\d+\s*(?:to|-)\s*\d+\s+of"
+    r"|検索結果",
+    re.IGNORECASE,
+)
+
+
+def looks_like_listing_page(text: str) -> bool:
+    """本文冒頭に「結果1〜20件」「Page 1 of N」等の検索結果・一覧ページ特有の
+    文言があれば、個別記事ではなく一覧・ナビゲーションページを誤って取得したと判定する
+    （2026-09-09、川崎さんからの不具合報告対応。ドイツ環境省・M&S等のクロール先で、
+    include_pathsが緩いために一覧ページやカテゴリページが個別記事として保存されて
+    いたケースが複数見つかった）。"""
+    if not text:
+        return False
+    return bool(_LISTING_PAGE_RE.search(text[:400]))
+
+
 def save_article(client: SupabaseClient, target: dict, article_url: str, fetched_url: str,
                   final_url: str, title: str, pub_dt, updated_dt, text: str,
                   document_info: dict = None) -> tuple:
     """article_urls / articles へ保存する。document_info(PDF/.docx用)があれば
-    article_filesにも本文ファイルとして記録する。(is_new_url, is_new_version)を返す"""
+    article_filesにも本文ファイルとして記録する。(is_new_url, is_new_version)を返す。
+    本文が一覧・検索結果ページの特徴を持つ場合や、最終URLがクロール先のtarget_url自体
+    （トップページ・一覧ページ）と一致する場合は記事として保存せず(False, False)を返す
+    （include_pathsが緩いクロール先で一覧・トップページ自体を記事として拾ってしまう
+    事故対策）。"""
+    target_url = (target.get("target_url") or "").rstrip("/").split("?")[0]
+    if final_url and final_url.rstrip("/").split("?")[0] == target_url:
+        return False, False
+    if looks_like_listing_page(text):
+        return False, False
     text = strip_figure_captions(text)
     now_iso = datetime.now(timezone.utc).isoformat()
 
