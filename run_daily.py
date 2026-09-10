@@ -48,7 +48,11 @@ BASE = Path(__file__).parent
 # 環境依存のパスをハードコードせずsys.executableで解決する）
 PYTHON = Path(sys.executable)
 LOG_DIR = BASE / "logs" / "daily"
-LOCK_PATH = BASE / "run_daily.lock"
+# Azure WebJobsはジョブごとにWEBJOBS_NAME環境変数を自動設定する。これを使ってロックファイルを
+# ジョブ単位で分離し、実行するステップの異なる複数WebJob（記事クロール系/競合クロール系）が
+# お互いの実行をブロックしないようにする（手動/ローカル実行時はWEBJOBS_NAME未設定のため共通名を使う）。
+_lock_suffix = os.environ.get("WEBJOBS_NAME", "default")
+LOCK_PATH = BASE / f"run_daily_{_lock_suffix}.lock"
 MAX_LOCK_AGE_HOURS = 6  # これを超えて残っているロックは前回異常終了とみなし上書きする
 
 # (ステップ名, コマンド引数, タイムアウト秒)

@@ -28,7 +28,7 @@ node_modules/
 logs/
 
 # 日次パイプラインの重複実行防止ロック
-run_daily.lock
+run_daily*.lock
 
 # 退避した旧ファイル（削除ではなく退避のため、追跡対象から外す）
 _removed_20260723/
