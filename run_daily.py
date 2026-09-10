@@ -57,12 +57,12 @@ MAX_LOCK_AGE_HOURS = 6  # これを超えて残っているロックは前回異
 
 # (ステップ名, コマンド引数, タイムアウト秒)
 STEPS = [
-    ("crawl", ["article_crawler.py"], 3600),
+    ("crawl", ["article_crawler.py"], 21600),
     ("reference_list", ["reference_list_monitor.py"], 900),
     ("api_articles", ["api_article_crawler.py"], 900),
     ("filter_coverage_check", ["check_filter_keyword_coverage.py"], 300),
     ("analyze", ["article_analyzer.py", "9999", "5"], 5400),
-    ("competitor_crawl", ["competitor_crawler.py"], 1800),
+    ("competitor_crawl", ["competitor_crawler.py"], 5400),
     ("selector", ["sustainability_article_selector.py", "--top-n-per-theme", "10"], 3600),
 ]
 
