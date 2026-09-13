@@ -8,6 +8,14 @@ import monthly_competitor_report as monthly  # noqa: E402
 from tests._fakes import FakeSupabaseClient  # noqa: E402
 
 
+def _report_row(report_id="mr-1", status="GENERATED"):
+    return {
+        "report_id": report_id, "report_month": "2026-09", "period_start": "2026-09-01",
+        "period_end": "2026-09-30", "subject": "件名", "html_body": "<p>本文</p>",
+        "status": status, "send_mode": None, "recipients": [], "send_status": None,
+    }
+
+
 def _scored(initiative_id, score, recommended=True, duplicate_of=None):
     return {
         "initiative_id": initiative_id, "selection_score": score,
@@ -57,6 +65,71 @@ def test_resolve_period_handles_december_rollover():
     assert period_start == date(2026, 12, 1)
     assert period_end == date(2026, 12, 31)
     assert period_end_exclusive == date(2027, 1, 1)
+
+
+def test_approve_and_send_success_marks_sent(monkeypatch):
+    client = FakeSupabaseClient({"monthly_reports": [_report_row()]})
+    monkeypatch.setattr(monthly, "send_email",
+                         lambda subject, html_body, config, to_addresses: {"ok": True, "mode": "preview"})
+    monkeypatch.setattr(monthly, "list_recipients", lambda client, test_mode=False: [])
+
+    result = monthly.approve_and_send(client, {}, "mr-1", reviewer_id="reviewer-a")
+
+    assert result["ok"] is True
+    assert result["status"] == "SENT"
+    row = client.tables["monthly_reports"][0]
+    assert row["status"] == "SENT"
+    assert row["send_status"] == "success"
+    assert row["send_error_message"] is None
+
+
+def test_approve_and_send_refuses_cancelled_report():
+    client = FakeSupabaseClient({"monthly_reports": [_report_row(status="CANCELLED")]})
+    result = monthly.approve_and_send(client, {}, "mr-1", reviewer_id="reviewer-a")
+    assert result["ok"] is False
+
+
+def test_approve_and_send_refuses_already_sent_report():
+    """元のガードはstatus=='CANCELLED'のみだったが、既に'SENT'のレポートへの
+    再送も防ぐよう強化した（pmo-003/009と同じ二重送信防止の考え方）"""
+    client = FakeSupabaseClient({"monthly_reports": [_report_row(status="SENT")]})
+    result = monthly.approve_and_send(client, {}, "mr-1", reviewer_id="reviewer-a")
+    assert result["ok"] is False
+
+
+def test_approve_and_send_second_concurrent_call_does_not_double_send(monkeypatch):
+    client = FakeSupabaseClient({"monthly_reports": [_report_row()]})
+    send_count = {"n": 0}
+
+    def counting_send_email(subject, html_body, config, to_addresses):
+        send_count["n"] += 1
+        return {"ok": True, "mode": "preview"}
+
+    monkeypatch.setattr(monthly, "send_email", counting_send_email)
+    monkeypatch.setattr(monthly, "list_recipients", lambda client, test_mode=False: [])
+
+    first = monthly.approve_and_send(client, {}, "mr-1", reviewer_id="reviewer-a")
+    second = monthly.approve_and_send(client, {}, "mr-1", reviewer_id="reviewer-b")
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert send_count["n"] == 1
+
+
+def test_reject_report_blocks_when_already_sent():
+    client = FakeSupabaseClient({"monthly_reports": [_report_row(status="SENT")]})
+    result = monthly.reject_report(client, "mr-1", reviewer_id="reviewer-a")
+    assert result["ok"] is False
+    row = client.tables["monthly_reports"][0]
+    assert row["status"] == "SENT"  # 変化していない
+
+
+def test_reject_report_succeeds_when_generated():
+    client = FakeSupabaseClient({"monthly_reports": [_report_row(status="GENERATED")]})
+    result = monthly.reject_report(client, "mr-1", reviewer_id="reviewer-a")
+    assert result["ok"] is True
+    row = client.tables["monthly_reports"][0]
+    assert row["status"] == "CANCELLED"
 
 
 def _company(company_id, name, is_own=False, category="ビール", order=1):

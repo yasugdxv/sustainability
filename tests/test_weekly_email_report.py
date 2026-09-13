@@ -318,6 +318,40 @@ def test_approve_and_send_refuses_rejected_report():
     assert result["ok"] is False
 
 
+def test_approve_and_send_second_concurrent_call_does_not_double_send(tmp_path, monkeypatch):
+    """同じレポートに対してapprove_and_send()が2回連続で呼ばれても（二重クリック相当）、
+    send_email()は1回しか呼ばれない（pmo-009の直接的な回帰テスト。
+    send_state_machine.SendStateMachine.claim_for_sendingの原子的claimに依存）"""
+    monkeypatch.setattr(wer, "CACHE_DIR", tmp_path)
+    client = FakeSupabaseClient({"weekly_email_reports": [_report_row()]})
+    send_count = {"n": 0}
+
+    def counting_send_email(subject, html_body, config, to_addresses):
+        send_count["n"] += 1
+        return {"ok": True, "mode": "preview"}
+
+    monkeypatch.setattr(wer, "send_email", counting_send_email)
+    config = {"email": {"enabled": False}}
+
+    first = wer.approve_and_send(client, config, "r-1", reviewer_id="reviewer-a")
+    second = wer.approve_and_send(client, config, "r-1", reviewer_id="reviewer-b")
+
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert send_count["n"] == 1
+    row = client.tables["weekly_email_reports"][0]
+    assert row["review_status"] == "sent"
+    assert row["reviewer_id"] == "reviewer-a"  # 2回目のclaimは失敗しているため上書きされない
+
+
+def test_reject_report_blocks_when_already_sent():
+    client = FakeSupabaseClient({"weekly_email_reports": [_report_row(review_status="sent")]})
+    result = wer.reject_report(client, "r-1", reviewer_id="reviewer-a")
+    assert result["ok"] is False
+    row = client.tables["weekly_email_reports"][0]
+    assert row["review_status"] == "sent"  # 変化していない
+
+
 def test_record_send_result_advances_to_sent_on_success():
     client = FakeSupabaseClient({"weekly_email_reports": [_report_row(review_status="approved")]})
     wer.record_send_result(client, "r-1", send_mode="preview", recipients=[], send_status="success")

@@ -14,6 +14,7 @@ competitor_classifier.py が抽出した1レコード(TARGET/KPI/ACTUAL/ESG_RATI
 
 保存が必要な各処理は competitor_audit.log_action で監査ログに記録する。
 """
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,168 @@ def compare_structured_fields(before: dict, after: dict) -> list:
         if before_value != after_value:
             changed.append({"field": key, "before": before_value, "after": after_value})
     return changed
+
+
+# ─── Phase 2: 競合変更通知の自動送信ゲート（機械検証可能性判定、LLM不要の純粋関数） ─────
+# 「LLMの確信度(confidence)が高い」ことは、それ単独では自動送信を正当化しない。
+# 一次開示照合(verification_status)・変更分類(change_type/direction)・機械検証可能性
+# （before/after構造化フィールドの機械比較）・LLM自身のreview_required申告は、それぞれ
+# 独立した軸として扱い、全軸が揃って初めて「機械的に検証可能な事実変更」として自動送信候補
+# にする。意味解釈（STRENGTHENED/WEAKENED等の解釈、表現変更か実質変更かの判定、対象範囲・
+# 適用条件の変更等）を要するものは一律Human Reviewへ回す（保守的な初期allowlist）。
+
+# 数値としてそのまま機械比較できるフィールド（例: 30% -> 40%）
+MACHINE_VERIFIABLE_NUMERIC_FIELDS = {
+    "target_value", "numeric_value", "reduction_rate", "actual_value", "esg_score",
+}
+# 年・期限としてそのまま機械比較できるフィールド（例: 2030 -> 2035）
+MACHINE_VERIFIABLE_DATE_FIELDS = {
+    "base_year", "target_year", "interim_target_year", "actual_fiscal_year",
+}
+# 定義済みステータス値同士の比較のみ機械検証可能とみなすフィールド
+MACHINE_VERIFIABLE_STATUS_FIELDS = {"achievement_status", "selection_status"}
+# 意味解釈なしに比較できる、既知の定義済みステータス値（保守的な初期セット。
+# 自由記述のステータス文言はここに含めず、SEMANTIC_INTERPRETATION_REQUIREDへ倒す）
+KNOWN_STATUS_VALUES = {
+    "on_track", "on track", "delayed", "achieved", "not_achieved", "not achieved",
+    "達成", "未達成", "達成済み", "未達",
+    "selected", "not_selected", "not selected", "included", "excluded", "rejected",
+    "選定", "非選定", "除外",
+}
+# 対象範囲・適用条件系のフィールド（範囲変更は常にHuman Review、machine-verifiable allowlist外）
+SCOPE_FIELDS = {
+    "scope", "boundary", "target_region", "target_site", "target_product",
+    "target_material", "target_packaging", "target_company",
+}
+
+_NUMERIC_VALUE_RE = re.compile(r"^-?[\d,]+(\.\d+)?\s*%?$")
+_YEAR_VALUE_RE = re.compile(r"^\d{4}$")
+
+
+def _looks_purely_numeric(value) -> bool:
+    """値が「30%」「40」のような単純な数値表記そのものであることを機械的に確認する
+    （「carbon neutral by 2040」のような自然文はここでFalseになり、機械検証対象から外れる）"""
+    if value is None:
+        return False
+    return bool(_NUMERIC_VALUE_RE.match(str(value).strip()))
+
+
+def _looks_purely_year(value) -> bool:
+    if value is None:
+        return False
+    return bool(_YEAR_VALUE_RE.match(str(value).strip()))
+
+
+def _normalize_status(value) -> str:
+    return str(value).strip().casefold() if value is not None else ""
+
+
+def is_machine_verifiable_change(before: dict, after: dict, verification_status: str,
+                                  change_metadata: dict = None) -> dict:
+    """競合の変更通知を自動送信してよいか（＝機械的に検証可能な事実変更か）を判定する純粋関数
+    （DB・LLM呼び出し無し。ユニットテストしやすい）。
+
+    引数:
+      before / after: 変更前/変更後のstructured_fields（レコードの構造化フィールド辞書）
+      verification_status: competitor_disclosure_verifier.VERIFICATION_STATUSESのいずれか
+      change_metadata: judge_change()の判定結果由来のメタデータ。想定キー:
+        - change_type: CHANGE_JUDGE_SCHEMAのchange_type列挙値
+        - direction: "STRENGTHENED"/"WEAKENED"/"NEUTRAL"/None
+        - same_entity: 変更前後が同一エンティティと判定されたか（bool）
+        - review_required: LLM自身がレビュー要否を申告したフラグ（bool）
+
+    戻り値: {"machine_verifiable": bool, "reason_code": str, "requires_human_review": bool}
+    reason_codeは固定の監査用コードのみを返す（自由記述にしない）:
+      NUMERIC_CHANGE, DATE_CHANGE, STRUCTURED_STATUS_CHANGE,
+      SEMANTIC_INTERPRETATION_REQUIRED, UNIT_MISMATCH, SCOPE_CHANGED,
+      AMBIGUOUS_MAPPING, UNVERIFIED_SOURCE, CONTRADICTED_SOURCE, MULTIPLE_CHANGES
+
+    重要: VERIFIEDであることや確信度が高いことは、それ単独では自動送信を正当化しない。
+    STRENGTHENED/WEAKENEDという解釈自体も自動送信の許可根拠にはしない
+    （「50%→60%」という事実は機械検証できても、「強化された」という解釈はHuman Reviewの対象）。"""
+    meta = change_metadata or {}
+
+    def _blocked(reason_code: str) -> dict:
+        return {"machine_verifiable": False, "reason_code": reason_code, "requires_human_review": True}
+
+    # 軸1: 一次開示照合。VERIFIED以外は理由を問わず一律Human Review
+    if verification_status == "CONTRADICTED":
+        return _blocked("CONTRADICTED_SOURCE")
+    if verification_status != "VERIFIED":
+        return _blocked("UNVERIFIED_SOURCE")
+
+    # before/afterの対応関係が一意でなければ機械検証不能（新規登録＝before無し等を含む）
+    if not before or not after:
+        return _blocked("AMBIGUOUS_MAPPING")
+    if meta.get("same_entity") is False:
+        return _blocked("AMBIGUOUS_MAPPING")
+
+    # 軸2: 変更分類。STRENGTHENED/WEAKENEDという解釈自体は自動送信を許可する根拠にしない
+    if meta.get("direction") in ("STRENGTHENED", "WEAKENED"):
+        return _blocked("SEMANTIC_INTERPRETATION_REQUIRED")
+
+    change_type = meta.get("change_type")
+    if change_type in ("SCOPE_EXPANDED", "SCOPE_NARROWED"):
+        return _blocked("SCOPE_CHANGED")
+    if change_type != "SUBSTANTIVE_CHANGE":
+        # WORDING_ONLY/SIMPLE_REPUBLISH（表現変更か実質変更かの判定自体が意味解釈を要する）や
+        # NEW_TARGET/SUCCESSOR_TARGET/SEPARATE_TARGET/TARGET_WITHDRAWN/REMOVED_FROM_PAGE
+        # （同一目標の継続かどうかの判定自体が意味解釈を要する）は、保守的な初期allowlist外とする
+        return _blocked("SEMANTIC_INTERPRETATION_REQUIRED")
+
+    # 軸3: 機械検証可能性。実際に変わったフィールドを機械比較する（LLMの申告に頼らない）
+    changed_fields = compare_structured_fields(before, after)
+    if not changed_fields:
+        return _blocked("AMBIGUOUS_MAPPING")
+
+    changed_field_names = {cf["field"] for cf in changed_fields}
+    numeric_changed = changed_field_names & MACHINE_VERIFIABLE_NUMERIC_FIELDS
+
+    # unit自体が変わった場合、または数値フィールドの変更と同時にunitが食い違う場合は、
+    # 「安全に正規化できる」と機械的に断定できないため一律Human Review
+    if "unit" in changed_field_names or (numeric_changed and before.get("unit") != after.get("unit")):
+        return _blocked("UNIT_MISMATCH")
+
+    # 複数フィールドが同時に変わった場合は、単一の事実として機械的に通知できないため
+    # 一律Human Review（allowlistは「単一の変更が一対一で対応する」場合のみを想定）
+    if len(changed_fields) > 1:
+        return _blocked("MULTIPLE_CHANGES")
+
+    field = changed_fields[0]["field"]
+    before_value, after_value = changed_fields[0]["before"], changed_fields[0]["after"]
+
+    if field in MACHINE_VERIFIABLE_NUMERIC_FIELDS:
+        if _looks_purely_numeric(before_value) and _looks_purely_numeric(after_value):
+            result = {"machine_verifiable": True, "reason_code": "NUMERIC_CHANGE",
+                      "requires_human_review": False}
+        else:
+            return _blocked("SEMANTIC_INTERPRETATION_REQUIRED")
+    elif field in MACHINE_VERIFIABLE_DATE_FIELDS:
+        if _looks_purely_year(before_value) and _looks_purely_year(after_value):
+            result = {"machine_verifiable": True, "reason_code": "DATE_CHANGE",
+                      "requires_human_review": False}
+        else:
+            return _blocked("SEMANTIC_INTERPRETATION_REQUIRED")
+    elif field in MACHINE_VERIFIABLE_STATUS_FIELDS:
+        if (_normalize_status(before_value) in KNOWN_STATUS_VALUES
+                and _normalize_status(after_value) in KNOWN_STATUS_VALUES):
+            result = {"machine_verifiable": True, "reason_code": "STRUCTURED_STATUS_CHANGE",
+                      "requires_human_review": False}
+        else:
+            return _blocked("SEMANTIC_INTERPRETATION_REQUIRED")
+    elif field in SCOPE_FIELDS:
+        return _blocked("SCOPE_CHANGED")
+    else:
+        # kpi_definition（KPIの定義・適用条件自体の変更）等、上記いずれにも該当しない
+        # フィールドは意味解釈が必要とみなし、保守的な初期allowlistでは一律Human Reviewとする
+        return _blocked("SEMANTIC_INTERPRETATION_REQUIRED")
+
+    # 軸4/5: LLM自身がreview_requiredを申告している場合は、機械検証可能でも
+    # Human Reviewを優先する（確信度だけで押し切らないための多重防御。「no conflict」要件）
+    if meta.get("review_required"):
+        return _blocked("SEMANTIC_INTERPRETATION_REQUIRED")
+
+    return result
 
 
 # ─── LLMによる意味的変更判定＋一次開示照合（同一呼び出しで実施） ───────────

@@ -60,6 +60,8 @@ import weekly_geo_intelligence_service  # noqa: E402
 from weekly_geo_intelligence_service import is_weekly_geo_enabled  # noqa: E402
 import strategic_question_service as sqs  # noqa: E402
 import decision_insight_service as insight_service  # noqa: E402
+import send_state_machine as ssm  # noqa: E402
+import identity  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -393,13 +395,22 @@ def save_draft_edits(client: SupabaseClient, report_id: str, draft_content: dict
 
 
 def reject_report(client: SupabaseClient, report_id: str, reviewer_id: str,
-                   reviewer_feedback: dict = None) -> None:
-    """review_status='rejected'に更新するのみ（送信しない）"""
-    client.update("weekly_email_reports", {"report_id": f"eq.{report_id}"}, {
-        "review_status": "rejected", "reviewer_id": reviewer_id,
-        "reviewer_feedback": reviewer_feedback,
-        "reviewed_at": datetime.now(timezone.utc).isoformat(),
-    })
+                   reviewer_feedback: dict = None) -> dict:
+    """review_status='rejected'に更新する（送信しない）。
+    既に送信済み(review_status='sent')の行は却下できないようガードする
+    （send_state_machine.py: 却下ガードの共通化）"""
+    report = get_report(client, report_id)
+    if report is None:
+        return {"ok": False, "error": "report_idが見つかりません"}
+    state_machine = ssm.SendStateMachine(client, "weekly_email_reports", "report_id")
+    return state_machine.guard_reject(
+        report, status_field="review_status", blocked_statuses=("sent",),
+        patch={
+            "review_status": "rejected", "reviewer_id": reviewer_id,
+            "reviewer_feedback": reviewer_feedback,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 def record_send_result(client: SupabaseClient, report_id: str, *, send_mode: str, recipients: list,
@@ -444,14 +455,23 @@ def approve_and_send(client: SupabaseClient, config: dict, report_id: str, revie
     report = get_report(client, report_id)
     if report is None:
         return {"ok": False, "error": "report_idが見つかりません"}
-    if report.get("review_status") == "rejected":
-        return {"ok": False, "error": "却下済みのレポートは送信できません"}
 
-    client.update("weekly_email_reports", {"report_id": f"eq.{report_id}"}, {
-        "review_status": "approved", "reviewer_id": reviewer_id,
-        "reviewer_feedback": reviewer_feedback,
-        "reviewed_at": datetime.now(timezone.utc).isoformat(),
-    })
+    # review_status='approved'への更新と「送信中」claimを1回の条件付きUPDATEで
+    # 原子的に行う。既に'rejected'/'sent'ならここで即座に失敗し、send_email()は
+    # 一切呼ばれない。同時に2回approve_and_send()が呼ばれても、片方だけがこの
+    # claimに成功する（send_state_machine.py: pmo-003/009の二重送信防止）
+    state_machine = ssm.SendStateMachine(client, "weekly_email_reports", "report_id")
+    claim = state_machine.claim_for_sending(
+        report, status_field="review_status", blocked_statuses=("rejected", "sent"),
+        extra_patch={
+            "review_status": "approved", "reviewer_id": reviewer_id,
+            "reviewer_feedback": reviewer_feedback,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    if not claim["ok"]:
+        return claim
+    report = claim["row"]
 
     recipients = list_recipients(client, test_mode=test_mode)
     draft_content = report.get("draft_content") or {}
@@ -952,7 +972,11 @@ if __name__ == "__main__":
     p_send = subparsers.add_parser(
         "send", help="承認済みドラフトを送信する（主経路はダッシュボードの承認ボタン。CLIは運用フォールバック）")
     p_send.add_argument("--report-id", required=True)
-    p_send.add_argument("--reviewer-id", default="cli")
+    p_send.add_argument("--reviewer-id", default=None,
+                         help="非推奨・Phase 3以降は無視されます。自由記述のreviewer_idを"
+                              "アイデンティティとして使わないため。実際の送信者はDEV AUTHモード"
+                              "（環境変数 SUSTAINABILITY_EXPERT_DEV_AUTH_MODE / "
+                              "SUSTAINABILITY_EXPERT_DEV_USER_ID）経由でのみ解決される")
     p_send.add_argument("--mode", choices=["test", "production"], default="production",
                          help="test指定時はemail_recipientsのis_test=true受信者のみに送信する"
                               "（本番受信者には届かない）。未指定時はproduction（本番受信者へ送信）")
@@ -961,8 +985,24 @@ if __name__ == "__main__":
     if cli_args.cmd == "build":
         build_draft(since_days=cli_args.since_days, force_geo_rerun=cli_args.force_geo_rerun)
     else:
+        # Phase 3: --reviewer-idという自由記述文字列はもはやアイデンティティとして使わない
+        # （Baseline v1では既定値"cli"がそのままreviewer_id監査列に書き込まれていた）。
+        # DEV AUTHモードが明示的に有効な場合のみ環境変数由来のFakePrincipalで送信でき、
+        # それ以外（本番相当。Entra ID未接続）は常にfail-closedする。
+        if cli_args.reviewer_id is not None:
+            print(f"[警告] --reviewer-id は無視されます（Phase 3以降、自由記述のreviewer_idは"
+                  f"アイデンティティとして使用しません）: {cli_args.reviewer_id!r}")
+        try:
+            _principal = identity.resolve_principal(dev_principal=identity.dev_principal_from_env())
+        except identity.AuthenticationError as e:
+            print(f"[エラー] 認証済みレビュー担当者を解決できないため送信を中止しました（fail-closed）: {e}")
+            sys.exit(1)
+        if not identity.can_approve(_principal):
+            print("[エラー] この操作を行う権限がありません（reviewerロールが必要です）")
+            sys.exit(1)
         _config = load_config()
         _client = SupabaseClient(_config)
-        _result = approve_and_send(_client, _config, cli_args.report_id, reviewer_id=cli_args.reviewer_id,
+        _result = approve_and_send(_client, _config, cli_args.report_id,
+                                    reviewer_id=identity.audit_reviewer_id(_principal),
                                     test_mode=(cli_args.mode == "test"))
         print(_result)

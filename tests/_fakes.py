@@ -103,11 +103,19 @@ class FakeSupabaseClient:
             out.append(r)
         return out
 
-    def update(self, table: str, params: dict, patch: dict) -> None:
+    def update(self, table: str, params: dict, patch: dict, prefer: str = None):
+        """article_crawler.SupabaseClient.update()と同じインターフェース。
+        prefer="return=representation"の場合のみ、実際に更新された行のリスト
+        （更新後の内容）を返す（条件付きUPDATEの「0件だった」を検知するテスト用）"""
+        matched = []
         for row in self.tables.get(table, []):
             if self._matches(row, params):
                 row.update(patch)
+                matched.append(dict(row))
         self.updated.append((table, dict(params), dict(patch)))
+        if prefer:
+            return matched
+        return None
 
     def delete(self, table: str, params: dict) -> None:
         """article_crawler.SupabaseClient.delete()と同じインターフェース。

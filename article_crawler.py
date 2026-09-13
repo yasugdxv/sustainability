@@ -230,13 +230,21 @@ class SupabaseClient:
         resp.raise_for_status()
         return resp.json() if resp.text else None
 
-    def update(self, table: str, params: dict, patch: dict):
+    def update(self, table: str, params: dict, patch: dict, prefer: str = None):
+        """prefer未指定時は従来通り（Prefer: return=minimal、戻り値なし）。
+        prefer="return=representation" を渡した場合のみ、PostgRESTに実際に
+        更新された行を返させ、そのリストをそのまま返す（0件なら「paramsの条件に
+        一致する行が無かった」＝呼び出し側が条件付きUPDATEで排他制御したい時に使う。
+        send_state_machine.py の atomic claim design がこれに依存する）。
+        既存の全呼び出し箇所はpreferを渡さないため、挙動は一切変わらない"""
         resp = requests.patch(
             f"{self.base_url}/rest/v1/{table}",
-            headers={**self.headers, "Prefer": "return=minimal"},
+            headers={**self.headers, "Prefer": prefer or "return=minimal"},
             params=params, json=patch, proxies=self.proxies, verify=self.verify, timeout=30,
         )
         resp.raise_for_status()
+        if prefer:
+            return resp.json() if resp.text else []
 
     def delete(self, table: str, params: dict):
         resp = requests.delete(

@@ -38,6 +38,8 @@ from competitor_display import (  # noqa: E402
     esc as _esc, event_badge as _event_badge, format_before_after,
 )
 import competitor_audit as audit  # noqa: E402
+import send_state_machine as ssm  # noqa: E402
+import identity  # noqa: E402
 
 DEFAULT_INCLUDE_OWN_COMPANY = False
 MIN_INITIATIVES = 3
@@ -505,12 +507,24 @@ def list_reports(client: SupabaseClient, status: str = None) -> list:
 
 
 def reject_report(client: SupabaseClient, report_id: str, reviewer_id: str,
-                   reviewer_feedback: dict = None) -> None:
-    client.update("monthly_reports", {"report_id": f"eq.{report_id}"}, {
-        "status": "CANCELLED", "reviewed_by": reviewer_id,
-        "reviewed_at": datetime.now(timezone.utc).isoformat(),
-    })
-    audit.log_action(client, "monthly_report", report_id, "rejected", reviewer_id)
+                   reviewer_feedback: dict = None) -> dict:
+    """既に送信済み(status='SENT')のレポートは却下できないようガードする
+    （send_state_machine.py: 却下ガードの共通化）"""
+    rows = client.select("monthly_reports", {"report_id": f"eq.{report_id}", "limit": "1"})
+    report = rows[0] if rows else None
+    if report is None:
+        return {"ok": False, "error": "report_idが見つかりません"}
+    state_machine = ssm.SendStateMachine(client, "monthly_reports", "report_id")
+    result = state_machine.guard_reject(
+        report, status_field="status", blocked_statuses=("SENT",),
+        patch={
+            "status": "CANCELLED", "reviewed_by": reviewer_id,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    if result["ok"]:
+        audit.log_action(client, "monthly_report", report_id, "rejected", reviewer_id)
+    return result
 
 
 def approve_and_send(client: SupabaseClient, config: dict, report_id: str, reviewer_id: str,
@@ -519,14 +533,23 @@ def approve_and_send(client: SupabaseClient, config: dict, report_id: str, revie
     report = rows[0] if rows else None
     if report is None:
         return {"ok": False, "error": "report_idが見つかりません"}
-    if report.get("status") == "CANCELLED":
-        return {"ok": False, "error": "却下済みのレポートは送信できません"}
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    client.update("monthly_reports", {"report_id": f"eq.{report_id}"}, {
-        "status": "APPROVED", "reviewed_by": reviewer_id, "reviewed_at": now_iso,
-        "approved_by": reviewer_id, "approved_at": now_iso,
-    })
+    # status='APPROVED'への更新と「送信中」claimを1回の条件付きUPDATEで原子的に行う。
+    # 元々のガードは status=='CANCELLED' のみだったが、'SENT'（送信済み）も
+    # ブロック対象に加えている（既に送信済みのレポートを誤って再送しないため。
+    # send_state_machine.py: pmo-003/009の二重送信防止）
+    state_machine = ssm.SendStateMachine(client, "monthly_reports", "report_id")
+    claim = state_machine.claim_for_sending(
+        report, status_field="status", blocked_statuses=("CANCELLED", "SENT"),
+        extra_patch={
+            "status": "APPROVED", "reviewed_by": reviewer_id, "reviewed_at": now_iso,
+            "approved_by": reviewer_id, "approved_at": now_iso,
+        },
+    )
+    if not claim["ok"]:
+        return claim
+    report = claim["row"]
 
     recipients = list_recipients(client, test_mode=test_mode)
     result = send_email(report["subject"], report["html_body"], config, recipients)
@@ -619,7 +642,11 @@ if __name__ == "__main__":
 
     p_send = subparsers.add_parser("send", help="承認済みドラフトを送信する（運用フォールバック）")
     p_send.add_argument("--report-id", required=True)
-    p_send.add_argument("--reviewer-id", default="cli")
+    p_send.add_argument("--reviewer-id", default=None,
+                         help="非推奨・Phase 3以降は無視されます。自由記述のreviewer_idを"
+                              "アイデンティティとして使わないため。実際の送信者はDEV AUTHモード"
+                              "（環境変数 SUSTAINABILITY_EXPERT_DEV_AUTH_MODE / "
+                              "SUSTAINABILITY_EXPERT_DEV_USER_ID）経由でのみ解決される")
     p_send.add_argument("--mode", choices=["test", "production"], default="production",
                          help="test指定時はemail_recipientsのis_test=true受信者のみに送信する")
 
@@ -627,8 +654,22 @@ if __name__ == "__main__":
     if cli_args.cmd == "build":
         build_draft(report_month=cli_args.report_month)
     else:
+        # Phase 3: --reviewer-idという自由記述文字列はもはやアイデンティティとして使わない
+        # （Baseline v1では既定値"cli"がそのままreviewed_by/approved_by監査列に書き込まれていた）。
+        if cli_args.reviewer_id is not None:
+            print(f"[警告] --reviewer-id は無視されます（Phase 3以降、自由記述のreviewer_idは"
+                  f"アイデンティティとして使用しません）: {cli_args.reviewer_id!r}")
+        try:
+            _principal = identity.resolve_principal(dev_principal=identity.dev_principal_from_env())
+        except identity.AuthenticationError as e:
+            print(f"[エラー] 認証済みレビュー担当者を解決できないため送信を中止しました（fail-closed）: {e}")
+            sys.exit(1)
+        if not identity.can_approve(_principal):
+            print("[エラー] この操作を行う権限がありません（reviewerロールが必要です）")
+            sys.exit(1)
         _config = load_config()
         _client = SupabaseClient(_config)
-        _result = approve_and_send(_client, _config, cli_args.report_id, reviewer_id=cli_args.reviewer_id,
+        _result = approve_and_send(_client, _config, cli_args.report_id,
+                                    reviewer_id=identity.audit_reviewer_id(_principal),
                                     test_mode=(cli_args.mode == "test"))
         print(_result)

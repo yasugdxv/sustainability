@@ -234,3 +234,188 @@ def test_process_extracted_record_skips_other():
         client, azure_client=None, model="gpt-4o",
         company=COMPANY, source=SOURCE, extracted=extracted)
     assert result == {"kind": "skipped"}
+
+
+# ─── caa-007回帰: before/afterのstructured_fieldsが完全一致なら、after_textに何が
+# 書かれていようとjudge_change()（LLM）は一切呼ばれない（no_changeで即確定する） ─────────
+def test_process_extracted_record_identical_fields_never_calls_llm():
+    """一次開示照合の実装(judge_change())自体はPhase 2の変更対象外だが、「before/afterの
+    structured_fieldsが完全一致する入力ではLLMを一切呼ばない」という既存の安全な経路
+    （compare_structured_fieldsが空リストを返し、process_extracted_recordがno_changeで
+    即座に確定する）が本フェーズの変更で壊れていないことを確認する回帰テスト。
+    caa-007（悪意ある注入指示を含むafter_textでjudge_change()を欺こうとする攻撃）は、
+    そもそもbefore/afterが完全一致する限りjudge_change()にafter_textが渡ることすらない、
+    という実行パス自体がこの防御である"""
+    client = FakeSupabaseClient()
+    fields = {"target_value": "50% reduction by 2030", "boundary": "own operations"}
+    first_extracted = {"record_type": "TARGET", "title": "GHG削減目標",
+                        "structured_fields": fields, "summary": "..."}
+    detector.process_extracted_record(
+        client, azure_client=None, model="gpt-4o",
+        company=COMPANY, source=SOURCE, extracted=first_extracted)
+
+    azure_client = MagicMock()  # 呼ばれたら即座にテスト失敗させたいので応答は用意しない
+    second_extracted = {"record_type": "TARGET", "title": "GHG削減目標",
+                        "structured_fields": dict(fields), "summary": "..."}
+    result = detector.process_extracted_record(
+        client, azure_client=azure_client, model="gpt-4o",
+        company=COMPANY, source=SOURCE, extracted=second_extracted)
+
+    assert result == {"kind": "no_change"}
+    assert azure_client.chat.completions.create.call_count == 0
+
+
+# ─── Phase 2: is_machine_verifiable_change()（機械検証可能性の純粋関数） ─────────────
+def _metadata(change_type="SUBSTANTIVE_CHANGE", direction=None, same_entity=True,
+              review_required=False) -> dict:
+    return {"change_type": change_type, "direction": direction,
+            "same_entity": same_entity, "review_required": review_required}
+
+
+# --- 自動送信候補（machine_verifiable=True）となる3ケース ---
+def test_numeric_target_change_is_auto_send_eligible():
+    result = detector.is_machine_verifiable_change(
+        {"target_value": "30%"}, {"target_value": "40%"}, "VERIFIED", _metadata())
+    assert result == {"machine_verifiable": True, "reason_code": "NUMERIC_CHANGE",
+                       "requires_human_review": False}
+
+
+def test_deadline_change_is_auto_send_eligible():
+    result = detector.is_machine_verifiable_change(
+        {"target_year": "2030"}, {"target_year": "2035"}, "VERIFIED", _metadata())
+    assert result == {"machine_verifiable": True, "reason_code": "DATE_CHANGE",
+                       "requires_human_review": False}
+
+
+def test_structured_status_change_is_auto_send_eligible():
+    result = detector.is_machine_verifiable_change(
+        {"achievement_status": "未達成"}, {"achievement_status": "達成"}, "VERIFIED", _metadata())
+    assert result == {"machine_verifiable": True, "reason_code": "STRUCTURED_STATUS_CHANGE",
+                       "requires_human_review": False}
+
+
+# --- Human Review必須ケース ---
+def test_wording_only_requires_human_review():
+    result = detector.is_machine_verifiable_change(
+        {"scope": "全事業所"}, {"scope": "全ての事業所"}, "VERIFIED",
+        _metadata(change_type="WORDING_ONLY", direction="NEUTRAL"))
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "SEMANTIC_INTERPRETATION_REQUIRED"
+    assert result["requires_human_review"] is True
+
+
+def test_strengthened_direction_requires_human_review():
+    """「50%→60%」という事実は機械検証できても、STRENGTHENEDという解釈自体は
+    自動送信の許可根拠にしない（仕様のImportant節）"""
+    result = detector.is_machine_verifiable_change(
+        {"target_value": "50%"}, {"target_value": "60%"}, "VERIFIED",
+        _metadata(direction="STRENGTHENED"))
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "SEMANTIC_INTERPRETATION_REQUIRED"
+
+
+def test_weakened_direction_requires_human_review():
+    result = detector.is_machine_verifiable_change(
+        {"target_value": "60%"}, {"target_value": "50%"}, "VERIFIED",
+        _metadata(direction="WEAKENED"))
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "SEMANTIC_INTERPRETATION_REQUIRED"
+
+
+def test_unit_mismatch_requires_human_review():
+    result = detector.is_machine_verifiable_change(
+        {"target_value": "30", "unit": "%"}, {"target_value": "30", "unit": "kg"},
+        "VERIFIED", _metadata())
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "UNIT_MISMATCH"
+
+
+def test_scope_change_requires_human_review():
+    result = detector.is_machine_verifiable_change(
+        {"scope": "breweries"}, {"scope": "all sites"}, "VERIFIED",
+        _metadata(change_type="SCOPE_EXPANDED"))
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "SCOPE_CHANGED"
+
+
+def test_qualification_exception_change_requires_human_review():
+    """KPIの定義・適用条件自体の変更（kpi_definition）は数値/年限/ステータスのallowlistに
+    含まれないため、意味解釈が必要なものとして一律Human Reviewへ回す"""
+    result = detector.is_machine_verifiable_change(
+        {"kpi_definition": "per employee"}, {"kpi_definition": "per employee, excluding contractors"},
+        "VERIFIED", _metadata())
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "SEMANTIC_INTERPRETATION_REQUIRED"
+
+
+def test_ambiguous_before_after_requires_human_review():
+    result = detector.is_machine_verifiable_change(
+        {"target_value": "30%"}, {"target_value": "40%"}, "VERIFIED",
+        _metadata(same_entity=False))
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "AMBIGUOUS_MAPPING"
+
+
+def test_multiple_mixed_changes_require_human_review():
+    result = detector.is_machine_verifiable_change(
+        {"target_value": "30%", "scope": "breweries"},
+        {"target_value": "40%", "scope": "all sites"},
+        "VERIFIED", _metadata())
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "MULTIPLE_CHANGES"
+
+
+def test_unverified_requires_human_review():
+    result = detector.is_machine_verifiable_change(
+        {"target_value": "30%"}, {"target_value": "40%"}, "UNVERIFIED", _metadata())
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "UNVERIFIED_SOURCE"
+
+
+def test_contradicted_requires_human_review():
+    result = detector.is_machine_verifiable_change(
+        {"target_value": "30%"}, {"target_value": "40%"}, "CONTRADICTED", _metadata())
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "CONTRADICTED_SOURCE"
+
+
+# --- 回帰: caa-008（誇張表現でSUBSTANTIVE_CHANGEに見せかけた表現変更のみのケース） ---
+def test_caa_008_wording_only_dressed_as_substantive_does_not_auto_send():
+    """caa-008の実フィクスチャ値そのもの
+    （.agent-governance/evals/competitor-alert-auto-send/eval-cases.jsonl）。
+    judge_change()（LLM）が誇張されたプレスリリース文面に釣られて最悪ケースの出力
+    （SUBSTANTIVE_CHANGE・high confidence・VERIFIED）を返したと仮定しても、
+    before/afterのstructured_fieldsを機械比較すると2フィールド（target_value・boundary）が
+    同時に変わっており、かつtarget_valueは純粋な数値表記でもない。したがってLLMの分類・
+    確信度に関わらず、機械的にHuman Reviewへ回ることを確認する（Phase 2の核心: LLMの
+    確信度・分類だけでは自動送信を許可しない）"""
+    before_fields = {"target_value": "carbon neutral by 2040", "boundary": "Scope 1+2"}
+    after_fields = {"target_value": "net zero emissions by 2040", "boundary": "Scope 1 and Scope 2"}
+    worst_case_metadata = _metadata(change_type="SUBSTANTIVE_CHANGE", direction=None,
+                                     same_entity=True, review_required=False)
+
+    result = detector.is_machine_verifiable_change(
+        before_fields, after_fields, "VERIFIED", worst_case_metadata)
+
+    assert result["machine_verifiable"] is False
+    assert result["requires_human_review"] is True
+    assert result["reason_code"] == "MULTIPLE_CHANGES"
+
+
+# --- 要件(17): machine_verifiable相当の変更でも、verification_statusがVERIFIEDでなければ
+#     自動送信不可（検証・機械検証可能性は別軸であり、一方が他方の代わりにはならない） ---
+def test_machine_verifiable_shape_but_not_verified_does_not_auto_send():
+    result = detector.is_machine_verifiable_change(
+        {"target_value": "30%"}, {"target_value": "40%"}, "PARTIALLY_VERIFIED", _metadata())
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "UNVERIFIED_SOURCE"
+
+
+# --- 追加の多重防御確認: LLM自身がreview_required=Trueを申告していれば、機械検証可能な
+#     形をしていても最終的にHuman Reviewを優先する（confidenceだけで押し切らない） ---
+def test_review_required_flag_overrides_otherwise_machine_verifiable_change():
+    result = detector.is_machine_verifiable_change(
+        {"target_value": "30%"}, {"target_value": "40%"}, "VERIFIED",
+        _metadata(review_required=True))
+    assert result["machine_verifiable"] is False
+    assert result["reason_code"] == "SEMANTIC_INTERPRETATION_REQUIRED"

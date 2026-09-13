@@ -21,6 +21,7 @@ import monthly_competitor_report as monthly_competitor  # noqa: E402
 import competitor_source_discovery as source_discovery  # noqa: E402
 import competitor_daily_digest as daily_digest  # noqa: E402
 import strategic_question_service as sq_service  # noqa: E402
+import identity  # noqa: E402
 
 CANDIDATE_URL_TYPES = ["SUSTAINABILITY_HOME", "TARGETS", "PROGRESS", "REPORTS", "NEWS", "DISCLOSURE", "OTHER"]
 
@@ -60,6 +61,34 @@ def _get_client(config: dict) -> SupabaseClient:
     return SupabaseClient(config)
 
 
+# ─── Phase 3: 承認/却下アイデンティティ境界 ──────────────────────────────────
+# 「レビュー担当者ID」自由記述入力欄からreviewer_idを組み立てることは廃止した
+# （Baseline v1 pmo-002/007/008: 空欄が"unknown"になる、架空の名前がそのまま承認者に
+# なる、モジュールごとに挙動が違う、という3つの監査整合性の欠陥があったため）。
+# 以降、承認・却下・修正保存のreviewer_idは、必ずこの関数を経由してprincipalから
+# 導出する。
+def _authorize_reviewer_action(principal: identity.AuthenticatedPrincipal) -> str:
+    """承認/却下/修正保存アクションで使うreviewer_id値を、認証済みprincipalからのみ
+    導出する。principalが無い、またはreviewerロールが無い場合は例外を送出する
+    （呼び出し側でtry/exceptして画面にエラー表示する）。ユーザーが自由記述で入力した
+    テキストをここに混ぜてはならない。"""
+    if principal is None:
+        raise identity.AuthenticationError("認証済みレビュー担当者を解決できないため、この操作はできません")
+    if not identity.can_approve(principal):
+        raise PermissionError("この操作を行う権限がありません（reviewerロールが必要です）")
+    return identity.audit_reviewer_id(principal)
+
+
+def _resolve_dashboard_principal():
+    """画面全体で1回だけ呼ぶ。DEV AUTHモードが明示的に有効な場合のみ、環境変数由来の
+    FakePrincipalを使う。本番相当（DEV AUTHモード無効。Entra ID接続は本フェーズ未実装）
+    では常に解決失敗し、Noneを返す（呼び出し側で承認/却下ボタンを無効化する）。"""
+    try:
+        return identity.resolve_principal(dev_principal=identity.dev_principal_from_env()), None
+    except identity.AuthenticationError as e:
+        return None, str(e)
+
+
 def _render_geo_intelligence_summary(report: dict, config: dict):
     """Geo Intelligence（Phase S2）実行結果の簡易表示のみ。大規模UIは作らない。
     weekly_geo_intelligence_runs/itemsが無い（未適用/Kill Switch OFF）場合は何も表示しない"""
@@ -86,12 +115,16 @@ def _render_geo_intelligence_summary(report: dict, config: dict):
         pass  # 取得に失敗してもレビュー画面自体は継続する（大規模UIは作らない最小追加のため）
 
 
-def _render_weekly_report_card(report: dict, config: dict):
+def _render_weekly_report_card(report: dict, config: dict, principal: identity.AuthenticatedPrincipal):
     """1週分のドラフト全体を1カードとして表示する。表示内容は送信される
     メール本文そのもの（html_bodyのプレビュー）のみとし、概況・注目ポイント・
     テーマ別ダイジェスト・記事一覧をStreamlit側で別途表示することはしない
     （メール本文に既に含まれており二重表示になるため）。
-    承認して送信/却下/修正のみ保存の3操作を提供する"""
+    承認して送信/却下/修正のみ保存の3操作を提供する。
+
+    Phase 3: reviewer_idは自由記述入力からではなく、認証済みprincipal
+    （_authorize_reviewer_action経由）からのみ導出する。principalが無い、または
+    reviewerロールが無い場合は3操作すべて無効化する。"""
     draft = report.get("draft_content") or {}
     articles = draft.get("articles", [])
     report_id = report["report_id"]
@@ -113,7 +146,11 @@ def _render_weekly_report_card(report: dict, config: dict):
 
         st.divider()
         st.markdown("**レビュー**")
-        reviewer_id = st.text_input("レビュー担当者ID", key=f"weekly_reviewer_{report_id}")
+        can_act = identity.can_approve(principal)
+        if not can_act:
+            st.warning("⚠️ 認証済みレビュー担当者を解決できないため、承認・却下・修正保存は無効です。")
+        else:
+            st.caption(f"操作者: {principal.display_name}（{principal.user_id} / {principal.authentication_source}）")
         free_text = st.text_area("自由記述フィードバック", key=f"weekly_free_{report_id}", height=60)
 
         edited_json_text = st.text_area(
@@ -129,27 +166,28 @@ def _render_weekly_report_card(report: dict, config: dict):
         ):
             with col:
                 if st.button(label_text, key=f"weekly_btn_{status_value}_{report_id}",
-                             use_container_width=True, disabled=report["review_status"] == "rejected"):
-                    body = {
-                        "status": status_value, "reviewer_id": reviewer_id,
-                        "reviewer_feedback": {"free_text": free_text or None},
-                    }
+                             use_container_width=True,
+                             disabled=(report["review_status"] == "rejected") or not can_act):
                     try:
                         edited_draft = json.loads(edited_json_text)
-                        if edited_draft != draft:
-                            body["draft_content"] = edited_draft
                     except json.JSONDecodeError:
                         st.error("週次ドラフト本体のJSONが不正です。修正内容は保存されませんでした。")
+                        continue
+                    body = {
+                        "status": status_value,
+                        "reviewer_feedback": {"free_text": free_text or None},
+                    }
+                    if edited_draft != draft:
+                        body["draft_content"] = edited_draft
+                    result = expert_api.review_weekly_report(report_id, body, config, principal=principal)
+                    if result.get("ok"):
+                        st.success("保存しました")
+                        st.rerun()
                     else:
-                        result = expert_api.review_weekly_report(report_id, body, config)
-                        if result.get("ok"):
-                            st.success("保存しました")
-                            st.rerun()
-                        else:
-                            st.error(f"処理に失敗しました: {result.get('error')}")
+                        st.error(f"処理に失敗しました: {result.get('error')}")
 
 
-def _render_weekly_review_view(config: dict):
+def _render_weekly_review_view(config: dict, principal: identity.AuthenticatedPrincipal):
     client = _get_client(config)
     with st.sidebar:
         status_filter = st.selectbox(
@@ -171,12 +209,17 @@ def _render_weekly_review_view(config: dict):
 
     st.caption(f"{len(reports)}件")
     for report in reports:
-        _render_weekly_report_card(report, config)
+        _render_weekly_report_card(report, config, principal)
 
 
-def _render_daily_digest_card(digest: dict, config: dict):
+def _render_daily_digest_card(digest: dict, config: dict, principal: identity.AuthenticatedPrincipal):
     """1日分の変更イベントダイジェストをカード表示する。auto_sent/sentは参照のみ、
-    review_requiredのみ承認/却下ボタンを表示する"""
+    review_requiredのみ承認/却下ボタンを表示する。
+
+    Phase 3: reviewer_idは自由記述入力欄（"レビュー担当者ID"）からではなく、
+    認証済みprincipalからのみ導出する（_authorize_reviewer_action）。空欄が
+    "unknown"に丸められて承認者として記録される、という以前の挙動
+    （Baseline v1 pmo-002）は廃止した。"""
     digest_id = digest["digest_id"]
     label = COMPETITOR_ALERT_STATUS_LABELS.get(
         "auto_sent" if digest.get("auto_send_eligible") and digest["review_status"] == "sent"
@@ -199,32 +242,48 @@ def _render_daily_digest_card(digest: dict, config: dict):
 
         st.divider()
         st.markdown("**レビュー**")
-        reviewer_id = st.text_input("レビュー担当者ID", key=f"digest_reviewer_{digest_id}")
+        can_act = identity.can_approve(principal)
+        if not can_act:
+            st.warning("⚠️ 認証済みレビュー担当者を解決できないため、承認・却下は無効です。")
+        else:
+            st.caption(f"操作者: {principal.display_name}（{principal.user_id} / {principal.authentication_source}）")
         free_text = st.text_area("自由記述フィードバック", key=f"digest_free_{digest_id}", height=60)
 
         btn_col1, btn_col2 = st.columns(2)
         with btn_col1:
-            if st.button("✅ 承認して送信", key=f"digest_approve_{digest_id}", use_container_width=True):
+            if st.button("✅ 承認して送信", key=f"digest_approve_{digest_id}", use_container_width=True,
+                         disabled=not can_act):
                 client = _get_client(config)
-                result = daily_digest.approve_and_send(
-                    client, config, digest_id, reviewer_id or "unknown",
-                    reviewer_feedback={"free_text": free_text or None})
-                if result.get("ok"):
-                    st.success("承認・送信しました")
-                    st.rerun()
+                try:
+                    reviewer_id = _authorize_reviewer_action(principal)
+                except (identity.AuthenticationError, PermissionError) as e:
+                    st.error(f"認証エラー: {e}")
                 else:
-                    st.error(f"処理に失敗しました: {result.get('error')}")
+                    result = daily_digest.approve_and_send(
+                        client, config, digest_id, reviewer_id,
+                        reviewer_feedback={"free_text": free_text or None})
+                    if result.get("ok"):
+                        st.success("承認・送信しました")
+                        st.rerun()
+                    else:
+                        st.error(f"処理に失敗しました: {result.get('error')}")
         with btn_col2:
-            if st.button("🚫 却下", key=f"digest_reject_{digest_id}", use_container_width=True):
+            if st.button("🚫 却下", key=f"digest_reject_{digest_id}", use_container_width=True,
+                         disabled=not can_act):
                 client = _get_client(config)
-                daily_digest.reject_digest(
-                    client, digest_id, reviewer_id or "unknown",
-                    reviewer_feedback={"free_text": free_text or None})
-                st.success("却下しました")
-                st.rerun()
+                try:
+                    reviewer_id = _authorize_reviewer_action(principal)
+                except (identity.AuthenticationError, PermissionError) as e:
+                    st.error(f"認証エラー: {e}")
+                else:
+                    daily_digest.reject_digest(
+                        client, digest_id, reviewer_id,
+                        reviewer_feedback={"free_text": free_text or None})
+                    st.success("却下しました")
+                    st.rerun()
 
 
-def _render_daily_digest_view(config: dict):
+def _render_daily_digest_view(config: dict, principal: identity.AuthenticatedPrincipal):
     client = _get_client(config)
     with st.sidebar:
         status_filter = st.selectbox(
@@ -248,10 +307,13 @@ def _render_daily_digest_view(config: dict):
 
     st.caption(f"{len(digests)}件")
     for digest in digests:
-        _render_daily_digest_card(digest, config)
+        _render_daily_digest_card(digest, config, principal)
 
 
-def _render_competitor_monthly_card(report: dict, config: dict):
+def _render_competitor_monthly_card(report: dict, config: dict, principal: identity.AuthenticatedPrincipal):
+    """Phase 3: reviewer_idは自由記述入力欄からではなく、認証済みprincipalからのみ
+    導出する（_authorize_reviewer_action）。架空の名前（例:"PMO_Manager_Yamada"）が
+    そのまま承認者として記録されていた挙動（Baseline v1 pmo-007）は廃止した。"""
     report_id = report["report_id"]
     label = COMPETITOR_MONTHLY_STATUS_LABELS.get(report["status"], report["status"])
     summary = report.get("summary_json") or {}
@@ -276,32 +338,48 @@ def _render_competitor_monthly_card(report: dict, config: dict):
 
         st.divider()
         st.markdown("**レビュー**")
-        reviewer_id = st.text_input("レビュー担当者ID", key=f"comp_monthly_reviewer_{report_id}")
+        can_act = identity.can_approve(principal)
+        if not can_act:
+            st.warning("⚠️ 認証済みレビュー担当者を解決できないため、承認・却下は無効です。")
+        else:
+            st.caption(f"操作者: {principal.display_name}（{principal.user_id} / {principal.authentication_source}）")
         free_text = st.text_area("自由記述フィードバック", key=f"comp_monthly_free_{report_id}", height=60)
 
         btn_col1, btn_col2 = st.columns(2)
         with btn_col1:
-            if st.button("✅ 承認して送信", key=f"comp_monthly_approve_{report_id}", use_container_width=True):
+            if st.button("✅ 承認して送信", key=f"comp_monthly_approve_{report_id}", use_container_width=True,
+                         disabled=not can_act):
                 client = _get_client(config)
-                result = monthly_competitor.approve_and_send(
-                    client, config, report_id, reviewer_id or "unknown",
-                    reviewer_feedback={"free_text": free_text or None})
-                if result.get("ok"):
-                    st.success("承認・送信しました")
-                    st.rerun()
+                try:
+                    reviewer_id = _authorize_reviewer_action(principal)
+                except (identity.AuthenticationError, PermissionError) as e:
+                    st.error(f"認証エラー: {e}")
                 else:
-                    st.error(f"処理に失敗しました: {result.get('error')}")
+                    result = monthly_competitor.approve_and_send(
+                        client, config, report_id, reviewer_id,
+                        reviewer_feedback={"free_text": free_text or None})
+                    if result.get("ok"):
+                        st.success("承認・送信しました")
+                        st.rerun()
+                    else:
+                        st.error(f"処理に失敗しました: {result.get('error')}")
         with btn_col2:
-            if st.button("🚫 却下", key=f"comp_monthly_reject_{report_id}", use_container_width=True):
+            if st.button("🚫 却下", key=f"comp_monthly_reject_{report_id}", use_container_width=True,
+                         disabled=not can_act):
                 client = _get_client(config)
-                monthly_competitor.reject_report(
-                    client, report_id, reviewer_id or "unknown",
-                    reviewer_feedback={"free_text": free_text or None})
-                st.success("却下しました")
-                st.rerun()
+                try:
+                    reviewer_id = _authorize_reviewer_action(principal)
+                except (identity.AuthenticationError, PermissionError) as e:
+                    st.error(f"認証エラー: {e}")
+                else:
+                    monthly_competitor.reject_report(
+                        client, report_id, reviewer_id,
+                        reviewer_feedback={"free_text": free_text or None})
+                    st.success("却下しました")
+                    st.rerun()
 
 
-def _render_competitor_monthly_view(config: dict):
+def _render_competitor_monthly_view(config: dict, principal: identity.AuthenticatedPrincipal):
     client = _get_client(config)
     with st.sidebar:
         status_filter = st.selectbox(
@@ -326,7 +404,7 @@ def _render_competitor_monthly_view(config: dict):
 
     st.caption(f"{len(reports)}件")
     for report in reports:
-        _render_competitor_monthly_card(report, config)
+        _render_competitor_monthly_card(report, config, principal)
 
 
 def _render_candidate_card(candidate: dict, config: dict):
@@ -476,6 +554,17 @@ def main():
                    "sustainability_expert.enabled を true にするか、環境変数で有効化してください。")
         return
 
+    # Phase 3: 承認/却下操作の認証済みアイデンティティをこの画面全体で1回だけ解決する。
+    # まだEntra ID接続は未実装のため、DEV AUTHモードが明示的に有効な場合のみ
+    # 環境変数由来のFakePrincipalを使う。それ以外（本番相当）は常にNoneになり、
+    # 各カードの承認・却下ボタンが無効化される。
+    principal, auth_error = _resolve_dashboard_principal()
+    with st.sidebar:
+        if principal:
+            st.success(f"👤 {principal.display_name}\n\n({principal.user_id} / {principal.authentication_source})")
+        else:
+            st.error(f"⚠️ 認証済みレビュー担当者を解決できません。\n承認・却下操作は無効化されています。\n\n{auth_error}")
+
     with st.sidebar:
         view = st.radio("表示", [
             "週次メールレビュー", "競合アラート日次ダイジェスト", "競合月次レビュー",
@@ -484,15 +573,15 @@ def main():
 
     if view == "週次メールレビュー":
         st.caption("週次メールのドラフトは自動送信されません。内容を確認のうえ、承認して送信/却下/修正してください。")
-        _render_weekly_review_view(config)
+        _render_weekly_review_view(config, principal)
     elif view == "競合アラート日次ダイジェスト":
         st.caption("その日確定した変更イベントをまとめた日次ダイジェストです。"
                    "確信度の高い日は自動配信済みのため参照のみ、それ以外は内容を確認のうえ承認して送信/却下してください。")
-        _render_daily_digest_view(config)
+        _render_daily_digest_view(config, principal)
     elif view == "競合月次レビュー":
         st.caption("競合サステナビリティ月次レポートのドラフトは自動送信されません。"
                    "内容を確認のうえ、承認して送信/却下してください。")
-        _render_competitor_monthly_view(config)
+        _render_competitor_monthly_view(config, principal)
     elif view == "戦略質問・組織判断ナレッジ":
         st.caption("戦略質問の承認は週次メールレビュー画面のJSON編集にバンドルされています"
                    "（このページは閲覧専用です）。")
@@ -503,4 +592,9 @@ def main():
         _render_candidate_view(config)
 
 
-main()
+if __name__ == "__main__":
+    # `streamlit run sustainability_expert_dashboard.py` はこのファイルを
+    # __main__として実行するため、実際の挙動は変わらない。このガードにより、
+    # テスト/評価ハーネストがmain()を実行せずに本ファイルをimportできるようにする
+    # （Phase 3で追加。以前はモジュールレベルで無条件にmain()を呼んでいた）。
+    main()
