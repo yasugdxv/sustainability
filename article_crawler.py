@@ -302,18 +302,26 @@ def _parse_datetime(value):
 
 
 def _within_lookback(pub_dt, lookback_days: int) -> bool:
-    """公開日が対象期間内か判定する。日付不明(None)は対象期間外として除外する"""
+    """公開日が対象期間内か判定する。
+
+    2026-09-14変更: 日付不明(None)は「除外しない」（対象に含める）。以前は除外していたが、
+    trafilaturaが公開日メタデータを抽出できないサイト（例: env.go.jp）で全候補が毎回
+    無条件に弾かれ、しかもエラーとして記録されない（run_result='更新なし'のまま）ため、
+    クロール自体は成功しているのに記事が一切保存されない不具合が続いていた。
+    日付不明の候補を通しても、save_article()側でURL/本文ハッシュによる重複判定が
+    既に行われているため、同じ記事を毎回重複保存する心配は無い。"""
     if pub_dt is None:
-        return False
+        return True
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     return pub_dt >= cutoff
 
 
 # trafilaturaは本文中のコピーライト年・設立年等の無関係な日付を、記事の公開日と
 # 誤って抽出することがある（例: 明確な日付が無いページで2000-01-01を抽出）。
-# 誤った古い日付のまま_within_lookbackに渡すと「本当は新しい記事」が正しい理由とは
-# 違う形で除外されてしまうため、明らかに古すぎる日付は「不明」(None)として扱う
-# （_within_lookbackの仕様上、不明な日付は対象期間外として除外される）。
+# 誤った日付のまま保存すると記事一覧の日付表示等に誤情報が残るため、明らかに
+# 誤りと疑われる日付は「不明」(None)として扱う（2026-09-14以降、日付不明の候補は
+# _within_lookbackで除外されず対象に含める方針に変更済みのため、ここでNoneにしても
+# 記事が失われることはない）。
 _MIN_PLAUSIBLE_ARTICLE_YEAR = 2020
 
 
@@ -321,7 +329,16 @@ def _parse_content_date(value):
     """trafilaturaが本文から抽出した日付をパースする。実装上の理由は
     _MIN_PLAUSIBLE_ARTICLE_YEAR のコメントを参照"""
     dt = _parse_datetime(value)
-    if dt is not None and dt.year < _MIN_PLAUSIBLE_ARTICLE_YEAR:
+    if dt is None:
+        return None
+    if dt.year < _MIN_PLAUSIBLE_ARTICLE_YEAR:
+        return None
+    if dt.month == 1 and dt.day == 1:
+        # コピーライト表記等から年だけを拾い、月日を1月1日にフォールバックする
+        # trafilaturaの挙動を疑う（実例: kirinholdings.comの複数の異なる記事で
+        # 発行日が一律「今年の1月1日」として誤抽出され、実際は当日公開の記事なのに
+        # lookback判定で「7日以上前」扱いされ除外され続けていた、2026-09-14発見）。
+        # 元日ちょうどの発行日は統計的に不自然なほど頻出するため「不明」として扱う。
         return None
     return dt
 

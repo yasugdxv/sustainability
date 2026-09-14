@@ -14,6 +14,8 @@
                                                                       # importance_level+スコア上位N件
                                                                       # ＋マテリアリティ接続タグ付き
                                                                       # クラスタ（ワイルドカード）のみ処理
+                                                                      # （既定で直近8日分のみで競わせる。
+                                                                      # --top-n-since-days 0で全期間に戻せる）
     python sustainability_article_selector.py --batch-size 10        # 1回のLLM呼び出しに10クラスタ分
                                                                       # まとめて評価させ、呼び出し回数を
                                                                       # 減らす（バッチのJSON検証が最終的に
@@ -160,7 +162,8 @@ def _stratified_top_n(candidate_ids: list, clusters: dict, top_n: int) -> list:
 
 def list_theme_prioritized_cluster_ids(client, all_urls: dict, top_n: int = 10,
                                         top_n_cross_cutting: int = CROSS_CUTTING_TOP_N_DEFAULT,
-                                        top_n_sub_axis: int = SUB_AXIS_TOP_N_DEFAULT) -> list:
+                                        top_n_sub_axis: int = SUB_AXIS_TOP_N_DEFAULT,
+                                        since_days: int = None) -> list:
     """主要9テーマ＋横断2軸（情報開示／ESG評価・サステナブルファイナンス）ごとに、
     ランクB以上かつimportance_total_score上位N件の事象クラスタのみを候補とする（Tier0）。
     各テーマ・軸の上位N件選定では、規制・基準系と企業・業界の取組事例系の双方が
@@ -174,7 +177,13 @@ def list_theme_prioritized_cluster_ids(client, all_urls: dict, top_n: int = 10,
         スコア降順で上位top_n_sub_axis件まで候補に加える
 
     全クラスタをLLMで評価するとコストが大きいため、重要度が既に高い/戦略的に重要とわかっている
-    クラスタに絞ってLLM選定を行うための事前フィルタ。"""
+    クラスタに絞ってLLM選定を行うための事前フィルタ。
+
+    since_days（既定None=全期間、従来通り）: 指定すると対象記事をpublished_atが直近since_days日
+    以内のものに限定する。2026-09-14発見: since_days未指定（全期間）だと、スコア上位N件が
+    「同じテーマの全期間の記事」から選ばれるため、過去の高スコア記事が枠を占有し続け、新しい週の
+    記事が（その週だけ見れば十分高スコアでも）候補にすら上がれない問題があった。週次選定
+    （--top-n-per-theme）用途では対象週相当のsince_daysを渡し、その週の記事同士でだけ競わせる。"""
     tag_rows = client.select("tag_reference", {"select": "tag_id,tag_axis,tag_level,parent_tag_id"})
     tag_by_id = {t["tag_id"]: t for t in tag_rows}
     theme_major_ids = {t["tag_id"] for t in tag_rows if t["tag_axis"] == "テーマ" and t["tag_level"] == "大分類"}
@@ -212,8 +221,13 @@ def list_theme_prioritized_cluster_ids(client, all_urls: dict, top_n: int = 10,
             "crawl_targets", {"select": "crawl_target_id,publisher_tag_id"})
         if t.get("publisher_tag_id") == OWN_COMPANY_TAG_ID
     }
-    articles = client.select("articles", {
-        "select": "article_id,article_url_id,crawl_target_id", "is_current": "eq.true"})
+    articles_params = {"select": "article_id,article_url_id,crawl_target_id,published_at",
+                        "is_current": "eq.true"}
+    if since_days is not None:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
+        # published_atがNULLの行は日付不明として除外しない（他箇所の日付フィルタと同じ方針）
+        articles_params["or"] = f"(published_at.gte.{cutoff},published_at.is.null)"
+    articles = client.select("articles", articles_params)
     articles = [a for a in articles if a.get("crawl_target_id") not in own_company_target_ids]
     analysis_by_article = {
         a["article_id"]: a for a in client.select(
@@ -586,6 +600,11 @@ def main():
     parser.add_argument("--top-n-per-theme", type=int, default=None,
                          help="テーマ大分類ごとにimportance_level+スコア上位N件＋マテリアリティ接続タグ付き"
                               "クラスタ（ワイルドカード）のみを対象にする（--since-days/--article-idsとは併用不可）")
+    parser.add_argument("--top-n-since-days", type=int, default=8,
+                         help="--top-n-per-theme使用時、スコア競争の対象記事を直近N日以内の公開分に"
+                              "限定する（既定8日=週次相当）。全期間を対象にしたい場合は0を指定する"
+                              "（過去の高スコア記事が枠を占有し続け、新しい週の記事が候補にすら上がれない"
+                              "問題への対応、2026-09-14）")
     parser.add_argument("--batch-size", type=int, default=1,
                          help="1回のLLM呼び出しにまとめて評価させるクラスタ数（既定1=1件ずつ、従来通り）。"
                               "バッチのJSON検証が最終的に失敗した場合は、そのバッチだけ1件ずつの呼び出しに"
@@ -612,7 +631,9 @@ def main():
 
     all_urls = common.fetch_all_article_urls(client)
     if args.top_n_per_theme:
-        cluster_ids = list_theme_prioritized_cluster_ids(client, all_urls, top_n=args.top_n_per_theme)
+        top_n_since_days = args.top_n_since_days if args.top_n_since_days else None
+        cluster_ids = list_theme_prioritized_cluster_ids(client, all_urls, top_n=args.top_n_per_theme,
+                                                           since_days=top_n_since_days)
     else:
         article_ids = [a.strip() for a in args.article_ids.split(",")] if args.article_ids else None
         cluster_ids = list_candidate_cluster_ids(client, since_days=args.since_days, article_ids=article_ids,

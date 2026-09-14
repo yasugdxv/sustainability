@@ -61,6 +61,7 @@ STEPS = [
     ("reference_list", ["reference_list_monitor.py"], 900),
     ("api_articles", ["api_article_crawler.py"], 900),
     ("filter_coverage_check", ["check_filter_keyword_coverage.py"], 300),
+    ("crawl_health_check", ["crawl_health_check.py"], 300),
     ("analyze", ["article_analyzer.py", "9999", "5"], 5400),
     ("competitor_crawl", ["competitor_crawler.py"], 5400),
     ("selector", ["sustainability_article_selector.py", "--top-n-per-theme", "10"], 3600),
