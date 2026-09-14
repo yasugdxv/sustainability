@@ -8,6 +8,15 @@ export const Route = createFileRoute("/competitors/overview")({
   component: CompetitorOverviewPage,
 });
 
+function formatReportMonth(reportMonth: string, lang: string): string {
+  const [year, month] = reportMonth.split("-").map(Number);
+  if (!year || !month) return reportMonth;
+  const date = new Date(Date.UTC(year, month - 1, 1));
+  return lang === "en"
+    ? date.toLocaleDateString("en-US", { year: "numeric", month: "long", timeZone: "UTC" })
+    : `${year}年${month}月`;
+}
+
 const STATS = [
   { key: "monitoredCompanies", labelKey: "competitor.overview.monitoredCompanies" },
   { key: "updatedCompanies", labelKey: "competitor.overview.updatedCompanies" },
@@ -38,6 +47,10 @@ function CompetitorOverviewPage() {
           <p className="text-muted-foreground">{t("competitor.overview.noReport")}</p>
         ) : (
           <>
+            <p className="text-sm font-medium text-foreground bg-muted/50 rounded-md px-3 py-2 inline-block">
+              {t("competitor.overview.reportMonth", { month: formatReportMonth(data.reportMonth, lang) })}
+            </p>
+
             <section className="grid grid-cols-3 md:grid-cols-6 gap-3">
               {STATS.map((s) => (
                 <div key={s.key} className="card-paper rounded-lg p-4">

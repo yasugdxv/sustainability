@@ -146,6 +146,9 @@ def cmd_fetch(args):
         if not result.get("ok"):
             print(f"  [取得失敗] {r['title']}: {result.get('error')}")
             continue
+        if result.get("encoding_suspect"):
+            print(f"  [文字化けの疑い] {r['title']}: リトライ後も未解消のためスキップ")
+            continue
         text = (result.get("text") or "")[:6000]
         if not text.strip():
             print(f"  [本文空] {r['title']}")

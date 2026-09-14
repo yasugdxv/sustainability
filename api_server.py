@@ -49,6 +49,13 @@ except Exception as e:
 # since_days値ごとにキャッシュする（検索画面の期間フィルターで異なる日数が
 # 指定されるため、単一エントリのキャッシュだと常に同じ日数で上書きされてしまう）
 _articles_cache: dict = {}
+
+# competitor_change_events取得結果(target_records解決込み)のキャッシュ。
+# after_record_id経由でcompetitor_target_recordsをchunk取得する処理が、
+# 未キャッシュ・毎回同期実行だと数秒〜十数秒かかり、フロント側のfetchが
+# タイムアウトして「変更なし」と誤表示される不具合があったため追加(2026-09-14)
+_competitor_changes_cache: dict = {}
+COMPETITOR_CHANGES_CACHE_TTL = 300
 _translate_pool = ThreadPoolExecutor(max_workers=12)
 
 # 9テーマの表示用メタ情報（英語ラベル・カテゴリ色）。
@@ -571,7 +578,10 @@ def _initiative_to_ui(i: dict, companies: dict, goal_categories: dict = None,
         "sourceUrl": i.get("source_url"),
     }
     if with_body:
-        body = i.get("source_text") or ""
+        # source_text(evidence_quote)が空の記事（過去にLLMが空文字を返しNULL化された
+        # もの。2026-09-14にスキーマ側はminLength制約で今後の再発を防止済み）は、
+        # 詳細ページの本文が完全に空になってしまうため、一覧と同じsummaryにフォールバックする
+        body = (i.get("source_text") or "").strip() or (i.get("summary") or "")
         body_translated = core.translate_body(_azure_client, _model, i["initiative_id"], body, lang) if body else ""
         out["body"] = [p for p in body_translated.split("\n") if p.strip()]
     return out
@@ -712,17 +722,23 @@ def competitor_overview():
     }
 
 
-@app.get("/api/competitors/changes")
-def competitor_changes(company_id: str = "", theme: str = "", record_type: str = "", since_days: int = 90,
-                        date_field: str = "createdAt", sort_dir: str = "desc",
-                        date_from: str = "", date_to: str = ""):
+def _fetch_competitor_changes_base(company_id: str, record_type: str, since_days: int, unbounded: bool) -> tuple:
+    """competitor_change_events + 紐づくcompetitor_target_records(after_record_id経由)を取得する。
+    date_from/date_to指定時(unbounded=True)は元々DB側で期間を絞り込んでおらず、後段のPython側
+    フィルタで対応しているため、company_id/record_typeが同じなら取得結果自体は
+    since_daysに関わらず同一になる（キャッシュキーをsince_days=Noneとして共有する）"""
+    cache_key = (company_id, record_type, None if unbounded else since_days)
+    now = time.time()
+    entry = _competitor_changes_cache.get(cache_key)
+    if entry is not None and now - entry["fetched_at"] <= COMPETITOR_CHANGES_CACHE_TTL:
+        return entry["events"], entry["target_records"]
+
     params = {"select": "*", "order": "created_at.desc"}
     if company_id:
         params["company_id"] = f"eq.{company_id}"
     if record_type:
         params["record_type"] = f"eq.{record_type}"
-    if not date_from and not date_to:
-        # 明示的な期間指定が無い場合のみ、従来通りsince_daysで当社取得日を絞り込む
+    if not unbounded:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
         params["created_at"] = f"gte.{cutoff}"
     events = _competitor_client.select("competitor_change_events", params)
@@ -731,11 +747,23 @@ def competitor_changes(company_id: str = "", theme: str = "", record_type: str =
     target_records = {}
     if after_ids:
         # after_idsが多いと1つのin.(...)クエリのURLが長くなりすぎて414 URI Too Longに
-        # なるため、chunk分割して取得する（article_analysisで実際に発生した問題と同種）
+        # なるため、chunk分割して取得する（article_analysisで実際に発生した問題と同種。
+        # chunk自体は_select_in_chunks側で並列実行される）
         rows = common._select_in_chunks(_competitor_client, "competitor_target_records", {
             "select": "record_id,source_url,title,themes,source_updated_at,goal_category_id",
         }, "record_id", after_ids)
         target_records = {r["record_id"]: r for r in rows}
+
+    _competitor_changes_cache[cache_key] = {"events": events, "target_records": target_records, "fetched_at": now}
+    return events, target_records
+
+
+@app.get("/api/competitors/changes")
+def competitor_changes(company_id: str = "", theme: str = "", record_type: str = "", since_days: int = 90,
+                        date_field: str = "createdAt", sort_dir: str = "desc",
+                        date_from: str = "", date_to: str = ""):
+    unbounded = bool(date_from or date_to)
+    events, target_records = _fetch_competitor_changes_base(company_id, record_type, since_days, unbounded)
 
     if theme:
         events = [e for e in events

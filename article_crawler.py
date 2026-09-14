@@ -125,6 +125,30 @@ def _detect_bot_block(final_url: str, text: str) -> str | None:
     return None
 
 
+# JS必須サイト等で本文が描画されず、サイト共通のナビゲーションメニューや
+# フッターリンクの羅列だけが「本文」として抽出されてしまうケースの検知
+# （2026-09-14、意味不明な本文が表示されるとの指摘対応）。
+# Bot対策検知と同じく、短文かつ定型語の複数ヒットのみを対象として誤検知を避ける。
+_NAV_MENU_MAX_CHARS = 600
+_NAV_MENU_MIN_HITS = 3
+_NAV_MENU_WORDS = (
+    "ホーム", "会社概要", "お問い合わせ", "サイトマップ", "プライバシーポリシー",
+    "利用規約", "採用情報", "ニュース一覧", "検索する", "メニュー", "ログイン",
+    "JavaScriptを有効に", "著作権", "広告掲載",
+)
+
+
+def _detect_nav_menu_only(text: str) -> str | None:
+    """本文抽出結果が実質的にサイト共通のナビゲーションメニュー・フッターリンクの
+    羅列になっているケースを検知する。該当しなければNone。"""
+    if not text or len(text) > _NAV_MENU_MAX_CHARS:
+        return None
+    hits = sum(1 for w in _NAV_MENU_WORDS if w in text)
+    if hits >= _NAV_MENU_MIN_HITS:
+        return f"本文がナビゲーションメニューの列挙と判定（定型語一致{hits}件）"
+    return None
+
+
 # URL正規化で取り除くトラッキングパラメータ
 _TRACKING_PARAM_PREFIXES = ("utm_",)
 _TRACKING_PARAM_NAMES = {
@@ -600,6 +624,10 @@ def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bo
     if bot_block_reason:
         return {"ok": False, "error": bot_block_reason, "http_status": status_code}
 
+    nav_menu_reason = _detect_nav_menu_only(text)
+    if nav_menu_reason:
+        return {"ok": False, "error": nav_menu_reason, "http_status": status_code}
+
     canonical_url = normalize_url(_extract_canonical_url(tree, final_url))
 
     return {
@@ -617,7 +645,25 @@ def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bo
 
 # ─── RSS ────────────────────────────────────────────────────────
 def list_rss_candidates(target: dict, proxies: dict, verify: bool) -> list:
-    """RSSフィードから候補記事(URL・仮タイトル・公開日)を一覧する"""
+    """RSSフィードから候補記事(URL・仮タイトル・公開日)を一覧する。
+
+    2026-09-14: extract_article()側の文字化けリトライ（プロキシ瞬断対策）は
+    本文抽出(trafilatura)のtitleにしか適用されておらず、それが空で
+    このRSS仮タイトルへフォールバックする記事（後述crawl_articles()の
+    `extracted["title"] or cand.get("title")`）では文字化けチェックが
+    一切行われていなかった。実際に厚労省・防衛省RSS由来の記事で
+    「repair_mojibakeでも復元不能な文字化けタイトル」が継続的に発生していたのは
+    これが原因だったため、同じ考え方でRSSフィード取得自体をリトライする"""
+    for attempt in range(ENCODING_CORRUPTION_MAX_RETRIES + 1):
+        candidates, status_code = _list_rss_candidates_once(target, proxies, verify)
+        if not any(_looks_encoding_corrupted(c["title"]) for c in candidates):
+            return candidates, status_code
+        if attempt < ENCODING_CORRUPTION_MAX_RETRIES:
+            time.sleep(ENCODING_CORRUPTION_RETRY_DELAY_SEC)
+    return candidates, status_code  # 全リトライ後もダメならそのまま返す(呼び出し元でextracted["title"]優先により救済される場合がある)
+
+
+def _list_rss_candidates_once(target: dict, proxies: dict, verify: bool) -> list:
     resp = requests.get(target["target_url"], proxies=proxies, verify=verify,
                          timeout=REQUEST_TIMEOUT, headers=_HEADERS)
     resp.raise_for_status()
@@ -936,6 +982,15 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
                     bot_block_detections += 1
                 continue
 
+            # 2026-09-02にextract_article()側へ追加されたリトライ機構が、全リトライ後も
+            # 文字化けが疑われる場合にencoding_suspectを立てていたにも関わらず、
+            # このクロールループ側でそれを一切見ておらず、化けたまま保存され続けていた
+            # 不具合を2026-09-14に発見。repair_garbled_articles.py（過去分の手動修復用）は
+            # このフラグを正しく見ていたため、新規クロール分だけがすり抜けていた。
+            if extracted.get("encoding_suspect"):
+                extraction_failures += 1
+                continue
+
             # RSSは一覧取得の時点で候補ごとの正確な日付(published_parsed)を持っている
             # ため、それを優先する。HTML一覧ページ等、候補側に日付が無いものだけ
             # 本文からのtrafilatura抽出日付(誤抽出対策済み)にフォールバックする。
@@ -944,6 +999,19 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
                 continue
 
             title = extracted["title"] or cand.get("title") or ""
+
+            # タイトルがクロール対象サイト自身の名前そのもの＝個別記事ではなく
+            # ハブ/一覧ページ等を誤って記事候補として拾ってしまったケース
+            # （例: Ipsos。include_pathsが緩いサイトのトップ/一覧ページが軒並み
+            # "Ipsos"という無内容な記事として保存されていた。2026-09-14発見）
+            site_name_variants = {
+                (target.get("publisher_name") or "").strip().lower(),
+                (target.get("target_name") or "").strip().lower(),
+            }
+            site_name_variants.discard("")
+            if title.strip().lower() in site_name_variants:
+                extraction_failures += 1
+                continue
 
             # 軽量キーワードフィルタ（メディア・データ提供機関カテゴリ限定）は
             # ここでは行わない。記事は無条件で保存し（案A）、フィルタ判定と

@@ -40,7 +40,8 @@ def main():
 
         new_title = result.get("title") or ""
         new_text = strip_figure_captions(result.get("text") or "")
-        if not result.get("ok") or not new_title or _looks_garbled(new_title):
+        if (not result.get("ok") or not new_title or result.get("encoding_suspect")
+                or _looks_garbled(new_title) or _looks_garbled(new_text[:500])):
             print(f"[{i}/{len(garbled)}] 修復できず: {r['article_id']}")
             still_failed += 1
             continue

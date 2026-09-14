@@ -37,7 +37,7 @@ function CompetitorChangesPage() {
   const [dateTo, setDateTo] = useState("");
   const sortOption = SORT_OPTIONS.find((s) => s.value === sort) ?? SORT_OPTIONS[0];
   const { data: companiesData } = useCompetitorCompanies();
-  const { data, isLoading } = useCompetitorChanges({
+  const { data, isLoading, isError } = useCompetitorChanges({
     companyId: companyId || undefined,
     theme: theme || undefined,
     dateField: sortOption.dateField,
@@ -146,6 +146,8 @@ function CompetitorChangesPage() {
 
         {isLoading ? (
           <p className="text-muted-foreground">...</p>
+        ) : isError ? (
+          <p className="text-sm text-destructive">{t("competitor.changes.error")}</p>
         ) : changes.length === 0 ? (
           <p className="text-sm text-muted-foreground">{t("competitor.changes.empty")}</p>
         ) : (

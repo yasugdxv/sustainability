@@ -22,6 +22,7 @@ const STRINGS: Record<Lang, Record<string, string>> = {
 
     "competitor.overview.title": "競合モニタリング概要",
     "competitor.overview.subtitle": "競合{count}社のサステナビリティ目標・実績・取組を継続的に監視しています。",
+    "competitor.overview.reportMonth": "対象月: {month}（このサマリーは月次集計のため、最新の変更・取組事例は下記の一覧の方が新しい場合があります）",
     "competitor.overview.monitoredCompanies": "監視対象企業",
     "competitor.overview.updatedCompanies": "当月更新企業",
     "competitor.overview.targetChanges": "目標・KPI変更",
@@ -37,6 +38,7 @@ const STRINGS: Record<Lang, Record<string, string>> = {
     "competitor.changes.title": "目標変更サマリー",
     "competitor.changes.subtitle": "競合各社の目標・KPI・ESG評価の変更を一覧できます。",
     "competitor.changes.empty": "該当する変更はまだありません。",
+    "competitor.changes.error": "変更履歴の取得に失敗しました。時間をおいて再度お試しください。",
     "competitor.changes.before": "変更前",
     "competitor.changes.after": "変更後",
     "competitor.changes.reviewBadge": "要確認",
@@ -248,6 +250,7 @@ const STRINGS: Record<Lang, Record<string, string>> = {
 
     "competitor.overview.title": "Competitor Monitoring Overview",
     "competitor.overview.subtitle": "Continuously tracking the sustainability targets, results, and initiatives of {count} competitors.",
+    "competitor.overview.reportMonth": "Report month: {month} (this summary is a monthly rollup — the lists below may reflect more recent changes and initiatives)",
     "competitor.overview.monitoredCompanies": "Monitored Companies",
     "competitor.overview.updatedCompanies": "Updated This Month",
     "competitor.overview.targetChanges": "Target/KPI Changes",
@@ -263,6 +266,7 @@ const STRINGS: Record<Lang, Record<string, string>> = {
     "competitor.changes.title": "Target Change Summary",
     "competitor.changes.subtitle": "Browse target, KPI, and ESG rating changes across competitors.",
     "competitor.changes.empty": "No changes found.",
+    "competitor.changes.error": "Failed to load changes. Please try again later.",
     "competitor.changes.before": "Before",
     "competitor.changes.after": "After",
     "competitor.changes.reviewBadge": "Needs Review",

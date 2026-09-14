@@ -9,7 +9,7 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-from article_crawler import SupabaseClient
+from article_crawler import SupabaseClient, _detect_nav_menu_only
 import sustainability_chat_geo_service as chat_geo
 import sustainability_expert_common as common
 
@@ -77,6 +77,10 @@ def get_client(config: dict) -> SupabaseClient:
 # 事実と異なる内容を生成してしまう恐れがあるため、正直に「表示できない」旨を示す。
 GARBLED_TITLE_FALLBACK = "文字化けのため表示できません（元記事のリンクをご確認ください）"
 GARBLED_BODY_FALLBACK = "この記事は文字コードの誤りにより本文を正しく表示できません。お手数ですが元記事のリンクからご確認ください。"
+# JS必須サイト等で本文が描画されず、ナビゲーションメニューの列挙が本文として
+# 保存されてしまった過去記事向け（article_crawler側は今後の新規保存を防止済み、
+# 2026-09-14）。表示時にのみ差し替え、DB上のextracted_textは変更しない。
+NAV_MENU_BODY_FALLBACK = "この記事はサイト側の技術的な事情（JavaScript必須等）により本文を正しく取得できませんでした。お手数ですが元記事のリンクからご確認ください。"
 
 
 # ─── 記事取得 ───────────────────────────────────────────────────────
@@ -93,8 +97,17 @@ def fetch_dashboard_articles(config: dict, since_days: int) -> list:
                 a[field] = repair_mojibake(a[field])
         if a.get("title") and _looks_garbled(a["title"]):
             a["title"] = GARBLED_TITLE_FALLBACK
+        is_nav_menu_body = False
         if a.get("extracted_text") and _looks_garbled(a["extracted_text"]):
             a["extracted_text"] = GARBLED_BODY_FALLBACK
+        elif a.get("extracted_text") and _detect_nav_menu_only(a["extracted_text"]):
+            a["extracted_text"] = NAV_MENU_BODY_FALLBACK
+            is_nav_menu_body = True
+        if is_nav_menu_body:
+            # 本文がナビメニューだった場合、summary_short/importance_reasonは
+            # そのナビメニューを元にLLMが生成した誤った内容のため表示しない
+            a["summary_short"] = ""
+            a["importance_reason"] = ""
         if a.get("summary_short") and _looks_garbled(a["summary_short"]):
             a["summary_short"] = ""
         if a.get("importance_reason") and _looks_garbled(a["importance_reason"]):

@@ -53,8 +53,8 @@ def main():
         print(f"[{i}/{len(by_url)}] {company_name} | {url}")
         try:
             extracted = extract_article(url, proxies, verify)
-            if not extracted.get("ok") or not extracted.get("text"):
-                print("  本文取得失敗、スキップ")
+            if not extracted.get("ok") or not extracted.get("text") or extracted.get("encoding_suspect"):
+                print("  本文取得失敗（文字化けの疑い含む）、スキップ")
                 unmatched_total += len(initiatives)
                 continue
             records = classifier.classify_and_extract(azure_client, model, company_name, extracted["text"])

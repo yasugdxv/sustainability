@@ -183,7 +183,10 @@ def _build_classify_schema() -> dict:
                         "title": {"type": "string"},
                         "structured_fields": STRUCTURED_FIELDS_SCHEMA,
                         "summary": {"type": "string"},
-                        "evidence_quote": {"type": "string"},
+                        # minLength: 空文字を返すと呼び出し側で`or None`によりNULL化され、
+                        # INITIATIVE詳細ページの本文が完全に空になる不具合があったため
+                        # （2026-09-14発見）、必ず何か書かせる制約を追加
+                        "evidence_quote": {"type": "string", "minLength": 1},
                         "themes": {"type": "array", "items": {"type": "string", "enum": THEMES}},
                         "goal_category_id": {"type": ["string", "null"], "enum": _GOAL_CATEGORY_IDS + [None]},
                     },

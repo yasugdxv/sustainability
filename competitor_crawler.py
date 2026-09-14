@@ -84,6 +84,18 @@ def process_source(source: dict, client: SupabaseClient, proxies: dict, verify: 
         )
         return {"ok": False, "source": source, "error": result.get("error")}
 
+    if result.get("encoding_suspect"):
+        # article_crawler.py側で発見した不具合と同一（2026-09-14）。
+        # extract_article()のリトライ後も文字化けが疑われる場合、ここで弾かないと
+        # 破損した本文がそのままLLM分類(classifier.classify_and_extract)に渡り、
+        # 一見もっともらしいが実際は文字化け由来の誤った競合データを生成しかねない
+        save_crawl_log(
+            client, source, started_at, finished_at,
+            run_result="抽出失敗", http_status=result.get("http_status"),
+            items_detected=0, error_message="文字化けが疑われるため抽出結果を破棄（リトライ後も未解消）",
+        )
+        return {"ok": False, "source": source, "error": "文字化けが疑われるため抽出結果を破棄"}
+
     save_crawl_log(
         client, source, started_at, finished_at,
         run_result="成功", http_status=result.get("http_status"), items_detected=1,
