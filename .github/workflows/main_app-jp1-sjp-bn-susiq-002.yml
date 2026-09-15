@@ -35,15 +35,6 @@ jobs:
           source antenv/bin/activate
           pip install -r requirements.txt
 
-      # ブラウザ操作(Playwright)方式のクロール対応。既定のインストール先(~/.cache/ms-playwright)
-      # だとこの後のUpload artifact(path: .)に含まれずAzure側にブラウザ本体が届かないため、
-      # PLAYWRIGHT_BROWSERS_PATH=0でantenv配下(デプロイ対象に含まれる場所)へインストールする。
-      # Azure App Service側の実行環境でヘッドレスChromiumが実際に動くかは未検証（試験導入）。
-      - name: Install Playwright browser (Chromium)
-        run: |
-          source antenv/bin/activate
-          PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install --with-deps chromium
-
       # 社内プロキシ環境のため、Azure App Service側(Oryxビルド)からPyPIへ直接アクセスできずビルドが失敗する。
       # そのためこのジョブ側でpip installを完了させ、antenv(仮想環境)を含めてそのままデプロイし、
       # App Service側のOryxビルド(SCM_DO_BUILD_DURING_DEPLOYMENT)をスキップする運用に変更している。
@@ -52,6 +43,7 @@ jobs:
         with:
           name: python-app
           path: .
+          retention-days: 3
 
 
   deploy:
