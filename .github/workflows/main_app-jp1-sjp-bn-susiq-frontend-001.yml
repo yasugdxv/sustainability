@@ -60,4 +60,4 @@ jobs:
           app-name: 'app-jp1-sjp-bn-susiq-frontend-001'
           slot-name: 'Production'
           package: release.zip
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_96158BA72D56405E85708279054ADCE5 }}
+          publish-profile: ${{ secrets.azure_frontend }}
