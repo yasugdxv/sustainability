@@ -7,6 +7,7 @@ _removed_20260827/ へ退避済み。
 """
 import json
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from article_crawler import SupabaseClient, _detect_nav_menu_only
@@ -122,29 +123,37 @@ def top_articles_for_carousel(articles: list, limit: int) -> list:
     return ranked[:limit]
 
 
-ENGAGEMENT_FETCH_CHUNK_SIZE = 150
+_ENGAGEMENT_CACHE_TTL_SEC = 60
+_engagement_cache: dict = {"data": None, "fetched_at": 0.0}
+
+
+def _all_engagement(config: dict) -> dict:
+    """article_engagementテーブル全体をTTLキャッシュする。
+    以前はfetch_engagement_map呼び出しのたびに対象記事ID群を150件ずつin.(...)で
+    チャンク問い合わせしており、検索等でフィルタ後の記事数が数千件規模になると
+    リクエストごとに数十回の往復が発生し（実測: 検索1回で約20秒）検索の体感速度を
+    大きく落としていた。article_engagementは「実際にいいね/読んだが発生した記事」
+    のみを持つ小さいテーブルのため、全件を1回だけ取得してプロセス内でTTLキャッシュする
+    （並び替え・絞り込みの正しさには影響しない）。"""
+    now = time.time()
+    if _engagement_cache["data"] is None or now - _engagement_cache["fetched_at"] > _ENGAGEMENT_CACHE_TTL_SEC:
+        client = get_client(config)
+        try:
+            rows = client.select("article_engagement", {"select": "article_id,likes_count,reads_count"})
+            _engagement_cache["data"] = {r["article_id"]: r for r in rows}
+        except Exception:
+            _engagement_cache["data"] = _engagement_cache["data"] or {}
+        _engagement_cache["fetched_at"] = now
+    return _engagement_cache["data"]
 
 
 def fetch_engagement_map(config: dict, article_ids: list) -> dict:
     """記事ID一覧に対する いいね・読んだ 件数を取得する（React版ダッシュボード用）。
-    article_engagementテーブル未適用の環境でも落ちないよう、取得失敗時は空map。
-    記事数が多いと in.(id1,id2,...) のURLが長くなりすぎてSupabase側に400で
-    拒否される（737件で発生確認済み）ため、チャンクに分けて取得する。"""
+    article_engagementテーブル未適用の環境でも落ちないよう、取得失敗時は空map。"""
     if not article_ids:
         return {}
-    client = get_client(config)
-    result: dict = {}
-    for i in range(0, len(article_ids), ENGAGEMENT_FETCH_CHUNK_SIZE):
-        chunk = article_ids[i:i + ENGAGEMENT_FETCH_CHUNK_SIZE]
-        try:
-            rows = client.select("article_engagement", {
-                "select": "article_id,likes_count,reads_count",
-                "article_id": f"in.({','.join(chunk)})",
-            })
-        except Exception:
-            continue
-        result.update({r["article_id"]: r for r in rows})
-    return result
+    all_engagement = _all_engagement(config)
+    return {aid: all_engagement[aid] for aid in article_ids if aid in all_engagement}
 
 
 def increment_engagement(config: dict, article_id: str, likes_delta: int = 0, reads_delta: int = 0) -> dict:
@@ -157,6 +166,7 @@ def increment_engagement(config: dict, article_id: str, likes_delta: int = 0, re
         "p_reads_delta": reads_delta,
     })
     row = result[0] if isinstance(result, list) and result else {}
+    _engagement_cache["data"] = None  # 次回fetch_engagement_map呼び出し時に全件再取得させる
     return {
         "likesCount": row.get("likes_count", 0),
         "readsCount": row.get("reads_count", 0),

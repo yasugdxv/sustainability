@@ -20,6 +20,7 @@ API・メール・手動は対象外（サイトごとに個別実装が必要�
     python article_crawler.py          # 全RSS/HTML対象をクロール
     python article_crawler.py 10       # 先頭10件だけ試す（動作確認用）
 """
+import base64
 import hashlib
 import io
 import json
@@ -27,6 +28,7 @@ import re
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
@@ -46,7 +48,7 @@ MAX_HTML_LINKS_PER_TARGET = 30   # HTML一覧ページから拾う候補リン�
 ARTICLE_FETCH_SLEEP = 0.3        # 記事ページ取得の間隔（相手サーバへの配慮）
 BROWSER_NAV_TIMEOUT_MS = 25000   # Playwrightのページ遷移タイムアウト
 BROWSER_RENDER_WAIT_MS = 1500    # JS描画待ちの簡易ウェイト
-SUPPORTED_METHODS = ("RSS", "HTML", "ブラウザ操作")
+SUPPORTED_METHODS = ("RSS", "HTML", "ブラウザ操作", "Zyte", "JSON API")
 
 # PDF/.docxは本文抽出対応（下記DOCUMENT_EXTENSIONS）。それ以外の添付系拡張子は
 # 記事本文として扱わない（.doc(旧形式)は対応ライブラリが無いため対象外）
@@ -229,20 +231,77 @@ class SupabaseClient:
                 params = {**params, "order": f"{first_col}.asc"}
 
         page_size = 1000
-        all_rows = []
-        offset = 0
-        while True:
-            resp = requests.get(
-                f"{self.base_url}/rest/v1/{table}", headers=self.headers,
-                params={**params, "limit": page_size, "offset": offset},
-                proxies=self.proxies, verify=self.verify, timeout=30,
-            )
-            resp.raise_for_status()
-            rows = resp.json()
-            all_rows.extend(rows)
-            if len(rows) < page_size:
-                break
-            offset += page_size
+        # 1ページ目はPrefer: count=exactを付け、PostgRESTがContent-Range(例: 0-999/12345)
+        # ヘッダで返す総件数を使って残りページ数を先に確定させる。
+        # これにより2ページ目以降を（順番待ちせず）ThreadPoolExecutorで並列取得できる
+        # （_select_in_chunksと同じ理由・同じパターン。1000件超の全件取得が逐次ページングで
+        # 遅かった問題に対応。実測: articles/article_analysisの全件取得で約49秒→大幅短縮）。
+        # Content-Rangeが取得できない/解釈できない場合は、安全側として従来の逐次ページングに
+        # フォールバックする。
+        resp = requests.get(
+            f"{self.base_url}/rest/v1/{table}", headers={**self.headers, "Prefer": "count=exact"},
+            params={**params, "limit": page_size, "offset": 0},
+            proxies=self.proxies, verify=self.verify, timeout=30,
+        )
+        resp.raise_for_status()
+        first_rows = resp.json()
+        all_rows = list(first_rows)
+
+        total = None
+        content_range = resp.headers.get("Content-Range", "")
+        if "/" in content_range:
+            total_part = content_range.rsplit("/", 1)[1]
+            if total_part.isdigit():
+                total = int(total_part)
+
+        if len(first_rows) < page_size:
+            return all_rows
+
+        if total is None:
+            # フォールバック: 従来通りの逐次ページング
+            offset = page_size
+            while True:
+                resp = requests.get(
+                    f"{self.base_url}/rest/v1/{table}", headers=self.headers,
+                    params={**params, "limit": page_size, "offset": offset},
+                    proxies=self.proxies, verify=self.verify, timeout=30,
+                )
+                resp.raise_for_status()
+                rows = resp.json()
+                all_rows.extend(rows)
+                if len(rows) < page_size:
+                    break
+                offset += page_size
+            return all_rows
+
+        def _fetch_page(off: int):
+            # select()には本文全文(extracted_text)等の重い列を含む呼び出しもあり、
+            # 同時実行数が多いとPostgREST/Postgres側が瞬間的に500を返すことがあるため
+            # （実測確認済み）、並列数を抑えつつ簡単なリトライを入れる。
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    r = requests.get(
+                        f"{self.base_url}/rest/v1/{table}", headers=self.headers,
+                        params={**params, "limit": page_size, "offset": off},
+                        proxies=self.proxies, verify=self.verify, timeout=30,
+                    )
+                    r.raise_for_status()
+                    return r.json()
+                except requests.exceptions.HTTPError as e:
+                    last_exc = e
+                    if e.response is not None and e.response.status_code < 500:
+                        raise
+                    time.sleep(0.5 * (attempt + 1))
+            raise last_exc
+
+        remaining_offsets = list(range(page_size, total, page_size))
+        if not remaining_offsets:
+            return all_rows
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(_fetch_page, off) for off in remaining_offsets]
+            for future in futures:
+                all_rows.extend(future.result())
         return all_rows
 
     def insert(self, table: str, rows: list, prefer: str = "return=representation"):
@@ -530,6 +589,97 @@ def _fetch_with_browser(url: str, proxies: dict, verify: bool):
         context.close()
 
 
+ZYTE_EXTRACT_URL = "https://api.zyte.com/v1/extract"
+ZYTE_TIMEOUT = 90  # Browser RenderingはHTTPより時間がかかるため長めに取る
+ZYTE_MIN_HTML_CHARS = 500  # これ未満ならHTTP取得を失敗とみなしBrowser Renderingへ切り替える
+_zyte_api_key_cache = None
+
+
+def _get_zyte_api_key() -> str:
+    """config.jsonのzyte.api_key（推奨）または既存のgeo_intelligence.zyte.api_keyから読む
+    （scripts/zyte_poc/zyte_test.pyと同じ読み込み規約）"""
+    global _zyte_api_key_cache
+    if _zyte_api_key_cache is None:
+        config = load_config()
+        key = config.get("zyte", {}).get("api_key", "")
+        if not key:
+            key = config.get("geo_intelligence", {}).get("zyte", {}).get("api_key", "")
+        _zyte_api_key_cache = key.strip()
+    return _zyte_api_key_cache
+
+
+ZYTE_TRANSIENT_RETRY_MAX = 2
+ZYTE_TRANSIENT_RETRY_DELAY_SEC = 3
+# Zyteのレンダリング処理側の一時的な失敗（相手サイト側ではなくZyte基盤側の問題）で、
+# 短い待機を挟んだ再試行で解消することが多い（2026-09-16、cofcointernational.com等で
+# 12件中1件だけ520になる、といった間欠的な発生を確認）
+ZYTE_TRANSIENT_STATUS_CODES = (520, 521, 522, 523, 524)
+
+
+def _call_zyte(url: str, proxies: dict, verify: bool, browser: bool, wait_sec: int = 5):
+    """Zyte APIを1回呼び出す（一時的な5xxはリトライする）。
+    (html, final_url, status_code, raw_content)を返す。
+    raw_contentはhttpResponseBody取得時のみ生バイト列（PDF/.docx抽出用）、Browser時はNone"""
+    api_key = _get_zyte_api_key()
+    if not api_key:
+        raise RuntimeError("Zyte APIキーが未設定です(config.jsonのzyte.api_key)")
+    if browser:
+        # SPA(React/Next.js等)ではページ読み込み直後は「読込中」スピナーのみで、
+        # 一覧本体は少し遅れてクライアント側フェッチで描画されることがある
+        # （2026-09-16、cdp.netで確認: 待機なしだとスピナーのみ、5秒待つと実記事が出現）
+        payload = {"url": url, "browserHtml": True, "actions": [{"action": "waitForTimeout", "timeout": wait_sec}]}
+    else:
+        payload = {"url": url, "httpResponseBody": True}
+
+    for attempt in range(ZYTE_TRANSIENT_RETRY_MAX + 1):
+        resp = requests.post(ZYTE_EXTRACT_URL, auth=(api_key, ""), json=payload,
+                              proxies=proxies, verify=verify, timeout=ZYTE_TIMEOUT)
+        if resp.status_code in ZYTE_TRANSIENT_STATUS_CODES and attempt < ZYTE_TRANSIENT_RETRY_MAX:
+            time.sleep(ZYTE_TRANSIENT_RETRY_DELAY_SEC)
+            continue
+        break
+    resp.raise_for_status()
+    data = resp.json()
+    status_code = data.get("statusCode", resp.status_code)
+    final_url = data.get("url", url)
+    if browser:
+        return data.get("browserHtml", "") or "", final_url, status_code, None
+    body_b64 = data.get("httpResponseBody", "")
+    raw_content = base64.b64decode(body_b64) if body_b64 else b""
+    return raw_content.decode("utf-8", errors="ignore"), final_url, status_code, raw_content
+
+
+# SPA(React/Next.js等)がクライアント側フェッチ完了までの間だけ表示するローディング
+# プレースホルダーの目印（2026-09-16、cdp.netで確認: HTTP取得(JS未実行)だと本文は
+# 数十万文字あってもこのスピナーしか無く、実記事は含まれない）。これが検出された場合は
+# 応答が長くてもBrowser Renderingへ強制的にエスカレーションする
+_ZYTE_LOADING_PLACEHOLDER_MARKERS = ("animate-spin", "animate-pulse")
+
+
+def _fetch_with_zyte(url: str, proxies: dict, verify: bool, force_browser: bool = False):
+    """Zyte APIでページを取得する。まず安価なHTTP取得を試し、応答が短すぎる、または
+    ローディングプレースホルダーの目印しか無い(Bot対策やSPAのクライアント側フェッチ待ちで
+    本来のページが返っていない可能性が高い)場合のみ、より高価なBrowser Renderingへ
+    フォールバックする。(html, final_url, status_code, raw_content)を返す。
+
+    force_browser=True の場合はこの判定をスキップし常にBrowser Renderingを使う
+    (2026-09-17、canada.caで確認: HTTP取得の応答が長くローディングプレースホルダーの
+    目印も無いため上記の自動判定ではBrowser Renderingへ進まないが、実際には検索結果が
+    クライアント側フェッチで後から描画される構造で、待機時間を延ばしたBrowser
+    Renderingでないと個別記事リンクが取得できないサイトが存在するため)"""
+    if force_browser:
+        html, final_url, status_code, _ = _call_zyte(url, proxies, verify, browser=True, wait_sec=10)
+        return html, final_url, status_code, None
+    html, final_url, status_code, raw_content = _call_zyte(url, proxies, verify, browser=False)
+    looks_like_placeholder = any(m in html for m in _ZYTE_LOADING_PLACEHOLDER_MARKERS)
+    if len(html) >= ZYTE_MIN_HTML_CHARS and not looks_like_placeholder:
+        return html, final_url, status_code, raw_content
+    html2, final_url2, status_code2, _ = _call_zyte(url, proxies, verify, browser=True)
+    if len(html2) >= len(html):
+        return html2, final_url2, status_code2, None
+    return html, final_url, status_code, raw_content
+
+
 def _decoded_html(resp: requests.Response) -> str:
     """Content-TypeヘッダーにcharsetがないHTML（<meta charset>頼みのページ）では、
     requestsがHTTP仕様のデフォルトであるISO-8859-1と誤判定し文字化けすることがあるため、
@@ -548,14 +698,55 @@ def _safe_lxml_parse(html: str):
     return lxml_html.fromstring(html)
 
 
-def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool):
-    """通常HTTPまたはブラウザでページを取得する。(html, final_url, status_code)を返す"""
-    if use_browser:
-        return _fetch_with_browser(url, proxies, verify)
-    resp = requests.get(url, proxies=proxies, verify=verify,
-                         timeout=REQUEST_TIMEOUT, headers=_HEADERS)
-    resp.raise_for_status()
-    return _decoded_html(resp), resp.url, resp.status_code
+_META_REFRESH_RE = re.compile(
+    r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\']\s*(\d+)\s*;\s*url=([^"\']+)',
+    re.IGNORECASE,
+)
+META_REFRESH_MAX_WAIT_SEC = 10  # これを超える待機秒数はユーザー向け案内ページの可能性が高く追従しない
+META_REFRESH_MAX_HOPS = 2
+
+
+def _follow_meta_refresh(html: str, final_url: str):
+    """<meta http-equiv="refresh" content="N;URL=..."> による転送を追従する
+    (2026-09-17、mlit.go.jpで確認: target_urlが当月の実ページへ0秒refreshするだけの
+    中継ページで、これを追従しないと候補記事が一切取れなかった)。
+    転送先が無い/待機秒数が長い場合はそのまま返す(呼び出し元は通常のhtmlとして扱う)"""
+    m = _META_REFRESH_RE.search(html)
+    if not m or int(m.group(1)) > META_REFRESH_MAX_WAIT_SEC:
+        return html, final_url, False
+    return html, urljoin(final_url, m.group(2).strip()), True
+
+
+def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool, use_zyte: bool = False,
+                 force_zyte_browser: bool = False):
+    """通常HTTP・ブラウザ・Zyte APIのいずれかでページを取得する。(html, final_url, status_code)を返す。
+    meta refreshによる転送(短時間のもののみ)は自動で追従する"""
+    if use_zyte:
+        html, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify, force_browser=force_zyte_browser)
+    elif use_browser:
+        html, final_url, status_code = _fetch_with_browser(url, proxies, verify)
+    else:
+        resp = requests.get(url, proxies=proxies, verify=verify,
+                             timeout=REQUEST_TIMEOUT, headers=_HEADERS)
+        resp.raise_for_status()
+        html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
+
+    for _ in range(META_REFRESH_MAX_HOPS):
+        html, next_url, followed = _follow_meta_refresh(html, final_url)
+        if not followed or next_url == final_url:
+            break
+        final_url = next_url
+        if use_zyte:
+            html, final_url, status_code, _ = _fetch_with_zyte(final_url, proxies, verify,
+                                                                force_browser=force_zyte_browser)
+        elif use_browser:
+            html, final_url, status_code = _fetch_with_browser(final_url, proxies, verify)
+        else:
+            resp = requests.get(final_url, proxies=proxies, verify=verify,
+                                 timeout=REQUEST_TIMEOUT, headers=_HEADERS)
+            resp.raise_for_status()
+            html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
+    return html, final_url, status_code
 
 
 # 社内プロキシ越しの通信が稀に瞬断・破損し、UTF-8バイト列がLatin-1として誤デコード
@@ -573,13 +764,14 @@ def _looks_encoding_corrupted(text: str, threshold: float = 0.2) -> bool:
 
 
 # ─── 記事本文抽出（RSS・HTML共通） ────────────────────────────────
-def extract_article(url: str, proxies: dict, verify: bool, use_browser: bool = False) -> dict:
+def extract_article(url: str, proxies: dict, verify: bool, use_browser: bool = False,
+                     use_zyte: bool = False) -> dict:
     """記事URLから本文・タイトル・公開日を抽出する。PDF/.docxは専用抽出、
     それ以外はtrafilaturaでHTMLから抽出する。取得結果のタイトル・本文が
     文字化けして見える場合、ENCODING_CORRUPTION_MAX_RETRIES回まで再取得を試みる
     （プロキシ瞬断による破損を、リトライで正常な応答に置き換えるため）"""
     for attempt in range(ENCODING_CORRUPTION_MAX_RETRIES + 1):
-        result = _extract_article_once(url, proxies, verify, use_browser)
+        result = _extract_article_once(url, proxies, verify, use_browser, use_zyte=use_zyte)
         if not result.get("ok"):
             return result
         if not (_looks_encoding_corrupted(result.get("title", "")) or
@@ -591,13 +783,18 @@ def extract_article(url: str, proxies: dict, verify: bool, use_browser: bool = F
     return result
 
 
-def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bool = False) -> dict:
+def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bool = False,
+                           use_zyte: bool = False) -> dict:
     doc_kind = _detect_document_kind(url)
     if doc_kind:
         use_browser = False  # 文書ファイルはブラウザ経由で扱わない（PDFビューア化を避ける）
+        use_zyte = False     # 文書ファイルはZyte経由でも扱わない（httpResponseBodyで代用可能だが未検証のため通常取得を使う）
 
     try:
-        if use_browser:
+        if use_zyte:
+            html, final_url, status_code, raw_content = _fetch_with_zyte(url, proxies, verify)
+            content_type = ""
+        elif use_browser:
             html, final_url, status_code = _fetch_with_browser(url, proxies, verify)
             content_type, raw_content = "", None
         else:
@@ -681,10 +878,18 @@ def list_rss_candidates(target: dict, proxies: dict, verify: bool) -> list:
 
 
 def _list_rss_candidates_once(target: dict, proxies: dict, verify: bool) -> list:
-    resp = requests.get(target["target_url"], proxies=proxies, verify=verify,
-                         timeout=REQUEST_TIMEOUT, headers=_HEADERS)
-    resp.raise_for_status()
-    feed = feedparser.parse(resp.content)
+    """RSS取得。素のHTTPがBot対策等で失敗した場合はZyte経由に自動フォールバックする
+    (2026-09-17、unwater.org/stand.earth等で確認: 素のrequestsは403でも、Zyteの
+    HTTPモード経由なら普通に取得できるケースがあった)"""
+    try:
+        resp = requests.get(target["target_url"], proxies=proxies, verify=verify,
+                             timeout=REQUEST_TIMEOUT, headers=_HEADERS)
+        resp.raise_for_status()
+        content, final_url, status_code = resp.content, resp.url, resp.status_code
+    except requests.exceptions.RequestException:
+        html, final_url, status_code, raw = _fetch_with_zyte(target["target_url"], proxies, verify)
+        content = raw if raw else html.encode("utf-8", errors="ignore")
+    feed = feedparser.parse(content)
 
     candidates = []
     for entry in feed.entries[:50]:
@@ -693,12 +898,12 @@ def _list_rss_candidates_once(target: dict, proxies: dict, verify: bool) -> list
         if not link or not title:
             continue
         # <link>が相対パスのRSSフィード（例: 防衛省, ファーストリテイリング）向けに
-        # フィード自身のURL（リダイレクト後のresp.url）を基準に絶対URLへ解決する
-        link = urljoin(resp.url, link)
+        # フィード自身のURL（リダイレクト後のfinal_url）を基準に絶対URLへ解決する
+        link = urljoin(final_url, link)
         pp = entry.get("published_parsed") or entry.get("updated_parsed")
         pub_dt = datetime(*pp[:6], tzinfo=timezone.utc) if pp else None
         candidates.append({"url": link, "title": title, "published_at": pub_dt})
-    return candidates, resp.status_code
+    return candidates, status_code
 
 
 # ─── XMLサイトマップ ─────────────────────────────────────────────
@@ -747,7 +952,19 @@ def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
 
 
 # ─── HTML（汎用） ─────────────────────────────────────────────────
-def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser: bool = False) -> list:
+def _path_matches(path: str, pattern: str) -> bool:
+    """include_paths/exclude_pathsの1パターンに対する一致判定。
+    先頭が"*"の場合は部分一致(pathのどこかにpattern[1:]が含まれるか)、
+    それ以外は従来通りの前方一致(startswith)。
+    （2026-09-17、canada.caで追加: 記事URLが/en/<部署名>/news/2026/09/<slug>.html
+    のように可変の部署名セグメントを挟むサイトでは前方一致だけでは絞り込めないため）"""
+    if pattern.startswith("*"):
+        return pattern[1:] in path
+    return path.startswith(pattern)
+
+
+def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser: bool = False,
+                          use_zyte: bool = False) -> list:
     """HTML一覧ページから候補記事リンクを抽出する（<a>を汎用的に収集し、
     include_paths/exclude_paths・ドメイン一致で絞り込む）"""
     url = target["target_url"]
@@ -755,13 +972,24 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
     include_paths = [p.strip() for p in (target.get("include_paths") or "").split(",") if p.strip()]
     exclude_paths = [p.strip() for p in (target.get("exclude_paths") or "").split(",") if p.strip()]
 
-    html, final_url, status_code = _fetch_page(url, proxies, verify, use_browser)
+    # search_conditions列を「Zyte強制ブラウザレンダリング」フラグとして流用
+    # (2026-09-17、canada.caで確認: 通常のZyte自動判定ではBrowser Renderingへ
+    # エスカレーションされないが、実際には検索結果がクライアント側フェッチで
+    # 後から描画されるため長めの待機付きBrowser Renderingが必須なサイト向け)
+    force_zyte_browser = (target.get("search_conditions") == "force_zyte_browser")
+    html, final_url, status_code = _fetch_page(url, proxies, verify, use_browser, use_zyte=use_zyte,
+                                                force_zyte_browser=force_zyte_browser)
 
     tree = _safe_lxml_parse(html)
+    # <base href="..."> がある場合、相対リンクはfinal_urlではなくこちらを基準に解決する
+    # (例: mnd.gov.twは<base href="/">を指定しており、これを無視すると相対リンクが
+    # 現在ページのパス配下に誤って連結されてしまう=urljoinの標準動作とHTML仕様の齟齬)
+    base_href = next(iter(tree.xpath("//base/@href")), None)
+    link_base = urljoin(final_url, base_href) if base_href else final_url
     seen = set()
     candidates = []
     for href in tree.xpath("//a/@href"):
-        full = urljoin(final_url, href)
+        full = urljoin(link_base, href)
         parsed = urlparse(full)
         if not parsed.scheme.startswith("http"):
             continue
@@ -776,9 +1004,9 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
         if not is_query_id_article:
             if path.lower().endswith(NON_ARTICLE_EXTENSIONS):
                 continue
-            if include_paths and not any(path.startswith(p) for p in include_paths):
+            if include_paths and not any(_path_matches(path, p) for p in include_paths):
                 continue
-            if exclude_paths and any(path.startswith(p) for p in exclude_paths):
+            if exclude_paths and any(_path_matches(path, p) for p in exclude_paths):
                 continue
         normalized_path = path.rstrip("/") or "/"
         if is_query_id_article:
@@ -789,6 +1017,87 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
             continue
         seen.add(normalized)
         candidates.append({"url": normalized, "title": None, "published_at": None})
+        if len(candidates) >= MAX_HTML_LINKS_PER_TARGET:
+            break
+    return candidates, status_code
+
+
+# JSON APIのレスポンス内で記事URL・タイトル・日付を指す可能性があるキー名
+# （サイトごとに命名が異なるため複数候補を順に試す。例: mcdonalds.comの
+# /bin/getCategory は articlePath/title/defaultDate、他サイトは url/link/date等の場合がある）
+_JSON_URL_KEYS = ("articlePath", "url", "link", "path", "href", "urlId")
+_JSON_TITLE_KEYS = ("title", "headline", "name")
+_JSON_DATE_KEYS = ("defaultDate", "publishDate", "date", "pubDate", "published")
+
+
+def list_json_api_candidates(target: dict, proxies: dict, verify: bool, use_zyte: bool = False) -> list:
+    """JSON API(記事一覧をJSON配列で返すエンドポイント)から候補記事を抽出する。
+    2026-09-16、corporate.mcdonalds.comの/bin/getCategoryで確認: 通常のHTML一覧ページ
+    には記事リンクが一切含まれず(ナビゲーションのみ)、実際の一覧はこのJSON APIから
+    クライアント側で取得・描画される構造だった。レスポンス形式はサイトごとに異なる
+    ため、よくあるキー名を順に試す簡易実装（完全な汎用パーサではない）"""
+    url = target["target_url"]
+    domain = target.get("domain") or urlparse(url).netloc
+
+    if use_zyte:
+        text, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify)
+    else:
+        resp = requests.get(url, proxies=proxies, verify=verify, timeout=REQUEST_TIMEOUT, headers=_HEADERS)
+        resp.raise_for_status()
+        text, final_url, status_code = resp.text, resp.url, resp.status_code
+
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return [], status_code
+
+    # レスポンスが{"items": [...]}のように配列を包んでいる場合も考慮する。
+    # Cision検索API(storaenso.com等)のように{success,error,message,result:{items:[...]}}
+    # と一段ネストしているケースもあるため、まず"result"を優先的に開いてから同じ判定を行う
+    if isinstance(data, dict) and isinstance(data.get("result"), dict):
+        data = data["result"]
+    if isinstance(data, dict):
+        for key in ("items", "results", "articles", "data", "news"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+
+    if not isinstance(data, list):
+        return [], status_code
+
+    # urlId等、記事一覧APIのURL自体とは別の基準パスに対して相対解決すべきサイト向け
+    # (例: storaenso.comのCision検索APIはurlIdが"2026/9/slug"のようなbareパスで、
+    # APIエンドポイント自身ではなくニュースルームのアーカイブパスが基準になる)
+    url_base = target.get("json_url_base") or target.get("fallback_url") or final_url
+
+    candidates = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        path = next((item[k] for k in _JSON_URL_KEYS if item.get(k)), None)
+        if not path:
+            continue
+        # AEM(Adobe Experience Manager)サイトはJSON APIが内部コンテンツパス
+        # (/content/<サイト名>/...)を返すが、公開URLはこのプレフィックスを含まない
+        # 例: /content/mcdonalds/corpmcd/our-stories/article/x.html → /corpmcd/our-stories/article/x.html
+        if path.startswith("/content/"):
+            parts = path.split("/", 3)
+            if len(parts) == 4:
+                path = "/" + parts[3]
+        full = urljoin(url_base, path)
+        parsed = urlparse(full)
+        if domain not in parsed.netloc:
+            continue
+        title = next((item[k] for k in _JSON_TITLE_KEYS if item.get(k)), None)
+        # WordPress REST API等はtitleが{"rendered": "..."}のようなネスト構造になっている
+        if isinstance(title, dict):
+            title = title.get("rendered")
+        date_str = next((item[k] for k in _JSON_DATE_KEYS if item.get(k)), None)
+        candidates.append({
+            "url": normalize_url(full),
+            "title": title,
+            "published_at": _parse_datetime(date_str) if date_str else None,
+        })
         if len(candidates) >= MAX_HTML_LINKS_PER_TARGET:
             break
     return candidates, status_code
@@ -960,16 +1269,24 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
     single_page_mode = False
 
     # 'ブラウザ操作'はHTMLと同じ収集ロジックをPlaywright経由で行う（bot対策サイト向け）
+    # 'Zyte'も同様にHTMLと同じ収集ロジックをZyte API経由で行う（Playwright不採用のBot対策サイト向け、2026-09-16）
     use_browser = (method == "ブラウザ操作")
+    # 'JSON API'は記事一覧を返すエンドポイント向け。当該サイト(mcdonalds.com等)は
+    # 通常のHTML/HTTP取得がプロキシ経由で頻繁にタイムアウトするため、本文抽出も
+    # Zyte経由で行う（use_zyteをZyteと同様にTrueにする）
+    use_zyte = method in ("Zyte", "JSON API")
 
     try:
         if method == "RSS":
             candidates, http_status = list_rss_candidates(target, proxies, verify)
-        elif method in ("HTML", "ブラウザ操作"):
+        elif method == "JSON API":
+            candidates, http_status = list_json_api_candidates(target, proxies, verify, use_zyte=True)
+        elif method in ("HTML", "ブラウザ操作", "Zyte"):
             if endpoint_type == "サイトマップ":
                 candidates, http_status = list_sitemap_candidates(target, proxies, verify)
             elif endpoint_type in LISTING_ENDPOINT_TYPES:
-                candidates, http_status = list_html_candidates(target, proxies, verify, use_browser=use_browser)
+                candidates, http_status = list_html_candidates(target, proxies, verify, use_browser=use_browser,
+                                                                 use_zyte=use_zyte)
             else:
                 # SINGLE_PAGE_ENDPOINT_TYPES、および未知のendpoint_typeは安全側で単一ページ扱い
                 single_page_mode = True
@@ -987,7 +1304,7 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
 
     if error_message is None:
         for cand in candidates:
-            extracted = extract_article(cand["url"], proxies, verify, use_browser=use_browser)
+            extracted = extract_article(cand["url"], proxies, verify, use_browser=use_browser, use_zyte=use_zyte)
             time.sleep(ARTICLE_FETCH_SLEEP)
 
             if single_page_mode:

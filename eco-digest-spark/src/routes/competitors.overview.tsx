@@ -130,13 +130,18 @@ function CompetitorOverviewPage() {
                 </div>
                 <div className="space-y-3">
                   {data.topInitiatives.map((ini) => (
-                    <div key={ini.id} className="card-paper rounded-lg p-4">
+                    <Link
+                      key={ini.id}
+                      to="/competitors/initiatives/$id"
+                      params={{ id: ini.id }}
+                      className="card-paper rounded-lg p-4 block hover:bg-muted/30 transition-colors"
+                    >
                       <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
                         {companyDisplayName(ini.companyName, ini.companyNameEn, lang)}
                       </div>
                       <p className="text-sm font-medium mt-1">{ini.title}</p>
                       <p className="text-sm text-muted-foreground mt-1 leading-relaxed">{ini.summary}</p>
-                    </div>
+                    </Link>
                   ))}
                 </div>
               </section>

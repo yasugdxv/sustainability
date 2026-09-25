@@ -43,3 +43,9 @@ email_html_full.html
 # knowledge/はbackend起動時に必須のため2026-09-08よりgit管理下に変更
 uploads/
 docs/
+
+# Neural週次レポート比較分析: 社内非公開データのため、集計スクリプトのみ管理しデータ本体は除外
+neural_analysis/data/
+
+# Zyte API PoC: 取得結果(HTML/CSV/サマリー)は生成物のため除外。zyte_test.py/targets.txt/READMEは管理対象
+scripts/zyte_poc/results/
