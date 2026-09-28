@@ -353,12 +353,19 @@ def fetch_articles_with_tags(client, since_days: int, ranks: tuple = None) -> li
     if not analyses:
         return []
 
-    articles = client.select("articles", {
+    # articlesは「日付範囲内の全記事」ではなく、analysesに実在するarticle_idだけに絞って
+    # 取得する。analysis_status=差戻し/フィルタ除外を既に除外済みのanalysesは全体の
+    # 3〜4割程度しかなく、絞り込まずに全件（本文extracted_text込み、数MB〜規模）を
+    # 取得すると6割以上が使われずに捨てられていた（実測: 全件14000件超に対し最終的に
+    # 使うのは6000件台）。検索・記事一覧の応答が遅い問題の主要因だったため、
+    # analysesのid群でDB側を絞り込む（_select_in_chunksで既に並列化済み）。
+    analysis_ids = [a["article_id"] for a in analyses]
+    articles = _select_in_chunks(client, "articles", {
         "select": "article_id,article_url_id,title,extracted_text,published_at,fetched_at,"
                   "final_url,fetched_url,crawl_target_id",
         "is_current": "eq.true",
         "or": f"(published_at.gte.{cutoff_iso},published_at.is.null)",
-    })
+    }, "article_id", analysis_ids)
     articles_by_id = {a["article_id"]: a for a in articles}
     relevant_ids = [a["article_id"] for a in analyses if a["article_id"] in articles_by_id]
 

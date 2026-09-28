@@ -16,6 +16,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -217,6 +218,9 @@ app.add_middleware(
     # 明示的に許可する(社内ネットワーク/VPN経由の利用が前提)。
     allow_private_network=True,
 )
+# 記事一覧等が数千件規模になると無圧縮で約10MBのJSONになり、本番環境での転送時間が
+# 体感速度を大きく悪化させていた（実測: 圧縮なしで9.7MB）ため、応答を圧縮する。
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 @app.get("/api/health")
@@ -272,8 +276,24 @@ def get_importance_rubric():
     return core.importance_rubric(_config)
 
 
+# 検索語(q)無しの一覧表示（トップページ等が使う既定の呼び出し）は、パラメータが
+# 同じであれば5分間はレスポンス全体を使い回す。検索語ありはLLMによる検索意図抽出が
+# 入力ごとに変わるためキャッシュ対象外とする。
+# 追加理由(2026-09-28): CPU負荷の高いUI変換処理(_to_ui_article等)が毎回全件分
+# 再実行されており、本番で同時リクエストが重なるとCPU(GIL)が詰まり、articles自体は
+# もちろん/api/categories等の軽いエンドポイントまで数十秒待たされる事象を確認したため。
+_articles_response_cache: dict = {}
+
+
 @app.get("/api/articles")
 def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: str = "", lang: str = "ja"):
+    cache_key = (since_days, themes, lang)
+    if not q.strip():
+        now = time.time()
+        cached = _articles_response_cache.get(cache_key)
+        if cached is not None and now - cached["fetched_at"] <= ARTICLES_CACHE_TTL:
+            return cached["data"]
+
     articles = _get_articles(since_days)
     selected_themes = [t for t in themes.split(",") if t]
     filtered = core.apply_tag_filter(articles, selected_themes)
@@ -303,7 +323,7 @@ def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: 
     _warm_translation_cache(filtered, lang)
     engagement = core.fetch_engagement_map(_config, [a["article_id"] for a in filtered])
 
-    return {
+    result = {
         "total": len(articles),
         "filteredTotal": len(filtered),
         "keywords": keywords,
@@ -311,6 +331,9 @@ def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: 
         "articles": [_to_ui_article(a, engagement, lang, blocking=False) for a in filtered],
         "crossDomainIntelligence": cross_domain_intelligence,
     }
+    if not q.strip():
+        _articles_response_cache[cache_key] = {"data": result, "fetched_at": time.time()}
+    return result
 
 
 @app.get("/api/articles/{article_id}")
@@ -335,7 +358,9 @@ def update_engagement(article_id: str, req: EngagementRequest):
     likes_delta = 1 if req.liked is True else (-1 if req.liked is False else 0)
     reads_delta = 1 if req.read is True else (-1 if req.read is False else 0)
     try:
-        return core.increment_engagement(_config, article_id, likes_delta, reads_delta)
+        result = core.increment_engagement(_config, article_id, likes_delta, reads_delta)
+        _articles_response_cache.clear()
+        return result
     except Exception as e:
         raise HTTPException(
             status_code=500,
