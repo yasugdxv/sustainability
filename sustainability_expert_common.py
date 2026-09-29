@@ -293,6 +293,52 @@ def categorize_tags(tag_ids: list, tag_ref_by_id: dict) -> dict:
     }
 
 
+# ─── 共有ファイルキャッシュ ─────────────────────────────────────────
+# api_server.py(Gunicorn複数ワーカー)とrun_daily.pyのバッチ処理の間で、記事一覧のような
+# 重い集計結果を共有するために使う。プロセス内(メモリ)キャッシュだとワーカー・プロセスが
+# 別々だと共有できないが、同一コンテナ内であればファイルシステムは共有されているため、
+# ディスク上のファイルを介して受け渡す（2026-09-29）。
+SHARED_CACHE_DIR = Path(__file__).parent / "cache" / "shared_api_cache"
+
+
+def shared_cache_path(key: str) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+    return SHARED_CACHE_DIR / f"{digest}.json"
+
+
+def shared_cache_get(key: str, ttl: int):
+    path = shared_cache_path(key)
+    try:
+        if path.exists() and time.time() - path.stat().st_mtime <= ttl:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def shared_cache_set(key: str, data) -> None:
+    path = shared_cache_path(key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f"{path.name}.tmp{os.getpid()}")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp_path, path)  # 同一ファイルシステム内でのrenameはatomic
+    except Exception:
+        pass
+
+
+def shared_cache_clear_all() -> None:
+    """キー→ファイル名はハッシュ化されておりprefix指定での部分削除ができないため、
+    影響は小さい(記事一覧程度)こともあり、まとめて全削除する簡便な実装にしている。"""
+    try:
+        for p in SHARED_CACHE_DIR.glob("*.json"):
+            p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _select_in_chunks(client, table: str, base_params: dict, id_field: str, ids: list,
                        chunk_size: int = 100, max_workers: int = 8) -> list:
     """idsを1つの巨大な in.(id1,id2,...) にまとめると、件数が多い場合にURLが長くなりすぎて

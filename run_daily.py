@@ -21,6 +21,9 @@
     7. sustainability_article_selector.py  記事選定（テーマ別上位N件をLLM判定、expert_runsへ記録。
                                             週次メールのlist_weekly_picks()が参照する判定結果を
                                             日次で最新化しておく）
+    8. warm_dashboard_cache.py              記事一覧ダッシュボードの共有キャッシュを先回りして温める
+                                            （api_server.pyのユーザーリクエストが重いDB再取得を
+                                            踏まないようにするため）
 
 ジョブ重複実行防止: ロックファイル(run_daily.lock)を使用する。既存ロックが
 MAX_LOCK_AGE_HOURS以内なら多重起動とみなして即終了する（前回実行が正常終了していれば
@@ -65,6 +68,10 @@ STEPS = [
     ("analyze", ["article_analyzer.py", "9999", "5"], 5400),
     ("competitor_crawl", ["competitor_crawler.py"], 5400),
     ("selector", ["sustainability_article_selector.py", "--top-n-per-theme", "10"], 3600),
+    # 記事一覧ダッシュボード(api_server.py)の共有キャッシュを先回りして温める。
+    # データが実際に更新されるのはこのバッチだけなので、ここで温めておけば
+    # ユーザーの最初のアクセスが重いDB再取得を踏まずに済む(2026-09-29)
+    ("warm_dashboard_cache", ["warm_dashboard_cache.py"], 300),
 ]
 
 

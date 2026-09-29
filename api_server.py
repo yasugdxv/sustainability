@@ -7,8 +7,6 @@ sustainability_dashboard_core.py 経由で共有する。旧Streamlitプロト�
 
 起動: python api_server.py  (http://127.0.0.1:8000)
 """
-import hashlib
-import json
 import os
 import sys
 import time
@@ -58,49 +56,14 @@ _articles_cache: dict = {}
 # プロセス内(メモリ)キャッシュがワーカーごとに独立してしまい、リクエストがどの
 # ワーカーに振り分けられるかによって「温まっている/いない」がバラつき、体感速度が
 # 改善しない事象が発生した。同一コンテナ内であればワーカー間でファイルシステムを
-# 共有しているため、ディスク上のファイルを介して補助的にキャッシュを共有する
-# （プロセス内キャッシュを廃止するのではなく、その手前に挟む形。読み書き失敗時は
-# ベストエフォートで無視し、通常のDB再取得にフォールバックする）。
-_SHARED_CACHE_DIR = Path(__file__).parent / "cache" / "shared_api_cache"
-
-
-def _shared_cache_path(key: str) -> Path:
-    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
-    return _SHARED_CACHE_DIR / f"{digest}.json"
-
-
-def _shared_cache_get(key: str, ttl: int):
-    path = _shared_cache_path(key)
-    try:
-        if path.exists() and time.time() - path.stat().st_mtime <= ttl:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return None
-
-
-def _shared_cache_set(key: str, data) -> None:
-    path = _shared_cache_path(key)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(f"{path.name}.tmp{os.getpid()}")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp_path, path)  # 同一ファイルシステム内でのrenameはatomic
-    except Exception:
-        pass
-
-
-def _shared_cache_clear_all() -> None:
-    """いいね・読んだの更新時など、キャッシュ済み記事一覧を即座に古くしたい場合に使う。
-    キー→ファイル名はハッシュ化されておりprefix指定での部分削除ができないため、
-    影響は小さい(記事一覧程度)こともあり、まとめて全削除する簡便な実装にしている。"""
-    try:
-        for p in _SHARED_CACHE_DIR.glob("*.json"):
-            p.unlink(missing_ok=True)
-    except Exception:
-        pass
+# 共有しているため、ディスク上のファイルを介して補助的にキャッシュを共有する層
+# （common.shared_cache_get/set、run_daily.pyのバッチ処理からも使う）を挟む。
+#
+# ファイル側のTTLは、メモリ側のARTICLES_CACHE_TTL(5分)より大幅に長い値にしている。
+# 記事データの実体は日次バッチ(run_daily.py、warm_dashboard_cache.py)でしか
+# 更新されないため、ファイルは「前回バッチ〜次回バッチまで」有効とみなしてよい
+# （バッチ未実行環境向けの保険として、5分キャッシュのフォールバック経路自体は残す）。
+SHARED_ARTICLES_CACHE_TTL = 25 * 3600
 
 # competitor_change_events取得結果(target_records解決込み)のキャッシュ。
 # after_record_id経由でcompetitor_target_recordsをchunk取得する処理が、
@@ -162,10 +125,10 @@ def _get_articles(since_days: int = DEFAULT_LOOKBACK_DAYS) -> list:
         return entry["data"]
 
     shared_key = f"articles:{since_days}"
-    data = _shared_cache_get(shared_key, ARTICLES_CACHE_TTL)
+    data = common.shared_cache_get(shared_key, SHARED_ARTICLES_CACHE_TTL)
     if data is None:
         data = core.fetch_dashboard_articles(_config, since_days)
-        _shared_cache_set(shared_key, data)
+        common.shared_cache_set(shared_key, data)
     _articles_cache[since_days] = {"data": data, "fetched_at": now}
     return data
 
@@ -351,7 +314,7 @@ def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: 
         cached = _articles_response_cache.get(cache_key)
         if cached is not None and now - cached["fetched_at"] <= ARTICLES_CACHE_TTL:
             return cached["data"]
-        shared = _shared_cache_get(shared_key, ARTICLES_CACHE_TTL)
+        shared = common.shared_cache_get(shared_key, ARTICLES_CACHE_TTL)
         if shared is not None:
             _articles_response_cache[cache_key] = {"data": shared, "fetched_at": now}
             return shared
@@ -395,7 +358,7 @@ def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: 
     }
     if not q.strip():
         _articles_response_cache[cache_key] = {"data": result, "fetched_at": time.time()}
-        _shared_cache_set(shared_key, result)
+        common.shared_cache_set(shared_key, result)
     return result
 
 
@@ -422,8 +385,12 @@ def update_engagement(article_id: str, req: EngagementRequest):
     reads_delta = 1 if req.read is True else (-1 if req.read is False else 0)
     try:
         result = core.increment_engagement(_config, article_id, likes_delta, reads_delta)
+        # 共有ファイルキャッシュ全体(common.shared_cache_clear_all)はここでは呼ばない。
+        # 呼ぶと、日次バッチが温めた重い記事一覧キャッシュ(articles:*)まで巻き込んで
+        # 消えてしまい、次のリクエストが再び数十秒かかる高コストな再取得を踏んでしまう。
+        # いいね/読んだ数の反映が他ワーカー・他プロセスに伝播するまで最大5分(このプロセス内
+        # キャッシュのTTL)遅れる程度は許容する。
         _articles_response_cache.clear()
-        _shared_cache_clear_all()
         return result
     except Exception as e:
         raise HTTPException(
@@ -833,7 +800,7 @@ def _fetch_competitor_changes_base(company_id: str, record_type: str, since_days
         return entry["events"], entry["target_records"]
 
     shared_key = f"competitor_changes:{cache_key}"
-    shared = _shared_cache_get(shared_key, COMPETITOR_CHANGES_CACHE_TTL)
+    shared = common.shared_cache_get(shared_key, COMPETITOR_CHANGES_CACHE_TTL)
     if shared is not None:
         _competitor_changes_cache[cache_key] = {**shared, "fetched_at": now}
         return shared["events"], shared["target_records"]
@@ -866,7 +833,7 @@ def _fetch_competitor_changes_base(company_id: str, record_type: str, since_days
         target_records = {r["record_id"]: r for r in rows}
 
     _competitor_changes_cache[cache_key] = {"events": events, "target_records": target_records, "fetched_at": now}
-    _shared_cache_set(shared_key, {"events": events, "target_records": target_records})
+    common.shared_cache_set(shared_key, {"events": events, "target_records": target_records})
     return events, target_records
 
 
