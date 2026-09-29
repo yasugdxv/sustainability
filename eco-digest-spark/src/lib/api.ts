@@ -427,6 +427,8 @@ export interface CompetitorChange {
   confidence: number | null;
   reviewRequired: boolean;
   sourceUrl: string | null;
+  beforeSourceUrl: string | null;
+  crossDocumentComparison: boolean;
   createdAt: string;
   sourceUpdatedAt: string | null;
 }

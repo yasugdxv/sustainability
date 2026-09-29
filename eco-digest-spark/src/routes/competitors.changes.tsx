@@ -188,10 +188,27 @@ function CompetitorChangesPage() {
                   </span>
                 </div>
                 <p className="text-sm mt-3 leading-relaxed">{c.summary}</p>
+                {c.crossDocumentComparison && (
+                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-2 leading-relaxed">
+                    {t("competitor.changes.crossDocumentNote")}
+                  </p>
+                )}
                 {c.changedFields.length > 0 && (
                   <div className="grid grid-cols-2 gap-4 mt-3 text-xs text-muted-foreground border-t border-border pt-3">
                     <div>
-                      <div className="font-medium text-foreground mb-1">{t("competitor.changes.before")}</div>
+                      <div className="font-medium text-foreground mb-1 flex items-center gap-2">
+                        {t("competitor.changes.before")}
+                        {c.beforeSourceUrl && (
+                          <a
+                            href={c.beforeSourceUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="font-normal text-muted-foreground hover:text-foreground underline"
+                          >
+                            {t("competitor.readOriginal")}
+                          </a>
+                        )}
+                      </div>
                       {c.changedFields.map((f, i) => (
                         <div key={i}>{f.field}: {String(f.before ?? "—")}</div>
                       ))}

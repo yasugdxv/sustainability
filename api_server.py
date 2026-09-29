@@ -557,7 +557,10 @@ def _goal_category_map() -> dict:
 def _change_to_ui(e: dict, companies: dict, target_records: dict = None, goal_categories: dict = None) -> dict:
     company = companies.get(e["company_id"], {})
     after = (target_records or {}).get(e.get("after_record_id")) or {}
+    before = (target_records or {}).get(e.get("before_record_id")) or {}
     goal_category = (goal_categories or {}).get(after.get("goal_category_id"))
+    before_source_url = before.get("source_url")
+    after_source_url = after.get("source_url")
     return {
         "id": e["change_event_id"],
         "companyId": e["company_id"],
@@ -576,7 +579,14 @@ def _change_to_ui(e: dict, companies: dict, target_records: dict = None, goal_ca
         "goalCategoryTheme": goal_category.get("major_theme") if goal_category else None,
         "confidence": e.get("confidence"),
         "reviewRequired": e.get("review_required", False),
-        "sourceUrl": after.get("source_url"),
+        "sourceUrl": after_source_url,
+        "beforeSourceUrl": before_source_url,
+        # before/afterで参照元文書自体が異なる場合、項目の出現・消失は会社側の開示内容の
+        # 変更ではなく、比較対象の文書が違うことによる見かけ上の差の可能性があるため、
+        # フロントエンド側で注記を出せるようフラグを渡す（両方URLが分かっている場合のみ判定）
+        "crossDocumentComparison": bool(
+            before_source_url and after_source_url and before_source_url != after_source_url
+        ),
         "createdAt": e.get("created_at"),
         "sourceUpdatedAt": after.get("source_updated_at"),
     }
@@ -768,15 +778,21 @@ def _fetch_competitor_changes_base(company_id: str, record_type: str, since_days
         params["created_at"] = f"gte.{cutoff}"
     events = _competitor_client.select("competitor_change_events", params)
 
-    after_ids = list({e["after_record_id"] for e in events if e.get("after_record_id")})
+    # before_record_id側も合わせて取得する。変更前後で参照元文書が異なるケース
+    # （例: 詳細な目標一覧PDFと簡潔な保証報告書PDFを比較した結果、項目の有無だけが
+    # 入れ替わって見える）があり、before側のsource_urlが無いと「本当に会社が
+    # 内容を変えたのか、単に別文書と比較しただけなのか」がUI側で判別できないため。
+    record_ids = {e["after_record_id"] for e in events if e.get("after_record_id")}
+    record_ids |= {e["before_record_id"] for e in events if e.get("before_record_id")}
+    record_ids = list(record_ids)
     target_records = {}
-    if after_ids:
-        # after_idsが多いと1つのin.(...)クエリのURLが長くなりすぎて414 URI Too Longに
+    if record_ids:
+        # record_idsが多いと1つのin.(...)クエリのURLが長くなりすぎて414 URI Too Longに
         # なるため、chunk分割して取得する（article_analysisで実際に発生した問題と同種。
         # chunk自体は_select_in_chunks側で並列実行される）
         rows = common._select_in_chunks(_competitor_client, "competitor_target_records", {
             "select": "record_id,source_url,title,themes,source_updated_at,goal_category_id",
-        }, "record_id", after_ids)
+        }, "record_id", record_ids)
         target_records = {r["record_id"]: r for r in rows}
 
     _competitor_changes_cache[cache_key] = {"events": events, "target_records": target_records, "fetched_at": now}
