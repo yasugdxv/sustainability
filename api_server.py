@@ -935,7 +935,11 @@ def competitor_unread_count():
 if __name__ == "__main__":
     import os
     import uvicorn
-    # ローカル開発では127.0.0.1のみ、コンテナ内ではAPI_HOST=0.0.0.0を環境変数で指定する
+    # ローカル開発・手動起動専用（1プロセス）。本番(Azure App Service)は
+    # このブロックを経由せず、Gunicorn(Startup Command)がuvicorn.workers.UvicornWorker
+    # を複数プロセス起動する構成にする（本番の複数プロセス化はGunicorn側の責務。
+    # 理由はREADME/引き継ぎ参照: uvicorn自身の--workers/workers=はWindows(spawn)で
+    # 不安定・かつ一般的にはGunicornに任せるのが標準的なため、あえてここでは持たない）。
     host = os.environ.get("API_HOST", "127.0.0.1")
     port = int(os.environ.get("API_PORT", "8000"))
     uvicorn.run(app, host=host, port=port)
