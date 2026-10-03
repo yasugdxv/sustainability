@@ -28,6 +28,7 @@ import re
 import sys
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -717,6 +718,26 @@ def _follow_meta_refresh(html: str, final_url: str):
     return html, urljoin(final_url, m.group(2).strip()), True
 
 
+# 社内プロキシ越しの通信で稀に発生するSSL瞬断(SSLEOFError等)・接続断に対して、
+# 短い間隔でリトライする(2026-09-30、nature.comでSSLError多発かつ翌日は成功、を
+# 交互に繰り返しており一過性のTLS切断と判断。requests.get()呼び出し全般に適用する)
+HTTP_FETCH_MAX_RETRIES = 2
+HTTP_FETCH_RETRY_DELAY_SEC = 3
+_HTTP_RETRYABLE_EXCEPTIONS = (requests.exceptions.SSLError, requests.exceptions.ConnectionError)
+
+
+def _requests_get_with_retry(url: str, proxies: dict, verify: bool, timeout: int, headers: dict):
+    last_exc = None
+    for attempt in range(HTTP_FETCH_MAX_RETRIES + 1):
+        try:
+            return requests.get(url, proxies=proxies, verify=verify, timeout=timeout, headers=headers)
+        except _HTTP_RETRYABLE_EXCEPTIONS as e:
+            last_exc = e
+            if attempt < HTTP_FETCH_MAX_RETRIES:
+                time.sleep(HTTP_FETCH_RETRY_DELAY_SEC)
+    raise last_exc
+
+
 def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool, use_zyte: bool = False,
                  force_zyte_browser: bool = False):
     """通常HTTP・ブラウザ・Zyte APIのいずれかでページを取得する。(html, final_url, status_code)を返す。
@@ -726,8 +747,7 @@ def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool, use_zy
     elif use_browser:
         html, final_url, status_code = _fetch_with_browser(url, proxies, verify)
     else:
-        resp = requests.get(url, proxies=proxies, verify=verify,
-                             timeout=REQUEST_TIMEOUT, headers=_HEADERS)
+        resp = _requests_get_with_retry(url, proxies, verify, REQUEST_TIMEOUT, _HEADERS)
         resp.raise_for_status()
         html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
 
@@ -742,8 +762,7 @@ def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool, use_zy
         elif use_browser:
             html, final_url, status_code = _fetch_with_browser(final_url, proxies, verify)
         else:
-            resp = requests.get(final_url, proxies=proxies, verify=verify,
-                                 timeout=REQUEST_TIMEOUT, headers=_HEADERS)
+            resp = _requests_get_with_retry(final_url, proxies, verify, REQUEST_TIMEOUT, _HEADERS)
             resp.raise_for_status()
             html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
     return html, final_url, status_code
@@ -798,8 +817,7 @@ def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bo
             html, final_url, status_code = _fetch_with_browser(url, proxies, verify)
             content_type, raw_content = "", None
         else:
-            resp = requests.get(url, proxies=proxies, verify=verify,
-                                 timeout=REQUEST_TIMEOUT, headers=_HEADERS)
+            resp = _requests_get_with_retry(url, proxies, verify, REQUEST_TIMEOUT, _HEADERS)
             resp.raise_for_status()
             html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
             content_type, raw_content = resp.headers.get("Content-Type", ""), resp.content
@@ -963,6 +981,24 @@ def _path_matches(path: str, pattern: str) -> bool:
     return path.startswith(pattern)
 
 
+def _target_max_links(target: dict) -> int:
+    """search_conditions列に"max_links:N"形式の指定があれば、このターゲットの一覧候補上限として
+    使う（既定はMAX_HTML_LINKS_PER_TARGET=30）。2026-10-01、環境省(水規制)で確認:
+    一覧ページがカテゴリ別に記事を束ねているだけで日付順になっておらず、新着記事が
+    カテゴリの並び順次第で既定の上限30件を超えた位置に追いやられ取りこぼされていた。
+    全ターゲット共通の既定値を引き上げると全HTML方式ターゲットのクロール負荷が増えるため、
+    このsearch_conditions指定で対象ターゲットだけ上限を緩和できるようにする
+    （同列はforce_zyte_browserフラグとしても流用済みのため、形式が重複しないよう
+    "max_links:"プレフィックスで判別する）"""
+    sc = target.get("search_conditions") or ""
+    if sc.startswith("max_links:"):
+        try:
+            return int(sc.split(":", 1)[1])
+        except ValueError:
+            pass
+    return MAX_HTML_LINKS_PER_TARGET
+
+
 def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser: bool = False,
                           use_zyte: bool = False) -> list:
     """HTML一覧ページから候補記事リンクを抽出する（<a>を汎用的に収集し、
@@ -979,6 +1015,7 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
     force_zyte_browser = (target.get("search_conditions") == "force_zyte_browser")
     html, final_url, status_code = _fetch_page(url, proxies, verify, use_browser, use_zyte=use_zyte,
                                                 force_zyte_browser=force_zyte_browser)
+    max_links = _target_max_links(target)
 
     tree = _safe_lxml_parse(html)
     # <base href="..."> がある場合、相対リンクはfinal_urlではなくこちらを基準に解決する
@@ -995,7 +1032,7 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
             continue
         if domain not in parsed.netloc:
             continue
-        path = parsed.path
+        path = _strip_aem_content_prefix(parsed.path)
         # WWF(panda.org)のような旧CMSは記事識別子自体をクエリに埋め込む
         # （例: /?15703966/slug）ため、パスが空でクエリが数字始まりのものは
         # 通常のinclude_paths/exclude_paths判定（パスベース）を素通りさせて
@@ -1017,9 +1054,22 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
             continue
         seen.add(normalized)
         candidates.append({"url": normalized, "title": None, "published_at": None})
-        if len(candidates) >= MAX_HTML_LINKS_PER_TARGET:
+        if len(candidates) >= max_links:
             break
     return candidates, status_code
+
+
+def _strip_aem_content_prefix(path: str) -> str:
+    """AEM(Adobe Experience Manager)サイトは内部コンテンツパス(/content/<サイト名>/...)を
+    <a href>やJSON APIレスポンスにそのまま露出することがあるが、公開URLはこのプレフィックスを
+    含まない（例: /content/ifrs/home/news-and-events/x.html → /home/news-and-events/x.html）。
+    2026-09-29、ifrs.org(ISSB)で確認: list_html_candidates()側はこの変換をしておらず、
+    include_paths="/news-and-events/"に一件も一致せず記事を検出できていなかった"""
+    if path.startswith("/content/"):
+        parts = path.split("/", 3)
+        if len(parts) == 4:
+            return "/" + parts[3]
+    return path
 
 
 # JSON APIのレスポンス内で記事URL・タイトル・日付を指す可能性があるキー名
@@ -1077,13 +1127,7 @@ def list_json_api_candidates(target: dict, proxies: dict, verify: bool, use_zyte
         path = next((item[k] for k in _JSON_URL_KEYS if item.get(k)), None)
         if not path:
             continue
-        # AEM(Adobe Experience Manager)サイトはJSON APIが内部コンテンツパス
-        # (/content/<サイト名>/...)を返すが、公開URLはこのプレフィックスを含まない
-        # 例: /content/mcdonalds/corpmcd/our-stories/article/x.html → /corpmcd/our-stories/article/x.html
-        if path.startswith("/content/"):
-            parts = path.split("/", 3)
-            if len(parts) == 4:
-                path = "/" + parts[3]
+        path = _strip_aem_content_prefix(path)
         full = urljoin(url_base, path)
         parsed = urlparse(full)
         if domain not in parsed.netloc:
@@ -1303,6 +1347,7 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
     bot_block_detections = 0
 
     if error_message is None:
+        extracted_pairs = []
         for cand in candidates:
             extracted = extract_article(cand["url"], proxies, verify, use_browser=use_browser, use_zyte=use_zyte)
             time.sleep(ARTICLE_FETCH_SLEEP)
@@ -1325,10 +1370,31 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
                 extraction_failures += 1
                 continue
 
+            extracted_pairs.append((cand, extracted))
+
+        # 同一クロール内で、本文からのtrafilatura抽出日付（候補側に日付が無い場合の
+        # フォールバック）が複数候補にわたって全く同じ値になっている場合、記事個別の
+        # 公開日ではなくページ共通のテンプレート日付（コピーライト表記・最終レビュー日等）
+        # を誤抽出していると疑う（例: fao.org、2026-09-29発見。全候補が同一日付に固定され
+        # lookback判定で全滅し、クロールは成功しているのに記事が1件も保存されない
+        # 不具合が続いていた）。
+        fallback_date_counts = Counter(
+            extracted["published_at"].date()
+            for cand, extracted in extracted_pairs
+            if not cand.get("published_at") and extracted.get("published_at")
+        )
+        suspect_dates = {
+            d for d, count in fallback_date_counts.items()
+            if count >= 3 and count >= len(extracted_pairs) * 0.5
+        }
+
+        for cand, extracted in extracted_pairs:
             # RSSは一覧取得の時点で候補ごとの正確な日付(published_parsed)を持っている
             # ため、それを優先する。HTML一覧ページ等、候補側に日付が無いものだけ
             # 本文からのtrafilatura抽出日付(誤抽出対策済み)にフォールバックする。
             pub_dt = cand.get("published_at") or extracted["published_at"]
+            if pub_dt is not None and not cand.get("published_at") and pub_dt.date() in suspect_dates:
+                pub_dt = None
             if not _within_lookback(pub_dt, lookback):
                 continue
 

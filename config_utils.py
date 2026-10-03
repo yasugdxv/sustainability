@@ -45,6 +45,11 @@ def build_config_from_env() -> dict:
         "openai": os.environ.get("OPENAI_API_KEY", ""),
         "anthropic": os.environ.get("ANTHROPIC_API_KEY", ""),
     }
+    # 2026-10-02発見: ZYTE_API_KEY相当の環境変数がここに無かったため、Zyte方式の
+    # クロール対象(本番で約25件)がRuntimeError「Zyte APIキーが未設定です」で
+    # 全滅していた。他のキーと同じ並びに追加する(article_crawler._get_zyte_api_key()が
+    # config["zyte"]["api_key"]を読む)
+    config["zyte"] = {"api_key": os.environ.get("ZYTE_API_KEY", "")}
     if supabase_url:
         service_role_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
         config["supabase"] = {
