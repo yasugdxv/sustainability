@@ -348,12 +348,22 @@ class SupabaseClient:
 
 
 # ─── 日付ユーティリティ ──────────────────────────────────────────
+# 「2026年09月24日」のような和暦区切り表記はdateutilが解釈できず例外になる
+# （例: kubota.co.jpのJSON APIが日付をこの形式で返す、2026-10-04確認）。
+# dateutilに渡す前にISO風の区切りへ正規化する
+_JA_DATE_RE = re.compile(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日")
+
+
 def _parse_datetime(value):
     """文字列をdatetime(UTC)へ変換する。失敗時はNone"""
     if not value:
         return None
+    text = str(value)
+    ja_match = _JA_DATE_RE.search(text)
+    if ja_match:
+        text = f"{ja_match.group(1)}-{ja_match.group(2)}-{ja_match.group(3)}"
     try:
-        dt = dateutil_parser.parse(str(value))
+        dt = dateutil_parser.parse(text)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
@@ -1023,6 +1033,14 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
     # 現在ページのパス配下に誤って連結されてしまう=urljoinの標準動作とHTML仕様の齟齬)
     base_href = next(iter(tree.xpath("//base/@href")), None)
     link_base = urljoin(final_url, base_href) if base_href else final_url
+    # 一覧ページ自身が候補に混入するのを防ぐ自己リンク判定。target_url(DB登録値)が
+    # bare domainでもサイト側がwwwへリダイレクトすることがあり(例:
+    # coca-colacompany.com -> www.coca-colacompany.com)、その場合はurlとの単純比較
+    # では一致せず素通りしてしまう(2026-10-04、Coca-Cola Company等で確認)。
+    # final_url側も同じ正規化をして自己リンク集合に加える
+    self_urls = {url.rstrip("/")}
+    final_parsed = urlparse(final_url)
+    self_urls.add(f"{final_parsed.scheme}://{final_parsed.netloc}{final_parsed.path.rstrip('/') or '/'}")
     seen = set()
     candidates = []
     for href in tree.xpath("//a/@href"):
@@ -1050,7 +1068,7 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
             normalized = f"{parsed.scheme}://{parsed.netloc}/?{parsed.query}"
         else:
             normalized = f"{parsed.scheme}://{parsed.netloc}{normalized_path}"
-        if normalized in seen or normalized == url.rstrip("/"):
+        if normalized in seen or normalized in self_urls:
             continue
         seen.add(normalized)
         candidates.append({"url": normalized, "title": None, "published_at": None})
