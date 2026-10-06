@@ -49,3 +49,9 @@ neural_analysis/data/
 
 # Zyte API PoC: 取得結果(HTML/CSV/サマリー)は生成物のため除外。zyte_test.py/targets.txt/READMEは管理対象
 scripts/zyte_poc/results/
+
+# agent-security-reviewの生アタックサーフェス棚卸し(security-surface.json)は、
+# 過去にconfig.jsonのAPIキー実値がredactされず平文で書き出された事故があった
+# (2026-10-06発見・修正)。再発防止の多層防御として、最終成果物である
+# security-report.json/.mdとは別にgit管理対象から外す
+.agent-governance/security-surface.json
