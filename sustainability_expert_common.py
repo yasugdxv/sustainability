@@ -56,6 +56,17 @@ def is_enabled(config: dict) -> bool:
     return env.strip().lower() in ("1", "true", "yes")
 
 
+def is_chat_enabled() -> bool:
+    """2026-10-06のセキュリティインシデント対応で導入した/api/chat専用の緊急Kill Switch。
+    環境変数CHAT_ENABLEDのみで判定し、config.json(chat_api.enabled等)は一切参照しない
+    （config.json経由だとローカル開発者が気づかずtrueのまま本番相当の挙動を試す、あるいは
+    config.jsonの別の値と混同するリスクがあるため、意図的にconfig非依存にしている）。
+    明示的に"1"/"true"/"yes"（大小文字無視）の場合のみTrue。未設定・空文字・
+    "false"/"0"/"no"・その他の不正値は全てFalseとして扱う（安全側デフォルト）。"""
+    value = os.environ.get("CHAT_ENABLED", "")
+    return value.strip().lower() in ("1", "true", "yes")
+
+
 def get_expert_version(config: dict) -> str:
     cfg = (config or {}).get("sustainability_expert", {})
     if cfg.get("expert_version"):

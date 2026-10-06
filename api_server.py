@@ -432,6 +432,10 @@ class ChatRequest(BaseModel):
 
 @app.post("/api/chat")
 def chat(req: ChatRequest):
+    if not common.is_chat_enabled():
+        # 2026-10-06緊急停止: DB検索・LLM呼び出し・ナレッジ検索などを一切開始せず、
+        # ここで即座に固定応答のみ返す。内部構成・キー・例外・スタックトレースは含めない。
+        raise HTTPException(status_code=503, detail="Chat機能は一時的に利用できません。")
     if not common.is_enabled(_config):
         raise HTTPException(status_code=400, detail="サステナAIが無効化されています（config.jsonを確認してください）")
     if not _azure_client:
