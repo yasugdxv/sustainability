@@ -9,6 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import pytest  # noqa: E402
+
 import article_analyzer as aa  # noqa: E402
 from tests._fakes import FakeSupabaseClient  # noqa: E402
 
@@ -321,6 +323,65 @@ def test_needs_review_prompt_covers_no_substantive_content_case():
     assert "本文から評価の拠り所となる実質的な内容がほとんど・全く得られず" in prompt
     assert "重要度がゼロだと確定した" in prompt
     assert "記事取得自体が" in prompt and "失敗している可能性を含め人間の確認が必要な状態として扱うこと" in prompt
+
+
+def test_compute_rank_boundary_scores_match_without_warning(capsys):
+    """各rankのmin_score/max_score境界値ちょうどで正しいrankが返り、
+    warningが出力されないこと"""
+    for r in RANKS:
+        assert aa.compute_rank(r["min_score"], RANKS) == r["rank"]
+        assert aa.compute_rank(r["max_score"], RANKS) == r["rank"]
+    assert capsys.readouterr().out == ""
+
+
+def test_compute_rank_falls_back_to_d_with_warning_when_gap_exists():
+    """閾値定義にgapがある場合、該当スコアはDにフォールバックし、
+    scoreとranks_countを含むwarningが出力されること(ranksの中身・記事内容は含まない)"""
+    ranks_with_gap = [
+        {"rank": "A", "min_score": 23, "max_score": 28, "default_publication": "週次メール"},
+        # 10〜22が抜けている(gap)
+        {"rank": "D", "min_score": 0, "max_score": 9, "default_publication": "非掲載"},
+    ]
+
+    result = aa.compute_rank(15, ranks_with_gap)
+
+    assert result == "D"
+
+
+def test_compute_rank_gap_warning_message_content(capsys):
+    ranks_with_gap = [
+        {"rank": "A", "min_score": 23, "max_score": 28, "default_publication": "週次メール"},
+        {"rank": "D", "min_score": 0, "max_score": 9, "default_publication": "非掲載"},
+    ]
+
+    aa.compute_rank(15, ranks_with_gap)
+
+    out = capsys.readouterr().out.strip()
+    assert out == "WARNING compute_rank_fallback: score=15 ranks_count=2"
+
+
+@pytest.mark.parametrize("score", [-1, 36])
+def test_compute_rank_out_of_range_score_falls_back_to_d_with_warning(score, capsys):
+    """7項目合計の正常範囲(0〜35)を外れるスコア(負値、またはLLMが仕様外の値を
+    返した場合等)でもDにフォールバックし、scoreとranks_countを含み
+    ranksの中身は含まないwarningが出力されること"""
+    result = aa.compute_rank(score, RANKS)
+
+    assert result == "D"
+    out = capsys.readouterr().out.strip()
+    assert out == f"WARNING compute_rank_fallback: score={score} ranks_count=5"
+    assert "min_score" not in out
+    assert "default_publication" not in out
+
+
+def test_compute_rank_empty_ranks_falls_back_to_d_with_warning(capsys):
+    """importance_rank_definitionsが空(設定不備)の場合も例外にならずDにフォールバックし、
+    ranks_count=0のwarningで設定不備だとわかること"""
+    result = aa.compute_rank(20, [])
+
+    assert result == "D"
+    out = capsys.readouterr().out.strip()
+    assert out == "WARNING compute_rank_fallback: score=20 ranks_count=0"
 
 
 if __name__ == "__main__":

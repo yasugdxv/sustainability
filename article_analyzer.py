@@ -471,6 +471,10 @@ def compute_rank(total_score: int, ranks: list) -> str:
     for r in ranks:
         if r["min_score"] <= total_score <= r["max_score"]:
             return r["rank"]
+    print(
+        "WARNING compute_rank_fallback: "
+        f"score={total_score} ranks_count={len(ranks)}"
+    )
     return "D"
 
 
