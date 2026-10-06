@@ -362,10 +362,20 @@ def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: 
     return result
 
 
+ALL_TIME_SINCE_DAYS = 36500  # フロントエンドの検索画面「全期間」フィルタと同じ値
+
+
 @app.get("/api/articles/{article_id}")
 def get_article(article_id: str, lang: str = "ja"):
     articles = _get_articles()
     article = next((a for a in articles if a["article_id"] == article_id), None)
+    if not article:
+        # 2026-10-06修正: _get_articles()は既定でDEFAULT_LOOKBACK_DAYS(30日)分しか
+        # 保持しないため、検索・カテゴリ画面で期間を30日超に広げて表示された記事の
+        # 詳細をクリックすると、DBには存在するのに404になっていた。見つからない
+        # 場合のみ全期間で再検索する（通常ケースは従来通り30日分のキャッシュ経由）。
+        articles = _get_articles(ALL_TIME_SINCE_DAYS)
+        article = next((a for a in articles if a["article_id"] == article_id), None)
     if not article:
         raise HTTPException(status_code=404, detail="記事が見つかりません")
     engagement = core.fetch_engagement_map(_config, [article_id])
