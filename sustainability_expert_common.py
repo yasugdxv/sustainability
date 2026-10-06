@@ -22,7 +22,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import jsonschema
+import openai
 from dateutil import parser as dateutil_parser
 
 BASE = Path(__file__).parent
@@ -538,7 +540,15 @@ def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str
         {"role": "system", "content": system_prompt + "\n\n必ずJSON1個のみを出力すること。説明文・Markdown装飾は不要。"},
         {"role": "user", "content": user_prompt},
     ]
-    resp = client.chat.completions.create(model=model, messages=messages, **temp_kwargs)
+    try:
+        resp = client.chat.completions.create(model=model, messages=messages, **temp_kwargs)
+    except (openai.APIError, httpx.HTTPError) as e:
+        print(
+            "LLM call failed: stage=manual_json "
+            f"error_type={type(e).__name__} "
+            f"status={getattr(e, 'status_code', None)} "
+            f"request_id={getattr(e, 'request_id', None)}")
+        raise ExpertLLMError("LLM呼び出しに失敗しました") from None
     raw = resp.choices[0].message.content
     try:
         data = extract_json_object(raw)
@@ -556,7 +566,15 @@ def call_llm_structured(client, model: str, system_prompt: str, user_prompt: str
         "content": f"前回の出力はJSON Schema検証に失敗しました: {first_error}\n"
                     f"Schemaに厳密に従うJSON1個のみを再出力してください。",
     })
-    resp2 = client.chat.completions.create(model=model, messages=messages, **temp_kwargs)
+    try:
+        resp2 = client.chat.completions.create(model=model, messages=messages, **temp_kwargs)
+    except (openai.APIError, httpx.HTTPError) as e:
+        print(
+            "LLM call failed: stage=correction_retry "
+            f"error_type={type(e).__name__} "
+            f"status={getattr(e, 'status_code', None)} "
+            f"request_id={getattr(e, 'request_id', None)}")
+        raise ExpertLLMError("LLM呼び出しに失敗しました") from None
     raw2 = resp2.choices[0].message.content
     latency_ms = int((time.monotonic() - started) * 1000)
     try:
