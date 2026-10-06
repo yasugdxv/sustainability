@@ -53,7 +53,8 @@ def list_candidate_cluster_ids(client, since_days: int = None, article_ids: list
 
     suppressed_ids = {
         a["article_id"] for a in common._select_in_chunks(
-            client, "article_analysis", {"select": "article_id,representative_role"},
+            client, "article_analysis",
+            {"select": "article_id,representative_role", "is_current": "eq.true"},
             "article_id", [a["article_id"] for a in articles])
         if a.get("representative_role") == "suppressed_duplicate"
     }
@@ -232,7 +233,7 @@ def list_theme_prioritized_cluster_ids(client, all_urls: dict, top_n: int = 10,
     analysis_by_article = {
         a["article_id"]: a for a in client.select(
             "article_analysis", {"select": "article_id,importance_level,importance_total_score,"
-                                            "representative_role"})
+                                            "representative_role", "is_current": "eq.true"})
     }
     # 一次情報の要約・言い換えに留まると判定された二次記事(representative_role=
     # suppressed_duplicate)は、そもそも選定用LLM評価の候補にしない。一次情報側は

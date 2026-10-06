@@ -166,9 +166,9 @@ def test_list_theme_prioritized_cluster_ids_excludes_suppressed_duplicate():
         "articles": articles,
         "article_analysis": [
             {"article_id": "a1", "importance_level": "S", "importance_total_score": 30,
-             "representative_role": "representative"},
+             "representative_role": "representative", "is_current": True},
             {"article_id": "a2", "importance_level": "S", "importance_total_score": 32,
-             "representative_role": "suppressed_duplicate"},
+             "representative_role": "suppressed_duplicate", "is_current": True},
         ],
         "article_tags": [
             {"article_id": "a1", "tag_id": "TH-02"},
@@ -180,6 +180,158 @@ def test_list_theme_prioritized_cluster_ids_excludes_suppressed_duplicate():
 
     cluster_ids = sas.list_theme_prioritized_cluster_ids(client, all_urls, top_n=10)
     assert cluster_ids == ["u1"]
+
+
+class _SelectSpyClient:
+    """FakeSupabaseClientをラップし、select()に実際に渡されたparamsを記録するだけの
+    テスト専用スパイ（is_current=eq.trueが本当にクエリへ渡っていることを確認するため）"""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.select_calls = []
+
+    def select(self, table, params):
+        self.select_calls.append((table, dict(params)))
+        return self._inner.select(table, params)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_list_candidate_cluster_ids_passes_is_current_filter_to_article_analysis():
+    """article_analysisへの問い合わせにis_current=eq.trueが渡されていること"""
+    client = _SelectSpyClient(FakeSupabaseClient(_single_article_tables()))
+
+    sas.list_candidate_cluster_ids(client)
+
+    analysis_calls = [p for (t, p) in client.select_calls if t == "article_analysis"]
+    assert analysis_calls, "article_analysisへの問い合わせが発生していない"
+    assert all(p.get("is_current") == "eq.true" for p in analysis_calls)
+
+
+def test_list_candidate_cluster_ids_uses_only_current_row_despite_history():
+    """同一article_idに過去(is_current=false)のrepresentative_roleと、現在(is_current=true)の
+    representative_roleが食い違う履歴があっても、現在(is_current=true)の行だけで判定すること。
+    過去はsuppressed_duplicateだったが現在representativeに訂正された記事は候補に残り、
+    逆に過去representativeだったが現在suppressed_duplicateに訂正された記事は除外されること"""
+    urls = [
+        {"article_url_id": "u1", "article_url": "https://a.example.com/1",
+         "duplicate_of_article_url_id": None},
+        {"article_url_id": "u2", "article_url": "https://b.example.com/1",
+         "duplicate_of_article_url_id": None},
+    ]
+    articles = [
+        {"article_id": "a1", "article_url_id": "u1", "title": "過去suppressed→現在representative",
+         "extracted_text": "本文1", "published_at": "2026-07-10T00:00:00+00:00",
+         "final_url": "https://a.example.com/1", "fetched_url": "https://a.example.com/1",
+         "crawl_target_id": "t1", "is_current": True},
+        {"article_id": "a2", "article_url_id": "u2", "title": "過去representative→現在suppressed",
+         "extracted_text": "本文2", "published_at": "2026-07-10T01:00:00+00:00",
+         "final_url": "https://b.example.com/1", "fetched_url": "https://b.example.com/1",
+         "crawl_target_id": "t1", "is_current": True},
+    ]
+    tables = _base_tables(urls, articles)
+    tables["article_analysis"] = [
+        # a1: 過去はsuppressed_duplicate、現在はrepresentativeに訂正済み → 候補に残るべき
+        {"article_id": "a1", "primary_source_status": "解釈・分析", "summary_short": "旧要約",
+         "is_current": False, "representative_role": "suppressed_duplicate"},
+        {"article_id": "a1", "primary_source_status": "一次情報", "summary_short": "新要約",
+         "is_current": True, "representative_role": "representative"},
+        # a2: 過去はrepresentative、現在はsuppressed_duplicateに訂正済み → 除外されるべき
+        {"article_id": "a2", "primary_source_status": "一次情報", "summary_short": "旧要約",
+         "is_current": False, "representative_role": "representative"},
+        {"article_id": "a2", "primary_source_status": "解釈・分析", "summary_short": "新要約",
+         "is_current": True, "representative_role": "suppressed_duplicate"},
+    ]
+    client = FakeSupabaseClient(tables)
+
+    cluster_ids = sas.list_candidate_cluster_ids(client)
+
+    assert cluster_ids == ["u1"]  # a1(u1)は残る、a2(u2)は除外される
+
+
+def test_list_candidate_cluster_ids_result_independent_of_row_order():
+    """article_analysisの行の並び順(current行が先か過去行が先か)が変わっても、
+    結果が変わらないこと(is_current=eq.trueで絞り込むため、並び順に依存しなくなる)"""
+    urls = [{"article_url_id": "u1", "article_url": "https://a.example.com/1",
+             "duplicate_of_article_url_id": None}]
+    articles = [
+        {"article_id": "a1", "article_url_id": "u1", "title": "t", "extracted_text": "b",
+         "published_at": "2026-07-10T00:00:00+00:00", "final_url": "https://a.example.com/1",
+         "fetched_url": "https://a.example.com/1", "crawl_target_id": "t1", "is_current": True},
+    ]
+    current_row = {"article_id": "a1", "primary_source_status": "一次情報", "summary_short": "新",
+                    "is_current": True, "representative_role": "representative"}
+    past_row = {"article_id": "a1", "primary_source_status": "解釈・分析", "summary_short": "旧",
+                "is_current": False, "representative_role": "suppressed_duplicate"}
+
+    tables_a = _base_tables(urls, articles)
+    tables_a["article_analysis"] = [current_row, past_row]
+    tables_b = _base_tables(urls, articles)
+    tables_b["article_analysis"] = [past_row, current_row]
+
+    result_a = sas.list_candidate_cluster_ids(FakeSupabaseClient(tables_a))
+    result_b = sas.list_candidate_cluster_ids(FakeSupabaseClient(tables_b))
+
+    assert result_a == result_b == ["u1"]
+
+
+def test_list_theme_prioritized_cluster_ids_passes_is_current_filter_to_article_analysis():
+    """article_analysisへの問い合わせにis_current=eq.trueが渡されていること"""
+    tag_rows = [{"tag_id": "TH-02", "tag_axis": "テーマ", "tag_level": "大分類", "parent_tag_id": None}]
+    articles = [{"article_id": "a1", "article_url_id": "u1", "crawl_target_id": "t1", "is_current": True}]
+    inner = FakeSupabaseClient({
+        "tag_reference": tag_rows,
+        "crawl_targets": [{"crawl_target_id": "t1", "publisher_tag_id": None}],
+        "articles": articles,
+        "article_analysis": [{"article_id": "a1", "importance_level": "S",
+                               "importance_total_score": 30, "representative_role": "representative",
+                               "is_current": True}],
+        "article_tags": [{"article_id": "a1", "tag_id": "TH-02"}],
+    })
+    client = _SelectSpyClient(inner)
+    all_urls = {"u1": {"article_url_id": "u1", "duplicate_of_article_url_id": None}}
+
+    sas.list_theme_prioritized_cluster_ids(client, all_urls, top_n=10)
+
+    analysis_calls = [p for (t, p) in client.select_calls if t == "article_analysis"]
+    assert analysis_calls, "article_analysisへの問い合わせが発生していない"
+    assert all(p.get("is_current") == "eq.true" for p in analysis_calls)
+
+
+def test_list_theme_prioritized_cluster_ids_uses_only_current_row_despite_history():
+    """list_candidate_cluster_idsと同様、Tier0選定でも現在(is_current=true)の行だけで
+    判定すること。過去はrepresentativeだったが現在suppressed_duplicateに訂正された
+    クラスタは、Tier0候補から除外されること"""
+    tag_rows = [{"tag_id": "TH-02", "tag_axis": "テーマ", "tag_level": "大分類", "parent_tag_id": None}]
+    articles = [
+        {"article_id": "a1", "article_url_id": "u1", "crawl_target_id": "t1", "is_current": True},
+        {"article_id": "a2", "article_url_id": "u2", "crawl_target_id": "t1", "is_current": True},
+    ]
+    client = FakeSupabaseClient({
+        "tag_reference": tag_rows,
+        "crawl_targets": [{"crawl_target_id": "t1", "publisher_tag_id": None}],
+        "articles": articles,
+        "article_analysis": [
+            {"article_id": "a1", "importance_level": "S", "importance_total_score": 30,
+             "representative_role": "representative", "is_current": True},
+            # a2: 過去はrepresentative(古い行、is_current=false)、現在はsuppressed_duplicate
+            {"article_id": "a2", "importance_level": "S", "importance_total_score": 32,
+             "representative_role": "representative", "is_current": False},
+            {"article_id": "a2", "importance_level": "S", "importance_total_score": 32,
+             "representative_role": "suppressed_duplicate", "is_current": True},
+        ],
+        "article_tags": [
+            {"article_id": "a1", "tag_id": "TH-02"},
+            {"article_id": "a2", "tag_id": "TH-02"},
+        ],
+    })
+    all_urls = {"u1": {"article_url_id": "u1", "duplicate_of_article_url_id": None},
+                "u2": {"article_url_id": "u2", "duplicate_of_article_url_id": None}}
+
+    cluster_ids = sas.list_theme_prioritized_cluster_ids(client, all_urls, top_n=10)
+
+    assert cluster_ids == ["u1"]  # a2(u2)は現在の行がsuppressed_duplicateなので除外される
 
 
 def test_select_cluster_important_article_becomes_publish_candidate():
