@@ -31,6 +31,7 @@ import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import feedparser
@@ -691,6 +692,163 @@ def _fetch_with_zyte(url: str, proxies: dict, verify: bool, force_browser: bool 
     return html, final_url, status_code, raw_content
 
 
+# ─── TinyFish（Zyteが失敗した場合の追加フォールバック、2026-10-09） ──────────
+# PoC(scripts/tinyfish_poc/, scripts/zyte_poc/)での検証結果: Bot対策で失敗していた
+# 52件の実対象に対し、Zyte・TinyFishともに単独で98.1%(51/52)を解決できたが、
+# 「通常クロール→Zyte→TinyFish Fetch→TinyFish Agent」の順でチェーンさせると
+# 52/52(100%)を解決でき、かつ最もコストの高いAgentが必要だったのは1件のみだった。
+# Zyteは1リクエスト$0.0001〜0.016程度と極めて安価なため、TinyFishは「Zyteも
+# 失敗した場合の保険」という位置づけとする（コスト最適化目的ではなく冗長性目的）。
+TINYFISH_FETCH_URL = "https://api.fetch.tinyfish.ai"
+TINYFISH_AGENT_URL = "https://agent.tinyfish.ai/v1/automation/run-sse"
+TINYFISH_FETCH_TIMEOUT = 60
+TINYFISH_AGENT_TIMEOUT = 600  # Agentは自然言語タスク実行のため数分かかることがある
+TINYFISH_AGENT_GOAL = "Extract the main article title and the full body text of this page. Return as plain text."
+# 1回の実行(=1日分のバッチ)でAgentを呼び出せる上限。暴走防止の安全弁（適当値、
+# 実運用の呼び出し頻度を見ながら調整する）
+TINYFISH_AGENT_RUN_CAP = 10
+_tinyfish_api_key_cache = None
+_tinyfish_agent_call_count = 0
+
+
+def _get_tinyfish_api_key() -> str:
+    """config.jsonのapi_keys.tinyfishから読む（scripts/tinyfish_poc/tinyfish_test.pyと同じ規約）"""
+    global _tinyfish_api_key_cache
+    if _tinyfish_api_key_cache is None:
+        config = load_config()
+        _tinyfish_api_key_cache = config.get("api_keys", {}).get("tinyfish", "").strip()
+    return _tinyfish_api_key_cache
+
+
+def _tinyfish_agent_budget_available() -> bool:
+    return _tinyfish_agent_call_count < TINYFISH_AGENT_RUN_CAP
+
+
+def _record_tinyfish_agent_call() -> None:
+    global _tinyfish_agent_call_count
+    _tinyfish_agent_call_count += 1
+    if _tinyfish_agent_call_count == TINYFISH_AGENT_RUN_CAP:
+        print(f"[TinyFish Agent] 1回の実行あたりの上限({TINYFISH_AGENT_RUN_CAP}件)に達しました。"
+              f"以降はこの実行中エスカレーションしません。")
+
+
+def _call_tinyfish_fetch(url: str, proxies: dict, verify: bool, want_links: bool = False):
+    """TinyFish Fetch APIを1回呼び出す。(html, final_url, status_code)を返す。
+
+    Fetch自体はリンク構造を保持しない読みやすい形式のテキストしか返さないため
+    (2026-10-08、TinyFish社に確認済み。ただしlinks=Trueを指定すればページ内の
+    リンク一覧を別途取得できる)、タイトル・本文は最小限のHTMLへラップしてから返す。
+    want_links=Trueの場合は、取得したリンク一覧を<a href>として同じラップHTMLへ
+    追加し、一覧ページのリンク抽出(list_html_candidates)が既存のパース処理
+    (tree.xpath("//a/@href"))をそのまま使えるようにする。"""
+    api_key = _get_tinyfish_api_key()
+    if not api_key:
+        raise RuntimeError("TinyFish APIキーが未設定です(config.jsonのapi_keys.tinyfish)")
+    payload = {"urls": [url], "format": "markdown"}
+    if want_links:
+        payload["links"] = True
+    resp = requests.post(TINYFISH_FETCH_URL, headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+                         json=payload, proxies=proxies, verify=verify, timeout=TINYFISH_FETCH_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("results", [])
+    if not items:
+        errors = data.get("errors", [])
+        raise RuntimeError(f"TinyFish Fetch: 取得失敗({errors[0] if errors else '不明なエラー'})")
+    item = items[0]
+    final_url = item.get("final_url", url)
+    title = item.get("title", "") or ""
+    text = item.get("text", "") or ""
+    links_html = ""
+    if want_links:
+        links_html = "".join(f'<a href="{html_escape(link, quote=True)}"></a>' for link in (item.get("links") or []))
+    html = (f"<html><head><title>{html_escape(title)}</title></head>"
+            f"<body><article>{html_escape(text)}</article>{links_html}</body></html>")
+    return html, final_url, 200
+
+
+def _call_tinyfish_agent(url: str, proxies: dict, verify: bool):
+    """TinyFish Agent APIを1回呼び出す（最後の手段。1件6〜9分・従量課金のため
+    呼び出し回数はTINYFISH_AGENT_RUN_CAPで抑える）。(html, final_url, status_code)を返す。"""
+    api_key = _get_tinyfish_api_key()
+    if not api_key:
+        raise RuntimeError("TinyFish APIキーが未設定です(config.jsonのapi_keys.tinyfish)")
+    final_result = None
+    status = None
+    with requests.post(TINYFISH_AGENT_URL, headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+                       json={"url": url, "goal": TINYFISH_AGENT_GOAL}, proxies=proxies, verify=verify,
+                       timeout=TINYFISH_AGENT_TIMEOUT, stream=True) as resp:
+        resp.raise_for_status()
+        for raw_line in resp.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line[len("data:"):].strip() if raw_line.startswith("data:") else raw_line.strip()
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "COMPLETE":
+                status = event.get("status")
+                final_result = event.get("result")
+                break
+            if event.get("type") == "ERROR":
+                raise RuntimeError(f"TinyFish Agent error: {event.get('message') or event}")
+    if final_result is None:
+        raise RuntimeError(f"TinyFish Agent: 完了イベント未受信(最終status={status})")
+    text = final_result if isinstance(final_result, str) else json.dumps(final_result, ensure_ascii=False)
+    html = f"<html><body><article>{html_escape(text)}</article></body></html>"
+    return html, url, 200
+
+
+def _fetch_with_escalation(url: str, proxies: dict, verify: bool, *, start_with_zyte: bool = False,
+                            force_zyte_browser: bool = False, want_links: bool = False,
+                            allow_tinyfish_agent: bool = False):
+    """通常HTTP取得を軸に、失敗時は Zyte → TinyFish Fetch → (allow_tinyfish_agent時のみ)
+    TinyFish Agent の順に自動でエスカレーションする。(html, final_url, status_code, raw_content)を返す
+    （raw_contentはZyteのHTTPモードで取得できた場合のみ値が入る、それ以外はNone）。
+
+    明確な404(ページが存在しない)はエスカレーションしない。コストのかかる手段を
+    存在しないページに使っても無駄なため（通常取得のみで判定、Zyte/TinyFish側の
+    404はそのまま空に近い結果として返る想定で、そこから先はエスカレーションしない
+    設計にはしていない＝通常取得の時点での404だけを見る）。
+
+    start_with_zyte=Trueの場合は通常取得を省略しZyteから開始する
+    (crawl_method='Zyte'等、既に通常取得が機能しないと分かっている対象向け、
+    無駄な失敗リクエストを省く。以前からの挙動を維持)。"""
+    last_exc = None
+    if not start_with_zyte:
+        try:
+            resp = _requests_get_with_retry(url, proxies, verify, REQUEST_TIMEOUT, _HEADERS)
+            resp.raise_for_status()
+            return _decoded_html(resp), resp.url, resp.status_code, resp.content
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                raise
+            last_exc = e
+        except Exception as e:
+            last_exc = e
+
+    try:
+        html, final_url, status_code, raw_content = _fetch_with_zyte(url, proxies, verify,
+                                                                      force_browser=force_zyte_browser)
+        return html, final_url, status_code, raw_content
+    except Exception as e:
+        last_exc = e
+
+    try:
+        html, final_url, status_code = _call_tinyfish_fetch(url, proxies, verify, want_links=want_links)
+        return html, final_url, status_code, None
+    except Exception as e:
+        last_exc = e
+
+    if allow_tinyfish_agent and _tinyfish_agent_budget_available():
+        html, final_url, status_code = _call_tinyfish_agent(url, proxies, verify)
+        _record_tinyfish_agent_call()
+        return html, final_url, status_code, None
+
+    raise last_exc
+
+
 def _decoded_html(resp: requests.Response) -> str:
     """Content-TypeヘッダーにcharsetがないHTML（<meta charset>頼みのページ）では、
     requestsがHTTP仕様のデフォルトであるISO-8859-1と誤判定し文字化けすることがあるため、
@@ -749,32 +907,32 @@ def _requests_get_with_retry(url: str, proxies: dict, verify: bool, timeout: int
 
 
 def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool, use_zyte: bool = False,
-                 force_zyte_browser: bool = False):
-    """通常HTTP・ブラウザ・Zyte APIのいずれかでページを取得する。(html, final_url, status_code)を返す。
-    meta refreshによる転送(短時間のもののみ)は自動で追従する"""
-    if use_zyte:
-        html, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify, force_browser=force_zyte_browser)
-    elif use_browser:
+                 force_zyte_browser: bool = False, want_links: bool = False):
+    """通常HTTP・ブラウザ・Zyte API・TinyFishのいずれかでページを取得する。
+    (html, final_url, status_code)を返す。meta refreshによる転送(短時間のもののみ)は自動で追従する。
+
+    use_browser=Falseの場合、取得失敗時は_fetch_with_escalation()によりZyte→TinyFish Fetchへ
+    自動でエスカレーションする(2026-10-09追加)。want_links=Trueを渡すと、TinyFish Fetch経由で
+    解決した場合にページ内のリンク一覧を<a href>として埋め込んだHTMLを返す
+    (一覧ページのリンク抽出=list_html_candidates向け)。"""
+    if use_browser:
         html, final_url, status_code = _fetch_with_browser(url, proxies, verify)
     else:
-        resp = _requests_get_with_retry(url, proxies, verify, REQUEST_TIMEOUT, _HEADERS)
-        resp.raise_for_status()
-        html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
+        html, final_url, status_code, _ = _fetch_with_escalation(
+            url, proxies, verify, start_with_zyte=use_zyte, force_zyte_browser=force_zyte_browser,
+            want_links=want_links)
 
     for _ in range(META_REFRESH_MAX_HOPS):
         html, next_url, followed = _follow_meta_refresh(html, final_url)
         if not followed or next_url == final_url:
             break
         final_url = next_url
-        if use_zyte:
-            html, final_url, status_code, _ = _fetch_with_zyte(final_url, proxies, verify,
-                                                                force_browser=force_zyte_browser)
-        elif use_browser:
+        if use_browser:
             html, final_url, status_code = _fetch_with_browser(final_url, proxies, verify)
         else:
-            resp = _requests_get_with_retry(final_url, proxies, verify, REQUEST_TIMEOUT, _HEADERS)
-            resp.raise_for_status()
-            html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
+            html, final_url, status_code, _ = _fetch_with_escalation(
+                final_url, proxies, verify, start_with_zyte=use_zyte, force_zyte_browser=force_zyte_browser,
+                want_links=want_links)
     return html, final_url, status_code
 
 
@@ -820,17 +978,19 @@ def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bo
         use_zyte = False     # 文書ファイルはZyte経由でも扱わない（httpResponseBodyで代用可能だが未検証のため通常取得を使う）
 
     try:
-        if use_zyte:
-            html, final_url, status_code, raw_content = _fetch_with_zyte(url, proxies, verify)
-            content_type = ""
-        elif use_browser:
+        if use_browser:
             html, final_url, status_code = _fetch_with_browser(url, proxies, verify)
             content_type, raw_content = "", None
         else:
-            resp = _requests_get_with_retry(url, proxies, verify, REQUEST_TIMEOUT, _HEADERS)
-            resp.raise_for_status()
-            html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
-            content_type, raw_content = resp.headers.get("Content-Type", ""), resp.content
+            # 2026-10-09: 通常取得(または既存のuse_zyte指定)が失敗した場合、
+            # Zyte→TinyFish Fetch→TinyFish Agentの順に自動でエスカレーションする
+            # (記事本文取得はAgentまで許可。一覧取得list_html_candidatesとは異なり
+            # 1記事単位のため、Agentの費用・時間コストが発生しても許容範囲という判断)。
+            # content_typeはZyte/TinyFish経由で解決した場合は取得できないため空のまま
+            # (_detect_document_kindの第2判定はURL拡張子判定に委ねる)
+            html, final_url, status_code, raw_content = _fetch_with_escalation(
+                url, proxies, verify, start_with_zyte=use_zyte, allow_tinyfish_agent=True)
+            content_type = ""
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "http_status": None}
 
@@ -1024,7 +1184,7 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
     # 後から描画されるため長めの待機付きBrowser Renderingが必須なサイト向け)
     force_zyte_browser = (target.get("search_conditions") == "force_zyte_browser")
     html, final_url, status_code = _fetch_page(url, proxies, verify, use_browser, use_zyte=use_zyte,
-                                                force_zyte_browser=force_zyte_browser)
+                                                force_zyte_browser=force_zyte_browser, want_links=True)
     max_links = _target_max_links(target)
 
     tree = _safe_lxml_parse(html)
