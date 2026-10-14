@@ -8,6 +8,7 @@
 1日の処理件数が507件→233件まで減少)。全target分の失敗をまとめてから
 段階的に処理する方式に変更した。
 """
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,9 +23,12 @@ from tests._fakes import FakeSupabaseClient  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _reset_tinyfish_state(monkeypatch):
+def _reset_tinyfish_state(monkeypatch, tmp_path):
     monkeypatch.setattr(ac, "_tinyfish_api_key_cache", "dummy-tinyfish-key")
     monkeypatch.setattr(ac, "_tinyfish_agent_call_count", 0)
+    # 2026-10-14追加: ファネルログの書き出し先を実際のcache/配下ではなく
+    # テスト専用の一時ディレクトリへ向ける(本物のキャッシュを汚さないため)
+    monkeypatch.setattr(ac, "ESCALATION_FUNNEL_LOG_DIR", tmp_path / "crawl_escalation_funnel")
 
 
 # ─── _compute_run_result() ────────────────────────────────────────────
@@ -240,11 +244,19 @@ def test_escalate_pending_recovers_at_tinyfish_fetch_stage(monkeypatch):
 
     result = ac.escalate_pending([_pending_item()], client, {}, True)
 
-    assert result == {"recovered": 1, "final_failed": 0}
+    assert result["recovered"] == 1
+    assert result["final_failed"] == 0
     assert calls == ["tinyfish_fetch"]
     updated_log = client.select("crawl_logs", {"select": "*", "crawl_log_id": "eq.log-1"})[0]
     assert updated_log["new_items"] == 1
     assert updated_log["run_result"] == "成功"
+
+    # 2026-10-14追加: ファネルログがstage別の件数付きで書き出されていること
+    funnel_log = json.loads(Path(result["funnel_log_path"]).read_text(encoding="utf-8"))
+    assert funnel_log["total_pending"] == 1
+    assert funnel_log["recovered"] == 1
+    assert funnel_log["final_failed"] == 0
+    assert funnel_log["stages"] == [{"tier": "tinyfish_fetch", "attempted": 1, "extraction_ok": 1, "carried_over": 0}]
 
 
 def test_escalate_pending_falls_through_all_stages_then_fails(monkeypatch):
@@ -263,11 +275,18 @@ def test_escalate_pending_falls_through_all_stages_then_fails(monkeypatch):
     result = ac.escalate_pending([_pending_item(is_bot_block=True)], client, {}, True)
 
     assert calls == ["tinyfish_fetch", "zyte", "tinyfish_agent"]  # 順序通り全段階を経ること
-    assert result == {"recovered": 0, "final_failed": 1}
+    assert result["recovered"] == 0
+    assert result["final_failed"] == 1
     updated_log = client.select("crawl_logs", {"select": "*", "crawl_log_id": "eq.log-1"})[0]
     assert updated_log["extraction_failures"] == 1
     assert updated_log["run_result"] == "抽出失敗"
     assert updated_log["notes"] == "Bot対策検知1件"
+
+    # 2026-10-14追加: 全段階で抽出失敗(carried_over=1のまま次段へ)だったことがログに残ること
+    funnel_log = json.loads(Path(result["funnel_log_path"]).read_text(encoding="utf-8"))
+    assert [s["tier"] for s in funnel_log["stages"]] == ["tinyfish_fetch", "zyte", "tinyfish_agent"]
+    assert all(s["extraction_ok"] == 0 and s["carried_over"] == 1 for s in funnel_log["stages"])
+    assert funnel_log["bot_block_final_failed"] == 1
 
 
 def test_escalate_pending_respects_agent_budget_cap(monkeypatch):

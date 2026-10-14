@@ -32,6 +32,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import feedparser
@@ -1763,16 +1764,52 @@ def _apply_recovered_candidate(client: SupabaseClient, target: dict, cand: dict,
 ESCALATION_TIERS = ("tinyfish_fetch", "zyte", "tinyfish_agent")
 
 
+CACHE_DIR = Path(__file__).parent / "cache"
+ESCALATION_FUNNEL_LOG_DIR = CACHE_DIR / "crawl_escalation_funnel"
+
+
+def _write_escalation_funnel_log(started_at: datetime, total_pending: int, stage_stats: list,
+                                  recovered_count: int, final_failed: int, bot_block_final: int) -> str:
+    """2026-10-14追加: 各段階(TinyFish Fetch/Zyte/Agent)で何件投入し、何件が抽出成功
+    (extraction_ok)・何件を次段へ持ち越したか(carried_over)をファイルへ残す。
+    DBスキーマ変更はせず、cache/配下にJSON1ファイル/実行として書き出すだけ
+    (run_daily.py等の既存キャッシュファイルと同じ置き場所の慣習に合わせる)。
+    戻り値は書き出したファイルパス(文字列)"""
+    ESCALATION_FUNNEL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = ESCALATION_FUNNEL_LOG_DIR / f"{started_at.strftime('%Y%m%dT%H%M%S')}.json"
+    payload = {
+        "started_at": started_at.isoformat(),
+        "total_pending": total_pending,
+        "stages": stage_stats,
+        "recovered": recovered_count,
+        "final_failed": final_failed,
+        "bot_block_final_failed": bot_block_final,
+        "tinyfish_agent_calls_this_run": _tinyfish_agent_call_count,
+        "tinyfish_agent_run_cap": TINYFISH_AGENT_RUN_CAP,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
 def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verify: bool) -> dict:
     """pendingは process_target() が返した pending_escalations を全target分まとめたもの。
-    戻り値: {"recovered": 件数, "final_failed": 件数}"""
+    各段階(TinyFish Fetch/Zyte/Agent)の投入数・抽出成功数・次段への持ち越し数を
+    cache/crawl_escalation_funnel/配下へJSONログとして残す(2026-10-14追加。
+    本番実行時のファネル内訳がprint()の標準出力しか残らず、後から追えなかったため)。
+
+    戻り値: {"recovered": 件数, "final_failed": 件数, "funnel_log_path": 書き出したファイルパス}"""
+    started_at = datetime.now(timezone.utc)
+    total_pending = len(pending)
     remaining = pending
     recovered_count = 0
+    stage_stats = []
     for tier in ESCALATION_TIERS:
         if not remaining:
             break
-        print(f"\n[Pass2: {tier}] 対象{len(remaining)}件を再試行します")
+        attempted = len(remaining)
+        print(f"\n[Pass2: {tier}] 対象{attempted}件を再試行します")
         still_failed = []
+        extraction_ok = 0
         recovered_by_log = defaultdict(lambda: {"items_detected": 0, "new_items": 0, "updated_items": 0})
         for item in remaining:
             if tier == "tinyfish_agent" and not _tinyfish_agent_budget_available():
@@ -1785,6 +1822,7 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
             if not extracted.get("ok") or extracted.get("encoding_suspect"):
                 still_failed.append(item)
                 continue
+            extraction_ok += 1
             applied = _apply_recovered_candidate(client, item["target"], item["cand"], extracted,
                                                   item["lookback"])
             if applied is None:
@@ -1802,6 +1840,10 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
             update_crawl_log_after_escalation(
                 client, crawl_log_id, recovered_items_detected=agg["items_detected"],
                 recovered_new_items=agg["new_items"], recovered_updated_items=agg["updated_items"])
+        stage_stats.append({
+            "tier": tier, "attempted": attempted, "extraction_ok": extraction_ok,
+            "carried_over": len(still_failed),
+        })
         remaining = still_failed
 
     # 全段階を経ても失敗したままの候補は、ここで初めて抽出失敗として確定する
@@ -1815,9 +1857,14 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
         update_crawl_log_after_escalation(client, crawl_log_id, final_failures=fail_count,
                                            bot_block_detections=bot_block_by_log.get(crawl_log_id, 0))
 
+    bot_block_final = sum(bot_block_by_log.values())
+    funnel_log_path = _write_escalation_funnel_log(
+        started_at, total_pending, stage_stats, recovered_count, len(remaining), bot_block_final)
+
     print(f"\nPass2完了: 救済{recovered_count}件 / 最終的に失敗{len(remaining)}件"
-          f"(うちBot対策検知{sum(bot_block_by_log.values())}件)")
-    return {"recovered": recovered_count, "final_failed": len(remaining)}
+          f"(うちBot対策検知{bot_block_final}件)")
+    print(f"ファネルログ: {funnel_log_path}")
+    return {"recovered": recovered_count, "final_failed": len(remaining), "funnel_log_path": funnel_log_path}
 
 
 # ─── Bot対策検知によるクロール先の自動降格 ───────────────────────────
