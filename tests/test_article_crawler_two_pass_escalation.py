@@ -291,3 +291,164 @@ def test_escalate_pending_respects_agent_budget_cap(monkeypatch):
 
     assert len(agent_calls) <= 1
     assert result["final_failed"] == 2
+
+
+# ─── _fetch_with_escalation(allow_escalation=False): 一覧取得用の「1回だけ試す」モード ──
+# 2026-10-14追加: 一覧取得(list_html_candidates/list_rss_candidates)がPass1では常にフル
+# エスカレーション(Zyte→TinyFish Fetch)していたことが、HTML方式+32%/RSS方式+13%の
+# 1targetあたり処理時間増加の原因だったと判明したため、「本来の手段を1回だけ試して
+# 失敗ならその場で諦める」モードを追加した
+def test_fetch_with_escalation_allow_escalation_false_raises_without_zyte_fallback(monkeypatch):
+    monkeypatch.setattr(ac, "_requests_get_with_retry",
+                         lambda *a, **k: (_ for _ in ()).throw(ac.requests.exceptions.ConnectionError("boom")))
+    zyte_mock = MagicMock(side_effect=AssertionError("allow_escalation=FalseならZyteは呼ばれないはず"))
+    monkeypatch.setattr(ac, "_fetch_with_zyte", zyte_mock)
+
+    with pytest.raises(ac.requests.exceptions.ConnectionError):
+        ac._fetch_with_escalation("https://example.com/list", {}, True, allow_escalation=False)
+    zyte_mock.assert_not_called()
+
+
+def test_fetch_with_escalation_allow_escalation_false_start_with_zyte_tries_only_zyte(monkeypatch):
+    """crawl_method='Zyte'等(start_with_zyte=True)でallow_escalation=Falseの場合、
+    最初からZyteを1回試すだけで、それが失敗してもTinyFishへはエスカレーションしないこと"""
+    zyte_mock = MagicMock(side_effect=RuntimeError("zyte failed"))
+    monkeypatch.setattr(ac, "_fetch_with_zyte", zyte_mock)
+    tf_mock = MagicMock(side_effect=AssertionError("allow_escalation=FalseならTinyFishは呼ばれないはず"))
+    monkeypatch.setattr(ac, "_call_tinyfish_fetch", tf_mock)
+
+    with pytest.raises(RuntimeError):
+        ac._fetch_with_escalation("https://example.com/list", {}, True,
+                                   start_with_zyte=True, allow_escalation=False)
+    zyte_mock.assert_called_once()
+    tf_mock.assert_not_called()
+
+
+def test_fetch_with_escalation_allow_escalation_true_still_chains_as_before(monkeypatch):
+    """allow_escalation未指定(デフォルトTrue)の場合は既存通りZyte→TinyFishへ連鎖すること(非回帰)"""
+    monkeypatch.setattr(ac, "_requests_get_with_retry",
+                         lambda *a, **k: (_ for _ in ()).throw(ac.requests.exceptions.ConnectionError("boom")))
+    monkeypatch.setattr(ac, "_fetch_with_zyte", MagicMock(side_effect=RuntimeError("zyte failed")))
+    monkeypatch.setattr(ac, "_call_tinyfish_fetch",
+                         lambda *a, **k: ("<html>recovered</html>", "https://example.com/list", 200))
+
+    html, final_url, status_code, raw = ac._fetch_with_escalation("https://example.com/list", {}, True)
+
+    assert html == "<html>recovered</html>"
+
+
+# ─── list_html_candidates()/list_rss_candidates(): allow_escalationの伝播 ──────
+def test_list_html_candidates_passes_allow_escalation_false_through(monkeypatch):
+    spy = MagicMock(return_value=("<html></html>", "https://example.com/news", 200, None))
+    monkeypatch.setattr(ac, "_fetch_with_escalation", spy)
+    target = {"target_url": "https://example.com/news", "domain": "example.com",
+              "include_paths": "", "exclude_paths": "", "search_conditions": ""}
+
+    ac.list_html_candidates(target, {}, True, allow_escalation=False)
+
+    assert spy.call_args.kwargs["allow_escalation"] is False
+
+
+def test_list_rss_candidates_allow_escalation_false_does_not_fallback_to_zyte(monkeypatch):
+    def fake_requests_get(*a, **k):
+        raise ac.requests.exceptions.RequestException("boom")
+
+    monkeypatch.setattr(ac.requests, "get", fake_requests_get)
+    zyte_mock = MagicMock(side_effect=AssertionError("allow_escalation=FalseならZyteは呼ばれないはず"))
+    monkeypatch.setattr(ac, "_fetch_with_zyte", zyte_mock)
+    target = {"target_url": "https://example.com/rss"}
+
+    with pytest.raises(ac.requests.exceptions.RequestException):
+        ac.list_rss_candidates(target, {}, True, allow_escalation=False)
+    zyte_mock.assert_not_called()
+
+
+# ─── process_target(): 一覧取得自体の失敗(非404)はpending_listing_escalationへ ──
+def _rss_target(**overrides):
+    target = {
+        "crawl_target_id": "t1", "crawl_method": "RSS",
+        "target_url": "https://example.com/rss", "target_name": "Example", "publisher_name": "Example",
+        "lookback_days": 36500,
+    }
+    target.update(overrides)
+    return target
+
+
+def test_process_target_defers_non_404_listing_failure(monkeypatch):
+    client = FakeSupabaseClient({})
+    monkeypatch.setattr(ac, "list_rss_candidates",
+                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("listing boom")))
+
+    summary = ac.process_target(_rss_target(), client, {}, True)
+
+    assert summary["pending_escalations"] == []
+    assert summary["pending_listing_escalation"] is not None
+    assert summary["pending_listing_escalation"]["crawl_log_id"] == summary["crawl_log_id"]
+    assert summary["run_result"] == "更新なし"
+    # Pass1時点では暫定行(件数0)が保存されていること
+    saved = client.select("crawl_logs", {"select": "*", "crawl_log_id": f"eq.{summary['crawl_log_id']}"})[0]
+    assert saved["items_detected"] == 0 and saved["new_items"] == 0
+
+
+def test_process_target_listing_404_still_fails_immediately(monkeypatch):
+    """一覧取得自体が明確な404の場合は、以前通りPass2へ回さずその場で失敗確定すること(非回帰)"""
+    client = FakeSupabaseClient({})
+    resp = MagicMock(status_code=404)
+    err = ac.requests.exceptions.HTTPError(response=resp)
+    monkeypatch.setattr(ac, "list_rss_candidates", lambda *a, **k: (_ for _ in ()).throw(err))
+
+    summary = ac.process_target(_rss_target(), client, {}, True)
+
+    assert summary.get("pending_listing_escalation") is None
+    assert summary["run_result"] == "失敗"
+
+
+# ─── escalate_pending_listings(): 一覧取得をフルエスカレーション許可で再試行 ──
+def test_escalate_pending_listings_recovers_and_merges_article_escalations(monkeypatch):
+    """一覧取得の再試行が成功した場合、暫定行をUPDATEで上書きし、新たに判明した
+    記事単位の失敗(非404)をpending_escalationsとして返す(=通常のescalate_pending()へ
+    合流させるため)"""
+    client = FakeSupabaseClient({"crawl_logs": [
+        {"crawl_log_id": "log-1", "crawl_target_id": "t1", "items_detected": 0, "new_items": 0,
+         "updated_items": 0, "extraction_failures": 0, "error_message": None, "notes": None},
+    ]})
+    candidates = [{"url": "https://example.com/a", "title": "記事A", "published_at": None}]
+    monkeypatch.setattr(ac, "list_rss_candidates", lambda *a, **k: (candidates, 200))
+    monkeypatch.setattr(ac, "extract_article",
+                         lambda *a, **k: {"ok": False, "error": "Bot対策検知", "http_status": 403})
+
+    pending_listings = [{
+        "target": _rss_target(crawl_target_id="t1"), "crawl_log_id": "log-1",
+        "lookback": 36500, "started_at": datetime.now(timezone.utc),
+    }]
+    merged = ac.escalate_pending_listings(pending_listings, client, {}, True)
+
+    assert len(merged) == 1
+    assert merged[0]["crawl_log_id"] == "log-1"
+    assert merged[0]["is_bot_block"] is True
+    updated_log = client.select("crawl_logs", {"select": "*", "crawl_log_id": "eq.log-1"})[0]
+    assert updated_log["error_message"] is None  # 一覧取得自体は成功している
+
+
+def test_escalate_pending_listings_still_failing_marks_log_as_failed(monkeypatch):
+    client = FakeSupabaseClient({"crawl_logs": [
+        {"crawl_log_id": "log-1", "crawl_target_id": "t1", "items_detected": 0, "new_items": 0,
+         "updated_items": 0, "extraction_failures": 0, "error_message": None, "notes": None},
+    ]})
+    monkeypatch.setattr(ac, "list_rss_candidates",
+                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("still down")))
+
+    pending_listings = [{
+        "target": _rss_target(crawl_target_id="t1"), "crawl_log_id": "log-1",
+        "lookback": 36500, "started_at": datetime.now(timezone.utc),
+    }]
+    merged = ac.escalate_pending_listings(pending_listings, client, {}, True)
+
+    assert merged == []
+    updated_log = client.select("crawl_logs", {"select": "*", "crawl_log_id": "eq.log-1"})[0]
+    assert updated_log["run_result"] == "失敗"
+    assert "still down" in updated_log["error_message"]
+
+
+def test_escalate_pending_listings_empty_input_is_noop():
+    assert ac.escalate_pending_listings([], None, {}, True) == []
