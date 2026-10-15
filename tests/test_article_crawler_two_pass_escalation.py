@@ -452,3 +452,143 @@ def test_escalate_pending_listings_still_failing_marks_log_as_failed(monkeypatch
 
 def test_escalate_pending_listings_empty_input_is_noop():
     assert ac.escalate_pending_listings([], None, {}, True) == []
+
+
+# ─── crawl_method='Zyte'/'JSON API': Pass1では一切試行せずPass2へ丸ごと回送 ──────
+# 2026-10-15追加: これらのtargetは通常のHTTP取得が機能しないと既に分かっているため、
+# Pass1で同期的にZyteを呼ぶのをやめ、即座にPass2(TinyFish Fetch→Zyte→Agent)へ回送する。
+# 以前は記事数の多いtarget(例: McKinsey)で一覧取得+全記事のZyte呼び出しが合計85分に
+# 達し、Pass1全体の進行を圧迫していた
+def _zyte_method_target(**overrides):
+    target = {
+        "crawl_target_id": "t1", "crawl_method": "Zyte", "endpoint_type": "ニュース・一覧ページ",
+        "target_url": "https://example.com/news", "target_name": "Example", "publisher_name": "Example",
+        "lookback_days": 36500,
+    }
+    target.update(overrides)
+    return target
+
+
+def test_process_target_defers_zyte_method_without_any_fetch_attempt(monkeypatch):
+    """crawl_method='Zyte'はPass1で一覧取得・記事取得とも一切呼ばれず、
+    即座にpending_listing_escalationへ回送されること"""
+    client = FakeSupabaseClient({})
+    listing_mock = MagicMock(side_effect=AssertionError("Pass1で一覧取得が呼ばれないはず"))
+    monkeypatch.setattr(ac, "list_html_candidates", listing_mock)
+    extract_mock = MagicMock(side_effect=AssertionError("Pass1で記事取得が呼ばれないはず"))
+    monkeypatch.setattr(ac, "extract_article", extract_mock)
+
+    summary = ac.process_target(_zyte_method_target(), client, {}, True)
+
+    listing_mock.assert_not_called()
+    extract_mock.assert_not_called()
+    assert summary["pending_escalations"] == []
+    assert summary["pending_listing_escalation"]["tiers"] == ("tinyfish_fetch", "zyte", "tinyfish_agent")
+    assert summary["run_result"] == "更新なし"
+
+
+def test_process_target_defers_json_api_method_with_zyte_first_tiers(monkeypatch):
+    """crawl_method='JSON API'も同様にPass1で回送されるが、tier順は
+    tinyfish_fetchを含まない("zyte", "tinyfish_agent")であること
+    (TinyFish FetchはJSON構造を保持できないため)"""
+    client = FakeSupabaseClient({})
+    monkeypatch.setattr(ac, "list_json_api_candidates",
+                         MagicMock(side_effect=AssertionError("Pass1で一覧取得が呼ばれないはず")))
+
+    target = _zyte_method_target(crawl_method="JSON API", endpoint_type="")
+    summary = ac.process_target(target, client, {}, True)
+
+    assert summary["pending_listing_escalation"]["tiers"] == ("zyte", "tinyfish_agent")
+
+
+# ─── _resolve_tiered_listing(): tier順に試して最初の成功を返す ──────────────
+def test_resolve_tiered_listing_returns_first_successful_tier(monkeypatch):
+    def fake_list_with_tier(target, proxies, verify, tier):
+        if tier == "tinyfish_fetch":
+            return [], 200, False, "RuntimeError: still blocked", False
+        return [{"url": "https://example.com/a", "title": None, "published_at": None}], 200, False, None, False
+
+    monkeypatch.setattr(ac, "_list_candidates_with_tier", fake_list_with_tier)
+
+    resolved_tier, candidates, http_status, single_page_mode, error_message, is_404 = \
+        ac._resolve_tiered_listing(_zyte_method_target(), {}, True, ("tinyfish_fetch", "zyte", "tinyfish_agent"))
+
+    assert resolved_tier == "zyte"
+    assert len(candidates) == 1
+    assert error_message is None
+
+
+def test_resolve_tiered_listing_returns_none_when_all_tiers_fail(monkeypatch):
+    monkeypatch.setattr(ac, "_list_candidates_with_tier",
+                         lambda target, proxies, verify, tier: ([], None, False, f"{tier} failed", False))
+
+    resolved_tier, candidates, http_status, single_page_mode, error_message, is_404 = \
+        ac._resolve_tiered_listing(_zyte_method_target(), {}, True, ("tinyfish_fetch", "zyte"))
+
+    assert resolved_tier is None
+    assert "zyte failed" in error_message  # 最後に試した段階のエラーが残ること
+
+
+# ─── escalate_pending_listings(): "tiers"指定時はtier順で一覧取得→記事取得へ使い回す ──
+def test_escalate_pending_listings_with_tiers_resolves_and_reuses_tier_for_articles(monkeypatch):
+    """一覧取得がzyte段階で成功した場合、各候補の記事取得もtier="zyte"で
+    呼ばれること(use_browser/use_zyteではなくtier指定の呼び出しになること)"""
+    client = FakeSupabaseClient({"crawl_logs": [
+        {"crawl_log_id": "log-1", "crawl_target_id": "t1", "items_detected": 0, "new_items": 0,
+         "updated_items": 0, "extraction_failures": 0, "error_message": None, "notes": None},
+    ]})
+    candidates = [{"url": "https://example.com/a", "title": None, "published_at": None}]
+
+    def fake_list_with_tier(target, proxies, verify, tier):
+        if tier == "tinyfish_fetch":
+            return [], 200, False, "still blocked", False
+        return candidates, 200, False, None, False
+
+    monkeypatch.setattr(ac, "_list_candidates_with_tier", fake_list_with_tier)
+    monkeypatch.setattr(ac, "save_article", lambda *a, **k: (True, True))
+    extract_calls = []
+
+    def fake_extract_article(url, proxies, verify, use_browser=False, use_zyte=False, tier=None):
+        extract_calls.append({"use_browser": use_browser, "use_zyte": use_zyte, "tier": tier})
+        return _ok_extracted()
+
+    monkeypatch.setattr(ac, "extract_article", fake_extract_article)
+
+    pending_listings = [{
+        "target": _zyte_method_target(crawl_target_id="t1"), "crawl_log_id": "log-1",
+        "lookback": 36500, "started_at": datetime.now(timezone.utc),
+        "tiers": ("tinyfish_fetch", "zyte", "tinyfish_agent"),
+    }]
+    merged = ac.escalate_pending_listings(pending_listings, client, {}, True)
+
+    assert merged == []  # 記事取得は成功したので記事単位の再試行要求は無い
+    assert extract_calls == [{"use_browser": False, "use_zyte": False, "tier": "zyte"}]
+    updated_log = client.select("crawl_logs", {"select": "*", "crawl_log_id": "eq.log-1"})[0]
+    assert updated_log["new_items"] == 1
+
+
+def test_escalate_pending_listings_with_tiers_all_fail_marks_log_failed(monkeypatch):
+    client = FakeSupabaseClient({"crawl_logs": [
+        {"crawl_log_id": "log-1", "crawl_target_id": "t1", "items_detected": 0, "new_items": 0,
+         "updated_items": 0, "extraction_failures": 0, "error_message": None, "notes": None},
+    ]})
+    monkeypatch.setattr(ac, "_list_candidates_with_tier",
+                         lambda target, proxies, verify, tier: ([], None, False, f"{tier} failed", False))
+
+    pending_listings = [{
+        "target": _zyte_method_target(crawl_target_id="t1"), "crawl_log_id": "log-1",
+        "lookback": 36500, "started_at": datetime.now(timezone.utc),
+        "tiers": ("tinyfish_fetch", "zyte", "tinyfish_agent"),
+    }]
+    merged = ac.escalate_pending_listings(pending_listings, client, {}, True)
+
+    assert merged == []
+    updated_log = client.select("crawl_logs", {"select": "*", "crawl_log_id": "eq.log-1"})[0]
+    assert updated_log["run_result"] == "失敗"
+
+
+# ─── list_json_api_candidates(tier=...): tinyfish_fetchは非対応 ───────────────
+def test_list_json_api_candidates_rejects_tinyfish_fetch_tier():
+    with pytest.raises(ValueError):
+        ac.list_json_api_candidates(_zyte_method_target(crawl_method="JSON API"), {}, True,
+                                     tier="tinyfish_fetch")
