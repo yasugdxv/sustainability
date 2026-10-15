@@ -2155,7 +2155,19 @@ def downgrade_bot_blocked_targets(client: SupabaseClient, targets: list) -> None
 
 
 # ─── メイン ───────────────────────────────────────────────────────
-def main(limit: int = None, methods=SUPPORTED_METHODS):
+def _get_today_attempted_target_ids(client: SupabaseClient) -> set:
+    """本日(UTC 00:00以降)既にcrawl_logsへ行が保存されたcrawl_target_idの集合を返す。
+    2026-10-15追加: 日次バッチを複数回のチャンクに分けて実行する(run_daily.py参照)際、
+    前のチャンクで既に試行済みのtargetを除外して「残り」だけを次のチャンクに回すために使う"""
+    today_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00+00:00")
+    rows = client.select("crawl_logs", {"select": "crawl_target_id", "started_at": f"gte.{today_start}"})
+    return {r["crawl_target_id"] for r in rows}
+
+
+def main(limit: int = None, methods=SUPPORTED_METHODS, skip_today_attempted: bool = False):
+    """skip_today_attempted=Trueの場合、本日既にcrawl_logsへ記録済みのtargetを除外してから
+    limitを適用する(run_daily.pyがチャンク単位で繰り返し呼び出す際の「残りだけ処理する」用。
+    2026-10-15追加。デフォルトFalseのため、手動実行やテストでの既存の挙動は変わらない)"""
     config = load_config()
     proxies = make_proxies(config)
     verify = config.get("ssl", {}).get("verify", True)
@@ -2165,6 +2177,11 @@ def main(limit: int = None, methods=SUPPORTED_METHODS):
         "select": "*",
         "crawl_method": f"in.({','.join(methods)})",
     })
+    if skip_today_attempted:
+        attempted_ids = _get_today_attempted_target_ids(client)
+        before = len(targets)
+        targets = [t for t in targets if t["crawl_target_id"] not in attempted_ids]
+        print(f"本日試行済み{before - len(targets)}件を除外（残り{len(targets)}件）")
     if limit:
         targets = targets[:limit]
 
@@ -2209,5 +2226,10 @@ def main(limit: int = None, methods=SUPPORTED_METHODS):
 
 
 if __name__ == "__main__":
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else None
-    main(limit=n)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("limit", nargs="?", type=int, default=None)
+    parser.add_argument("--resume", action="store_true",
+                         help="本日(UTC)既に試行済みのtargetをスキップする（run_daily.pyのチャンク実行用）")
+    args = parser.parse_args()
+    main(limit=args.limit, skip_today_attempted=args.resume)
