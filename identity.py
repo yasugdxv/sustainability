@@ -15,7 +15,7 @@ principalを解決する手段が現時点で存在せず、常にfail-closed（
 開発時のみ、環境変数で明示的に有効化されたDEV AUTHモードに限り、環境変数由来の
 FakePrincipalを使うことができる。
 
-呼び出し側（sustainability_expert_dashboard.py / sustainability_expert_api.py）は、
+呼び出し側（api_server.py / sustainability_expert_api.py）は、
 resolve_principal() で得たAuthenticatedPrincipal.user_idを、既存のreviewer_id列に
 書き込む値としてそのまま使う（DBスキーマは変更しない。reviewer_id列自体は残し、
 その「値の出どころ」だけを自由記述からprincipal.user_idへ切り替える）。

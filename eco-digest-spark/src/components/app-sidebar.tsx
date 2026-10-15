@@ -7,6 +7,7 @@ import {
   Leaf,
   LayoutDashboard,
   Building2,
+  Mail,
   ChevronRight,
   ChevronDown,
 } from "lucide-react";
@@ -167,6 +168,56 @@ export function AppSidebar() {
                   <Link to={COMPETITOR_COMPANIES_URL} className="flex items-center gap-2">
                     <Building2 />
                     <span>{t("nav.competitorCompanies")}</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+
+        <SidebarGroup>
+          <SidebarGroupLabel className="text-[10px] uppercase tracking-[0.18em] text-sidebar-foreground/50">
+            メールレビュー
+          </SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={pathname === "/review/weekly"}>
+                  <Link to="/review/weekly" className="flex items-center gap-2">
+                    <Mail />
+                    <span>週次メール</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={pathname === "/review/daily"}>
+                  <Link to="/review/daily" className="flex items-center gap-2">
+                    <Mail />
+                    <span>競合日次ダイジェスト</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={pathname === "/review/monthly"}>
+                  <Link to="/review/monthly" className="flex items-center gap-2">
+                    <Mail />
+                    <span>競合月次レポート</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={pathname === "/review/candidates"}>
+                  <Link to="/review/candidates" className="flex items-center gap-2">
+                    <Mail />
+                    <span>競合クロール候補管理</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={pathname === "/review/questions"}>
+                  <Link to="/review/questions" className="flex items-center gap-2">
+                    <Mail />
+                    <span>戦略質問・組織判断</span>
                   </Link>
                 </SidebarMenuButton>
               </SidebarMenuItem>

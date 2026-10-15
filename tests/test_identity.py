@@ -129,16 +129,20 @@ def test_audit_reviewer_id_returns_principal_user_id_only():
     assert identity.audit_reviewer_id(principal) == "dev.kimura"
 
 
-# ─── (11) Streamlit: 自由記述reviewer_id入力欄がアイデンティティの出所から除外されている ──
-def test_dashboard_source_excludes_free_text_reviewer_id_from_identity():
-    """sustainability_expert_dashboard.py が、"レビュー担当者ID"自由記述入力の値を
-    reviewer_id/reviewed_byとしてバックエンドに渡していないことをソースレベルで確認する
-    （Baseline v1 pmo-002/007/008の再発防止）。Streamlit自体を起動せずに確認できるよう、
-    ソースの静的検査のみを行う。"""
-    src = (Path(__file__).parent.parent / "sustainability_expert_dashboard.py").read_text(encoding="utf-8")
-    assert 'st.text_input("レビュー担当者ID"' not in src
+# ─── (11) レビューAPI: 自由記述reviewer_idがアイデンティティの出所から除外されている ──
+def test_review_api_source_excludes_free_text_reviewer_id_from_identity():
+    """api_server.py（Reactレビュー画面のバックエンド）が、リクエストボディの自由記述を
+    reviewer_id/reviewed_byとして渡していないことをソースレベルで確認する
+    （Baseline v1 pmo-002/007/008の再発防止）。旧Streamlit画面（廃止）の同趣旨テストの移行版。
+    APIサーバーを起動せずに確認できるよう、ソースの静的検査のみを行う。"""
+    src = (Path(__file__).parent.parent / "api_server.py").read_text(encoding="utf-8")
     assert 'reviewer_id or "unknown"' not in src
-    assert "_authorize_reviewer_action" in src
+    # 承認・却下の担当者IDは、認証済みprincipalからのみ導出する
+    assert "identity.audit_reviewer_id(principal)" in src
+    assert "identity.can_approve(principal)" in src
+    # リクエストボディにreviewerIdのような自己申告フィールドを持たせていない
+    assert "reviewerId:" not in src.split("class ReviewActionBody")[1].split("def ")[0]
+    assert "reviewerId:" not in src.split("class WeeklyReviewBody")[1].split("def ")[0]
 
 
 if __name__ == "__main__":

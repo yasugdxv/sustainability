@@ -629,7 +629,7 @@ def build_draft(report_month: str = None) -> str:
     save_report_items(client, report["report_id"], companies_data)
 
     print(f"ドラフトを保存しました（report_id={report['report_id']}, status=GENERATED）。"
-          f"送信は行いません。sustainability_expert_dashboard.py でレビュー・承認してください。")
+          f"送信は行いません。フロントエンドの「メールレビュー」画面でレビュー・承認してください。")
     return report["report_id"]
 
 

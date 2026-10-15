@@ -19,6 +19,11 @@ import { Route as CompetitorsCompaniesRouteImport } from './routes/competitors.c
 import { Route as CompetitorsInitiativesRouteImport } from './routes/competitors.initiatives'
 import { Route as CompetitorsOverviewRouteImport } from './routes/competitors.overview'
 import { Route as CompetitorsTargetsRouteImport } from './routes/competitors.targets'
+import { Route as ReviewCandidatesRouteImport } from './routes/review.candidates'
+import { Route as ReviewDailyRouteImport } from './routes/review.daily'
+import { Route as ReviewMonthlyRouteImport } from './routes/review.monthly'
+import { Route as ReviewQuestionsRouteImport } from './routes/review.questions'
+import { Route as ReviewWeeklyRouteImport } from './routes/review.weekly'
 import { Route as CompetitorsCompaniesCompanyIdRouteImport } from './routes/competitors.companies.$companyId'
 import { Route as CompetitorsInitiativesIdRouteImport } from './routes/competitors.initiatives.$id'
 
@@ -72,6 +77,31 @@ const CompetitorsTargetsRoute = CompetitorsTargetsRouteImport.update({
   path: '/competitors/targets',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ReviewCandidatesRoute = ReviewCandidatesRouteImport.update({
+  id: '/review/candidates',
+  path: '/review/candidates',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ReviewDailyRoute = ReviewDailyRouteImport.update({
+  id: '/review/daily',
+  path: '/review/daily',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ReviewMonthlyRoute = ReviewMonthlyRouteImport.update({
+  id: '/review/monthly',
+  path: '/review/monthly',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ReviewQuestionsRoute = ReviewQuestionsRouteImport.update({
+  id: '/review/questions',
+  path: '/review/questions',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ReviewWeeklyRoute = ReviewWeeklyRouteImport.update({
+  id: '/review/weekly',
+  path: '/review/weekly',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const CompetitorsCompaniesCompanyIdRoute =
   CompetitorsCompaniesCompanyIdRouteImport.update({
     id: '/$companyId',
@@ -96,6 +126,11 @@ export interface FileRoutesByFullPath {
   '/competitors/initiatives': typeof CompetitorsInitiativesRouteWithChildren
   '/competitors/overview': typeof CompetitorsOverviewRoute
   '/competitors/targets': typeof CompetitorsTargetsRoute
+  '/review/candidates': typeof ReviewCandidatesRoute
+  '/review/daily': typeof ReviewDailyRoute
+  '/review/monthly': typeof ReviewMonthlyRoute
+  '/review/questions': typeof ReviewQuestionsRoute
+  '/review/weekly': typeof ReviewWeeklyRoute
   '/competitors/companies/$companyId': typeof CompetitorsCompaniesCompanyIdRoute
   '/competitors/initiatives/$id': typeof CompetitorsInitiativesIdRoute
 }
@@ -110,6 +145,11 @@ export interface FileRoutesByTo {
   '/competitors/initiatives': typeof CompetitorsInitiativesRouteWithChildren
   '/competitors/overview': typeof CompetitorsOverviewRoute
   '/competitors/targets': typeof CompetitorsTargetsRoute
+  '/review/candidates': typeof ReviewCandidatesRoute
+  '/review/daily': typeof ReviewDailyRoute
+  '/review/monthly': typeof ReviewMonthlyRoute
+  '/review/questions': typeof ReviewQuestionsRoute
+  '/review/weekly': typeof ReviewWeeklyRoute
   '/competitors/companies/$companyId': typeof CompetitorsCompaniesCompanyIdRoute
   '/competitors/initiatives/$id': typeof CompetitorsInitiativesIdRoute
 }
@@ -125,6 +165,11 @@ export interface FileRoutesById {
   '/competitors/initiatives': typeof CompetitorsInitiativesRouteWithChildren
   '/competitors/overview': typeof CompetitorsOverviewRoute
   '/competitors/targets': typeof CompetitorsTargetsRoute
+  '/review/candidates': typeof ReviewCandidatesRoute
+  '/review/daily': typeof ReviewDailyRoute
+  '/review/monthly': typeof ReviewMonthlyRoute
+  '/review/questions': typeof ReviewQuestionsRoute
+  '/review/weekly': typeof ReviewWeeklyRoute
   '/competitors/companies/$companyId': typeof CompetitorsCompaniesCompanyIdRoute
   '/competitors/initiatives/$id': typeof CompetitorsInitiativesIdRoute
 }
@@ -141,6 +186,11 @@ export interface FileRouteTypes {
     | '/competitors/initiatives'
     | '/competitors/overview'
     | '/competitors/targets'
+    | '/review/candidates'
+    | '/review/daily'
+    | '/review/monthly'
+    | '/review/questions'
+    | '/review/weekly'
     | '/competitors/companies/$companyId'
     | '/competitors/initiatives/$id'
   fileRoutesByTo: FileRoutesByTo
@@ -155,6 +205,11 @@ export interface FileRouteTypes {
     | '/competitors/initiatives'
     | '/competitors/overview'
     | '/competitors/targets'
+    | '/review/candidates'
+    | '/review/daily'
+    | '/review/monthly'
+    | '/review/questions'
+    | '/review/weekly'
     | '/competitors/companies/$companyId'
     | '/competitors/initiatives/$id'
   id:
@@ -169,6 +224,11 @@ export interface FileRouteTypes {
     | '/competitors/initiatives'
     | '/competitors/overview'
     | '/competitors/targets'
+    | '/review/candidates'
+    | '/review/daily'
+    | '/review/monthly'
+    | '/review/questions'
+    | '/review/weekly'
     | '/competitors/companies/$companyId'
     | '/competitors/initiatives/$id'
   fileRoutesById: FileRoutesById
@@ -184,6 +244,11 @@ export interface RootRouteChildren {
   CompetitorsInitiativesRoute: typeof CompetitorsInitiativesRouteWithChildren
   CompetitorsOverviewRoute: typeof CompetitorsOverviewRoute
   CompetitorsTargetsRoute: typeof CompetitorsTargetsRoute
+  ReviewCandidatesRoute: typeof ReviewCandidatesRoute
+  ReviewDailyRoute: typeof ReviewDailyRoute
+  ReviewMonthlyRoute: typeof ReviewMonthlyRoute
+  ReviewQuestionsRoute: typeof ReviewQuestionsRoute
+  ReviewWeeklyRoute: typeof ReviewWeeklyRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -258,6 +323,41 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof CompetitorsTargetsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/review/candidates': {
+      id: '/review/candidates'
+      path: '/review/candidates'
+      fullPath: '/review/candidates'
+      preLoaderRoute: typeof ReviewCandidatesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/review/daily': {
+      id: '/review/daily'
+      path: '/review/daily'
+      fullPath: '/review/daily'
+      preLoaderRoute: typeof ReviewDailyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/review/monthly': {
+      id: '/review/monthly'
+      path: '/review/monthly'
+      fullPath: '/review/monthly'
+      preLoaderRoute: typeof ReviewMonthlyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/review/questions': {
+      id: '/review/questions'
+      path: '/review/questions'
+      fullPath: '/review/questions'
+      preLoaderRoute: typeof ReviewQuestionsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/review/weekly': {
+      id: '/review/weekly'
+      path: '/review/weekly'
+      fullPath: '/review/weekly'
+      preLoaderRoute: typeof ReviewWeeklyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/competitors/companies/$companyId': {
       id: '/competitors/companies/$companyId'
       path: '/$companyId'
@@ -311,6 +411,11 @@ const rootRouteChildren: RootRouteChildren = {
   CompetitorsInitiativesRoute: CompetitorsInitiativesRouteWithChildren,
   CompetitorsOverviewRoute: CompetitorsOverviewRoute,
   CompetitorsTargetsRoute: CompetitorsTargetsRoute,
+  ReviewCandidatesRoute: ReviewCandidatesRoute,
+  ReviewDailyRoute: ReviewDailyRoute,
+  ReviewMonthlyRoute: ReviewMonthlyRoute,
+  ReviewQuestionsRoute: ReviewQuestionsRoute,
+  ReviewWeeklyRoute: ReviewWeeklyRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

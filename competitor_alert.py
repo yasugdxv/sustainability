@@ -7,7 +7,7 @@ competitor_change_detector.py が保存した変更イベント(change_status='C
 判定ルール（config.json の competitor_monitoring.auto_send_confidence_threshold）:
     change_event.review_required が false かつ confidence がしきい値以上 → 自動配信
     それ以外 → competitor_alerts に alert_status='review_required' で登録し、
-              PMOレビュー（sustainability_expert_dashboard.py）を経て配信する
+              PMOレビュー（フロントエンドの「メールレビュー」画面）を経て配信する
 
 実際の送信は weekly_email_report.send_email() をそのまま再利用する（SMTP未設定時は
 プレビューHTML保存にフォールバックする既存の挙動も踏襲）。取組事例(INITIATIVE)は

@@ -986,6 +986,403 @@ def competitor_unread_count():
     return {"count": len(digests) + len(reports)}
 
 
+# ─── 週次メールレビュー（Streamlitのレビュー画面をReactへ移行） ─────────────────
+# 認証はStreamlit版と同じDEV AUTH方式（identity.resolve_principal）のまま。
+# 本番相当(DEV AUTH無効)では承認・却下・修正保存は常にfail-closedする。ロール管理は後続対応。
+import identity  # noqa: E402
+import sustainability_expert_api as expert_api  # noqa: E402
+import weekly_email_report as wer  # noqa: E402
+
+
+class WeeklyReviewBody(BaseModel):
+    status: str  # approved | rejected | review_required
+    reviewerFeedback: dict | None = None
+    draftContent: dict | None = None
+
+
+def _review_principal():
+    """(principal, error)を返す。解決できない場合principalはNone"""
+    try:
+        return identity.resolve_principal(dev_principal=identity.dev_principal_from_env()), None
+    except identity.AuthenticationError as e:
+        return None, str(e)
+
+
+def _weekly_report_to_ui(r: dict, with_body: bool = False) -> dict:
+    draft = r.get("draft_content") or {}
+    out = {
+        "id": r["report_id"],
+        "subject": r.get("subject") or "",
+        "periodStart": r.get("period_start"),
+        "periodEnd": r.get("period_end"),
+        "reviewStatus": r.get("review_status"),
+        "status": r.get("status"),
+        "errorMessage": r.get("error_message"),
+        "articleCount": len(draft.get("articles", [])),
+        "reviewerId": r.get("reviewer_id"),
+        "sendStatus": r.get("send_status"),
+    }
+    if with_body:
+        out["htmlBody"] = r.get("html_body") or ""
+        out["draftContent"] = draft
+    return out
+
+
+@app.get("/api/review/principal")
+def review_principal():
+    principal, error = _review_principal()
+    if principal is None:
+        return {"ok": False, "canApprove": False, "error": error}
+    return {"ok": True, "userId": principal.user_id, "displayName": principal.display_name,
+            "authSource": principal.authentication_source, "canApprove": identity.can_approve(principal),
+            "error": None}
+
+
+@app.get("/api/weekly-reports")
+def weekly_reports(status: str = ""):
+    rows = wer.list_reports(_competitor_client, review_status=status or None)
+    return {"reports": [_weekly_report_to_ui(r) for r in rows]}
+
+
+@app.get("/api/weekly-reports/{report_id}")
+def weekly_report_detail(report_id: str):
+    r = wer.get_report(_competitor_client, report_id)
+    if r is None:
+        raise HTTPException(status_code=404, detail="指定されたreport_idが見つかりません")
+    return _weekly_report_to_ui(r, with_body=True)
+
+
+@app.post("/api/weekly-reports/{report_id}/review")
+def weekly_report_review(report_id: str, body: WeeklyReviewBody):
+    principal, error = _review_principal()
+    if principal is None:
+        raise HTTPException(status_code=401, detail=f"認証済みレビュー担当者を解決できません（{error}）")
+    payload = {"status": body.status, "reviewer_feedback": body.reviewerFeedback}
+    if body.draftContent is not None:
+        payload["draft_content"] = body.draftContent
+    result = expert_api.review_weekly_report(report_id, payload, _config, principal=principal)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=str(result.get("error") or "処理に失敗しました"))
+    return result
+
+
+# ─── 週次ドラフト生成（旧CLI `weekly_email_report.py build` のボタン化） ─────────
+# 生成は記事ごとにLLMを呼ぶため数分かかる。リクエスト内で実行せず、別プロセスで起動し、
+# 進捗は標準出力を書き込んだログファイルとジョブ状態JSONで共有する（Gunicornの複数
+# プロセスでも状態が食い違わないよう、メモリではなくファイルで持つ）。送信は行わない。
+import json as _json  # noqa: E402
+import re as _re  # noqa: E402
+import subprocess as _subprocess  # noqa: E402
+import threading as _threading  # noqa: E402
+import uuid as _uuid  # noqa: E402
+
+_BUILD_DIR = Path(__file__).parent / "logs" / "weekly_build"
+_BUILD_STALE_SEC = 60 * 60  # 1時間以上runningのままのジョブは、プロセス消失として扱う
+
+
+class WeeklyBuildBody(BaseModel):
+    sinceDays: int | None = None
+    forceGeoRerun: bool = False
+
+
+def _build_meta_path(job_id: str) -> Path:
+    return _BUILD_DIR / f"{job_id}.json"
+
+
+def _read_build_job(job_id: str) -> dict | None:
+    try:
+        meta = _json.loads(_build_meta_path(job_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    log_path = _BUILD_DIR / f"{job_id}.log"
+    log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    if meta.get("state") == "running" and time.time() - meta.get("startedAt", 0) > _BUILD_STALE_SEC:
+        meta["state"] = "lost"
+        meta["error"] = "ジョブの状態を確認できなくなりました（プロセスが終了した可能性があります）"
+    m = _re.search(r"report_id=([0-9a-fA-F-]{36})", log)
+    meta["reportId"] = m.group(1) if m else None
+    meta["log"] = log[-4000:]
+    return meta
+
+
+def _running_build_job() -> str | None:
+    for p in _BUILD_DIR.glob("*.json") if _BUILD_DIR.exists() else []:
+        job = _read_build_job(p.stem)
+        if job and job.get("state") == "running":
+            return p.stem
+    return None
+
+
+def _run_build_job(job_id: str, cmd: list):
+    meta_path = _build_meta_path(job_id)
+    meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    try:
+        with open(_BUILD_DIR / f"{job_id}.log", "w", encoding="utf-8") as log:
+            proc = _subprocess.run(cmd, cwd=str(Path(__file__).parent), env=env,
+                                   stdout=log, stderr=_subprocess.STDOUT)
+        meta["state"] = "done" if proc.returncode == 0 else "error"
+        if proc.returncode != 0:
+            meta["error"] = f"生成プロセスが異常終了しました（終了コード {proc.returncode}）"
+    except Exception as e:  # noqa: BLE001
+        meta["state"], meta["error"] = "error", f"{type(e).__name__}: {e}"
+    meta["finishedAt"] = time.time()
+    meta_path.write_text(_json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+
+@app.post("/api/weekly-reports/build")
+def weekly_report_build(body: WeeklyBuildBody):
+    principal, error = _review_principal()
+    if principal is None:
+        raise HTTPException(status_code=401, detail=f"認証済みレビュー担当者を解決できません（{error}）")
+    running = _running_build_job()
+    if running:
+        raise HTTPException(status_code=409, detail=f"ドラフト生成が実行中です（job_id={running}）")
+    cmd = [sys.executable, "weekly_email_report.py", "build"]
+    if body.sinceDays is not None:
+        if not 1 <= body.sinceDays <= 31:
+            raise HTTPException(status_code=400, detail="sinceDaysは1〜31で指定してください")
+        cmd += ["--since-days", str(body.sinceDays)]
+    if body.forceGeoRerun:
+        cmd.append("--force-geo-rerun")
+    _BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    job_id = _uuid.uuid4().hex[:12]
+    _build_meta_path(job_id).write_text(_json.dumps({
+        "jobId": job_id, "state": "running", "startedAt": time.time(),
+        "startedBy": principal.user_id, "sinceDays": body.sinceDays, "error": None,
+    }, ensure_ascii=False), encoding="utf-8")
+    _threading.Thread(target=_run_build_job, args=(job_id, cmd), daemon=True).start()
+    return {"jobId": job_id}
+
+
+@app.get("/api/weekly-reports/build/latest")
+def weekly_report_build_latest():
+    """画面を開き直しても進行中/直近のジョブを追えるよう、最新のジョブを返す"""
+    files = sorted(_BUILD_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True) \
+        if _BUILD_DIR.exists() else []
+    return {"job": _read_build_job(files[0].stem) if files else None}
+
+
+@app.get("/api/weekly-reports/build/{job_id}")
+def weekly_report_build_status(job_id: str):
+    if not _re.fullmatch(r"[0-9a-f]{12}", job_id):
+        raise HTTPException(status_code=400, detail="不正なjob_idです")
+    job = _read_build_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="指定されたジョブが見つかりません")
+    return job
+
+
+# ─── 競合の日次ダイジェスト／月次レポートのレビュー（Streamlit画面のReact移行） ─────
+# 2種類は「一覧→本文プレビュー→承認して送信／却下」で同じ形のため、共通のUI用形式に
+# 正規化して1組のAPIで扱う。承認・却下は週次と同じくDEV AUTHのprincipalでのみ可能。
+import competitor_daily_digest as daily_digest  # noqa: E402
+import monthly_competitor_report as monthly_competitor  # noqa: E402
+
+_REVIEW_FILTERS = ("pending", "approved", "rejected", "sent")
+_MONTHLY_PENDING = ("GENERATED", "UNDER_REVIEW", "REVISION_REQUIRED")
+_MONTHLY_STATUS_MAP = {"APPROVED": "approved", "SENT": "sent", "CANCELLED": "rejected"}
+
+
+class ReviewActionBody(BaseModel):
+    action: str  # approve | reject
+    freeText: str | None = None
+
+
+def _digest_to_ui(d: dict, with_body: bool = False) -> dict:
+    status = d.get("review_status")
+    auto = bool(d.get("auto_send_eligible")) and status == "sent"
+    out = {
+        "id": d["digest_id"], "subject": d.get("subject") or "", "dateLabel": str(d.get("digest_date") or ""),
+        "status": "pending" if status == "review_required" else status,
+        "rawStatus": status, "auto": auto, "reviewable": status == "review_required",
+        "meta": f"変更イベント数: {len(d.get('change_event_ids') or [])}件　"
+                f"自動配信対象日: {'はい' if d.get('auto_send_eligible') else 'いいえ'}",
+        "reviewerId": d.get("reviewer_id"), "sendStatus": d.get("send_status"),
+    }
+    if with_body:
+        out["htmlBody"] = d.get("html_body") or ""
+    return out
+
+
+def _monthly_to_ui(r: dict, with_body: bool = False) -> dict:
+    status = r.get("status")
+    s = r.get("summary_json") or {}
+    meta = f"対象期間: {r.get('period_start', '')}〜{r.get('period_end', '')}"
+    if s:
+        meta += (f"　監視対象{s.get('monitored_companies', '—')}社　更新企業{s.get('updated_companies', '—')}社"
+                 f"　目標変更{s.get('target_change_count', '—')}件　取組{s.get('initiative_count', '—')}件")
+    out = {
+        "id": r["report_id"], "subject": r.get("subject") or "", "dateLabel": str(r.get("report_month") or ""),
+        "status": "pending" if status in _MONTHLY_PENDING else _MONTHLY_STATUS_MAP.get(status, status),
+        "rawStatus": status, "auto": False, "reviewable": status in _MONTHLY_PENDING, "meta": meta,
+        "reviewerId": r.get("reviewed_by"), "sendStatus": r.get("send_status"),
+    }
+    if with_body:
+        out["htmlBody"] = r.get("html_body") or ""
+    return out
+
+
+def _review_kind(kind: str):
+    """kind -> (一覧取得関数, 1件取得関数, 正規化関数, 承認関数, 却下関数)"""
+    if kind == "daily":
+        def get(rid):
+            rows = _competitor_client.select("competitor_daily_alert_digests", {"digest_id": f"eq.{rid}", "limit": "1"})
+            return rows[0] if rows else None
+        return (lambda: daily_digest.list_digests(_competitor_client), get, _digest_to_ui,
+                daily_digest.approve_and_send, daily_digest.reject_digest)
+    if kind == "monthly":
+        def get(rid):
+            rows = _competitor_client.select("monthly_reports", {"report_id": f"eq.{rid}", "limit": "1"})
+            return rows[0] if rows else None
+        return (lambda: monthly_competitor.list_reports(_competitor_client), get, _monthly_to_ui,
+                monthly_competitor.approve_and_send, monthly_competitor.reject_report)
+    raise HTTPException(status_code=404, detail="kindはdailyまたはmonthlyです")
+
+
+@app.get("/api/review/{kind}")
+def review_list(kind: str, filter: str = ""):
+    lister, _, to_ui, _, _ = _review_kind(kind)
+    items = [to_ui(r) for r in lister()]
+    if filter in _REVIEW_FILTERS:
+        items = [i for i in items if i["status"] == filter]
+    return {"items": items}
+
+
+@app.get("/api/review/{kind}/{item_id}")
+def review_detail(kind: str, item_id: str):
+    _, getter, to_ui, _, _ = _review_kind(kind)
+    row = getter(item_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="指定されたIDが見つかりません")
+    return to_ui(row, with_body=True)
+
+
+@app.post("/api/review/{kind}/{item_id}/action")
+def review_action(kind: str, item_id: str, body: ReviewActionBody):
+    if body.action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="actionはapproveまたはrejectです")
+    _, getter, to_ui, approve_fn, reject_fn = _review_kind(kind)
+    principal, error = _review_principal()
+    if principal is None:
+        raise HTTPException(status_code=401, detail=f"認証済みレビュー担当者を解決できません（{error}）")
+    if not identity.can_approve(principal):
+        raise HTTPException(status_code=403, detail="この操作を行う権限がありません（reviewerロールが必要です）")
+    row = getter(item_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="指定されたIDが見つかりません")
+    reviewer_id = identity.audit_reviewer_id(principal)
+    feedback = {"free_text": body.freeText or None}
+    if body.action == "approve":
+        result = approve_fn(_competitor_client, _config, item_id, reviewer_id, reviewer_feedback=feedback)
+    else:
+        result = reject_fn(_competitor_client, item_id, reviewer_id, reviewer_feedback=feedback)
+    if isinstance(result, dict) and result.get("ok") is False:
+        raise HTTPException(status_code=400, detail=str(result.get("error") or "処理に失敗しました"))
+    return {"ok": True}
+
+
+# ─── 競合クロール候補管理 / 戦略質問・組織判断ナレッジ（Streamlit画面のReact移行） ─────
+import competitor_source_discovery as source_discovery  # noqa: E402
+import strategic_question_service as sq_service  # noqa: E402
+
+_CANDIDATE_URL_TYPES = ["SUSTAINABILITY_HOME", "TARGETS", "PROGRESS", "REPORTS", "NEWS", "DISCLOSURE", "OTHER"]
+
+
+class CandidateActivateBody(BaseModel):
+    urlType: str
+
+
+def _require_review_principal():
+    """監視対象を書き換える操作は、承認操作と同じくDEV AUTHのprincipal必須にする"""
+    principal, error = _review_principal()
+    if principal is None:
+        raise HTTPException(status_code=401, detail=f"認証済みレビュー担当者を解決できません（{error}）")
+    if not identity.can_approve(principal):
+        raise HTTPException(status_code=403, detail="この操作を行う権限がありません（reviewerロールが必要です）")
+    return principal
+
+
+@app.get("/api/competitor-candidates")
+def competitor_candidates(status: str = "unconfirmed"):
+    is_active = {"unconfirmed": False, "active": True}.get(status)
+    rows = source_discovery.list_candidates(_competitor_client, is_active=is_active)
+    return {"urlTypes": _CANDIDATE_URL_TYPES, "candidates": [{
+        "id": c["candidate_id"], "url": c["url"], "pageTitle": c.get("page_title"),
+        "urlType": c.get("url_type_candidate") or "OTHER", "isActive": bool(c.get("is_active")),
+        "isCrawlable": bool(c.get("is_crawlable")), "discoveredFromSourceId": c.get("discovered_from_source_id"),
+        "lastCheckedAt": c.get("last_checked_at"),
+    } for c in rows]}
+
+
+@app.post("/api/competitor-candidates/{candidate_id}/activate")
+def competitor_candidate_activate(candidate_id: str, body: CandidateActivateBody):
+    _require_review_principal()
+    if body.urlType not in _CANDIDATE_URL_TYPES:
+        raise HTTPException(status_code=400, detail="不正な種別です")
+    result = source_discovery.activate_candidate(_competitor_client, candidate_id, body.urlType)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=str(result.get("error") or "処理に失敗しました"))
+    return {"ok": True}
+
+
+@app.post("/api/competitor-candidates/{candidate_id}/deactivate")
+def competitor_candidate_deactivate(candidate_id: str):
+    _require_review_principal()
+    result = source_discovery.deactivate_candidate(_competitor_client, candidate_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=str(result.get("error") or "処理に失敗しました"))
+    return {"ok": True}
+
+
+@app.get("/api/strategic-questions")
+def strategic_questions():
+    out = []
+    for q in sq_service.list_questions(_competitor_client):
+        agg = None
+        if q.get("question_status") in ("open", "closed"):
+            try:
+                a = sqr.aggregate_results(_competitor_client, q["question_id"])
+                agg = {"totalResponses": a["total_responses"], "deliveryCount": a["delivery_count"],
+                       "responseRate": a["response_rate"]}
+            except Exception:
+                agg = None
+        out.append({
+            "id": q["question_id"], "status": q.get("question_status"), "periodStart": q.get("period_start"),
+            "theme": q.get("theme"), "title": q.get("title"), "questionText": q.get("question_text"),
+            "dimensionLabel": q.get("decision_dimension_label"), "dimensionKey": q.get("decision_dimension_key"),
+            "insightStatus": q.get("insight_status"), "insightError": q.get("insight_error_message"),
+            "options": [{"code": o["option_code"], "label": o["label"], "description": o.get("description"),
+                         "isStatusQuo": bool(o.get("is_status_quo"))} for o in q.get("_options", [])],
+            "analysis": q.get("analysis_json") or {},
+            "candidates": {"candidates": q.get("candidates_json") or [], "rankingScore": q.get("ranking_score"),
+                           "rankingReasons": q.get("ranking_reasons") or []},
+            "aggregate": agg,
+        })
+    return {"questions": out}
+
+
+@app.get("/api/decision-insights")
+def decision_insights():
+    rows = _competitor_client.select("sustainability_decision_insights", {"select": "*", "order": "observed_at.desc"})
+    out = []
+    for ins in rows:
+        try:
+            publishable = bool(decision_insight_service.publishable(ins, _config))
+        except Exception:
+            publishable = False
+        out.append({
+            "id": ins.get("insight_id"), "theme": ins.get("theme"),
+            "dimensionLabel": ins.get("decision_dimension_label"), "observedAt": ins.get("observed_at"),
+            "responseCount": ins.get("response_count"), "deliveryCount": ins.get("delivery_count"),
+            "confidence": ins.get("confidence"), "guardrailLabel": ins.get("guardrail_label"),
+            "observedTendency": ins.get("observed_tendency"), "distribution": ins.get("distribution_json") or {},
+            "reasoningSummary": ins.get("reasoning_summary"),
+            "representativeReasoning": ins.get("representative_reasoning") or [], "publishable": publishable,
+        })
+    return {"insights": out}
+
+
 if __name__ == "__main__":
     import os
     import uvicorn
