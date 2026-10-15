@@ -58,6 +58,14 @@ _lock_suffix = os.environ.get("WEBJOBS_NAME", "default")
 LOCK_PATH = BASE / f"run_daily_{_lock_suffix}.lock"
 MAX_LOCK_AGE_HOURS = 6  # これを超えて残っているロックは前回異常終了とみなし上書きする
 
+# 2026-10-15追加: "crawl"ステップは、原因不明のまま全507target中190〜282件で
+# プロセスごと停止する事象が本番で続けて発生したため(Pythonの例外は一切残らず、
+# App Serviceのメモリ/CPUメトリックも張り付いていない＝外部要因の疑いが強いが未特定)、
+# 1回の巨大な実行ではなく下記のチャンク単位に分割して実行する(run_crawl_step_with_resume参照)。
+CRAWL_CHUNK_SIZE = 100  # 1チャンクあたりの処理target数
+CRAWL_CHUNK_TIMEOUT_SEC = 3600  # 1チャンクあたりの上限（100件なら通常はこれよりかなり短時間で終わる想定）
+CRAWL_MAX_CHUNKS = 10  # 安全装置（507件 ÷ 100件 ≈ 6チャンクで足りる想定に余裕を持たせた上限）
+
 # (ステップ名, コマンド引数, タイムアウト秒)
 STEPS = [
     ("crawl", ["article_crawler.py"], 21600),
@@ -126,6 +134,75 @@ def run_step(name: str, args: list, timeout_sec: int) -> dict:
         return {"name": name, "ok": False, "elapsed_sec": elapsed, "log_path": str(log_path), "error": error}
 
 
+def run_crawl_step_with_resume(name: str, overall_timeout_sec: int) -> dict:
+    """2026-10-15追加: "crawl"ステップ専用。CRAWL_CHUNK_SIZE件ずつの小さなチャンクに
+    分けて`article_crawler.py <件数> --resume`を繰り返し起動する。--resumeは
+    本日(UTC)既にcrawl_logsへ記録済みのtargetを自動的にスキップするため、
+    あるチャンクが(原因不明のまま)落ちても、次のチャンクがその続きから再開できる。
+
+    各チャンク終了後、そのチャンクのログに"クロール対象: 0件"が含まれていれば
+    （article_crawler.py側が残りtarget数として出力する行）本日分は完了とみなし終了する。
+    それ以外は、チャンク数の上限(CRAWL_MAX_CHUNKS)または合計経過時間の上限
+    (overall_timeout_sec、従来の単発実行時と同じ6時間)に達するまで次のチャンクを続ける。
+
+    戻り値のokは、全チャンクが正常終了(returncode=0)した場合のみTrue。
+    途中のチャンクが異常終了しても最終的に全target処理が完了していればデータの欠落は
+    無いが、原因不明の停止自体は見逃さないよう通知対象にするため、ここではFalseのままにする"""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    overall_started = time.monotonic()
+    chunk_results = []
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+    for chunk_i in range(1, CRAWL_MAX_CHUNKS + 1):
+        remaining_budget = overall_timeout_sec - (time.monotonic() - overall_started)
+        if remaining_budget <= 0:
+            print(f"[{name}] 合計タイムアウト（{overall_timeout_sec}秒）に達したため打ち切ります")
+            break
+        chunk_timeout = min(CRAWL_CHUNK_TIMEOUT_SEC, remaining_budget)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = LOG_DIR / f"{ts}_{name}_chunk{chunk_i}.log"
+        cmd = [str(PYTHON), "article_crawler.py", str(CRAWL_CHUNK_SIZE), "--resume"]
+
+        print(f"[{name}] チャンク{chunk_i}開始（上限{chunk_timeout:.0f}秒）", flush=True)
+        chunk_started = time.monotonic()
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                result = subprocess.run(cmd, cwd=BASE, stdout=f, stderr=subprocess.STDOUT,
+                                         timeout=chunk_timeout, env=env)
+            ok = result.returncode == 0
+            error = None if ok else f"returncode={result.returncode}"
+        except subprocess.TimeoutExpired:
+            ok = False
+            error = f"タイムアウト（{chunk_timeout:.0f}秒）"
+        except Exception as e:
+            ok = False
+            error = f"{type(e).__name__}: {e}"
+        chunk_elapsed = time.monotonic() - chunk_started
+        print(f"[{name}] チャンク{chunk_i} {'完了' if ok else '異常終了'}"
+              f"（{chunk_elapsed:.0f}秒） ログ: {log_path}")
+        chunk_results.append({"chunk": chunk_i, "ok": ok, "elapsed_sec": chunk_elapsed,
+                               "log_path": str(log_path), "error": error})
+
+        try:
+            chunk_log_text = log_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            chunk_log_text = ""
+        if "クロール対象: 0件" in chunk_log_text:
+            print(f"[{name}] 本日の残りtarget 0件を確認したため終了します")
+            break
+    else:
+        print(f"[{name}] チャンク数の上限（{CRAWL_MAX_CHUNKS}）に達したため打ち切ります")
+
+    total_elapsed = time.monotonic() - overall_started
+    all_ok = all(r["ok"] for r in chunk_results) if chunk_results else False
+    error = None if all_ok else "; ".join(r["error"] for r in chunk_results if not r["ok"]) or None
+    return {
+        "name": name, "ok": all_ok, "elapsed_sec": total_elapsed,
+        "log_path": "; ".join(r["log_path"] for r in chunk_results),
+        "error": error, "chunks": chunk_results,
+    }
+
+
 def notify_failures(results: list) -> None:
     failed = [r for r in results if not r["ok"]]
     if not failed:
@@ -167,7 +244,10 @@ def main():
             if name in skip:
                 print(f"[{name}] スキップ指定によりスキップ")
                 continue
-            results.append(run_step(name, step_args, timeout_sec))
+            if name == "crawl":
+                results.append(run_crawl_step_with_resume(name, timeout_sec))
+            else:
+                results.append(run_step(name, step_args, timeout_sec))
     finally:
         release_lock()
 
