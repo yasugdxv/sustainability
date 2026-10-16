@@ -1578,10 +1578,59 @@ def _compute_run_result(error_message, extraction_failures: int, new_items: int,
     return "更新なし"
 
 
+# ─── crawl_logs.notes へのファネル記録（2026-10-16追加。DBスキーマは変更しない） ───
+# 以前は、Pass1で失敗した件数(再試行待ち)も、Pass2の各段階(TinyFish Fetch/Zyte/Agent)の
+# 件数も、標準出力(チャンクログ)にしか残らず、DBから追えなかった。チャンクが時間切れで
+# 終了するとPass2まで到達しないことがあり、その場合は「Pass1で失敗したのに記録が無い」
+# 状態になっていた。notesに次の書式で追記する:
+#   [Bot対策検知N件 | ]funnel={"p1_listing_failed":1,"p1_article_failed":3,
+#                              "listing_retry":"ok","tiers":{"zyte":[試行,成功]},"final_failed":1}
+# 既存のdowngrade_bot_blocked_targets()は notes が「Bot対策検知」で始まるかを見るため、
+# Bot対策検知の表記は必ず先頭に置く。
+FUNNEL_NOTES_MARKER = "funnel="
+
+
+def _split_notes(notes) -> tuple:
+    """notesを (Bot対策検知などの先頭部分, ファネル辞書) に分ける"""
+    notes = notes or ""
+    idx = notes.find(FUNNEL_NOTES_MARKER)
+    if idx == -1:
+        return notes.strip(" |"), {}
+    prefix = notes[:idx].strip(" |")
+    try:
+        funnel = json.loads(notes[idx + len(FUNNEL_NOTES_MARKER):])
+        if not isinstance(funnel, dict):
+            funnel = {}
+    except ValueError:
+        funnel = {}
+    return prefix, funnel
+
+
+def _compose_notes(prefix: str, funnel: dict):
+    """先頭部分とファネル辞書からnotes文字列を作る（どちらも空ならNone）"""
+    parts = []
+    if prefix:
+        parts.append(prefix)
+    if funnel:
+        parts.append(FUNNEL_NOTES_MARKER + json.dumps(funnel, ensure_ascii=False, separators=(",", ":")))
+    return " | ".join(parts) if parts else None
+
+
+def _merge_funnel(existing: dict, patch: dict) -> dict:
+    """tiersは段階ごとにマージし、それ以外のキーは上書きする"""
+    merged = dict(existing)
+    for k, v in (patch or {}).items():
+        if k == "tiers":
+            merged["tiers"] = {**(existing.get("tiers") or {}), **v}
+        else:
+            merged[k] = v
+    return merged
+
+
 def update_crawl_log_after_escalation(client: SupabaseClient, crawl_log_id: str, *,
                                        recovered_items_detected: int = 0, recovered_new_items: int = 0,
                                        recovered_updated_items: int = 0, final_failures: int = 0,
-                                       bot_block_detections: int = 0) -> None:
+                                       bot_block_detections: int = 0, funnel_patch: dict = None) -> None:
     """2026-10-13追加: Pass2(escalate_pending)でのエスカレーション結果を、
     Pass1で既に保存済みのcrawl_logs行へ反映する。救済できた分は
     items_detected/new_items/updated_itemsへ加算し、最後まで失敗した分は
@@ -1607,8 +1656,13 @@ def update_crawl_log_after_escalation(client: SupabaseClient, crawl_log_id: str,
         "extraction_failures": extraction_failures,
         "run_result": run_result,
     }
+    prefix, funnel = _split_notes(row.get("notes"))
     if bot_block_detections:
-        patch["notes"] = f"Bot対策検知{bot_block_detections}件"
+        prefix = f"Bot対策検知{bot_block_detections}件"
+    if funnel_patch:
+        funnel = _merge_funnel(funnel, funnel_patch)
+    if bot_block_detections or funnel_patch:
+        patch["notes"] = _compose_notes(prefix, funnel)
     client.update("crawl_logs", {"crawl_log_id": f"eq.{crawl_log_id}"}, patch)
 
 
@@ -1767,8 +1821,11 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
 
     if method in _ZYTE_METHOD_TIERS:
         finished_at = datetime.now(timezone.utc)
+        # Pass1の失敗ではなく、最初からPass2へ直送した対象。Pass2まで到達しないと暫定行の
+        # 「更新なし」のまま残るため、notesのp1_routed_to_pass2で本物の更新なしと区別する
         save_crawl_log(client, target, started_at, finished_at, "更新なし", None,
-                        0, 0, 0, 0, None, crawl_log_id=crawl_log_id)
+                        0, 0, 0, 0, None, crawl_log_id=crawl_log_id,
+                        notes=_compose_notes("", {"p1_routed_to_pass2": method}))
         return {
             "run_result": "更新なし",
             "items_detected": 0, "new_items": 0, "updated_items": 0,
@@ -1785,8 +1842,11 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
 
     if error_message is not None and not is_404:
         finished_at = datetime.now(timezone.utc)
+        # 暫定行。Pass2(一覧取得リトライ)まで到達しないと、この行は「更新なし」のまま残る。
+        # notesのp1_listing_failedで、本当の更新なしと区別できるようにする
         save_crawl_log(client, target, started_at, finished_at, "更新なし", None,
-                        0, 0, 0, 0, None, crawl_log_id=crawl_log_id)
+                        0, 0, 0, 0, None, crawl_log_id=crawl_log_id,
+                        notes=_compose_notes("", {"p1_listing_failed": 1}))
         return {
             "run_result": "更新なし",
             "items_detected": 0, "new_items": 0, "updated_items": 0,
@@ -1807,7 +1867,8 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
 def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict, verify: bool,
                               candidates: list, http_status, single_page_mode: bool, error_message,
                               use_browser: bool, use_zyte: bool, lookback: int, crawl_log_id: str,
-                              started_at, *, is_recovery: bool = False, article_tier: str = None) -> dict:
+                              started_at, *, is_recovery: bool = False, article_tier: str = None,
+                              listing_funnel: dict = None) -> dict:
     """process_target()から一覧取得より後ろ(記事単位の抽出・保存・crawl_logs書き込み)を
     切り出したもの。is_recovery=Trueの場合、Pass1で既にcrawl_logsへ暫定行(件数0)を
     INSERT済みであることを前提に、その行をUPDATEで上書きする
@@ -1924,7 +1985,13 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
     finished_at = datetime.now(timezone.utc)
     run_result = _compute_run_result(error_message, extraction_failures, new_items, updated_items)
 
-    crawl_notes = f"Bot対策検知{bot_block_detections}件" if bot_block_detections else None
+    crawl_funnel = {}
+    if is_recovery:
+        crawl_funnel.update({**(listing_funnel or {"p1_listing_failed": 1}), "listing_retry": "ok"})
+    if pending_escalations:
+        crawl_funnel["p1_article_failed"] = len(pending_escalations)
+    crawl_notes = _compose_notes(
+        f"Bot対策検知{bot_block_detections}件" if bot_block_detections else "", crawl_funnel)
     if is_recovery:
         _update_crawl_log_full(client, crawl_log_id, finished_at, run_result, http_status,
                                 items_detected, new_items, updated_items, extraction_failures,
@@ -1995,16 +2062,21 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
     戻り値: {"recovered": 件数, "final_failed": 件数}"""
     remaining = pending
     recovered_count = 0
+    log_tiers = defaultdict(dict)  # crawl_log_id -> {段階: [試行数, 抽出成功数]}（DBのnotesへ記録）
+    tier_totals = {}               # 段階 -> [試行数, 抽出成功数]（チャンクログへの要約用）
     for tier in ESCALATION_TIERS:
         if not remaining:
             break
         print(f"\n[Pass2: {tier}] 対象{len(remaining)}件を再試行します")
         still_failed = []
         recovered_by_log = defaultdict(lambda: {"items_detected": 0, "new_items": 0, "updated_items": 0})
+        tier_attempted = defaultdict(int)
+        tier_ok = defaultdict(int)
         for item in remaining:
             if tier == "tinyfish_agent" and not _tinyfish_agent_budget_available():
                 still_failed.append(item)
                 continue
+            tier_attempted[item["crawl_log_id"]] += 1
             extracted = extract_article(item["cand"]["url"], proxies, verify, tier=tier)
             if tier == "tinyfish_agent":
                 _record_tinyfish_agent_call()
@@ -2012,6 +2084,7 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
             if not extracted.get("ok") or extracted.get("encoding_suspect"):
                 still_failed.append(item)
                 continue
+            tier_ok[item["crawl_log_id"]] += 1
             applied = _apply_recovered_candidate(client, item["target"], item["cand"], extracted,
                                                   item["lookback"])
             if applied is None:
@@ -2025,10 +2098,16 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
                 else:
                     agg["updated_items"] += 1
             recovered_count += 1
-        for crawl_log_id, agg in recovered_by_log.items():
+        for crawl_log_id, n in tier_attempted.items():
+            log_tiers[crawl_log_id][tier] = [n, tier_ok.get(crawl_log_id, 0)]
+        tier_totals[tier] = [sum(tier_attempted.values()), sum(tier_ok.values())]
+        # 救済できた記事があるログ行は、その時点の段階別の試行・成功数もあわせて記録する
+        for crawl_log_id in set(recovered_by_log) | {k for k, v in tier_ok.items() if v}:
+            agg = recovered_by_log.get(crawl_log_id) or {"items_detected": 0, "new_items": 0, "updated_items": 0}
             update_crawl_log_after_escalation(
                 client, crawl_log_id, recovered_items_detected=agg["items_detected"],
-                recovered_new_items=agg["new_items"], recovered_updated_items=agg["updated_items"])
+                recovered_new_items=agg["new_items"], recovered_updated_items=agg["updated_items"],
+                funnel_patch={"tiers": dict(log_tiers[crawl_log_id])})
         remaining = still_failed
 
     # 全段階を経ても失敗したままの候補は、ここで初めて抽出失敗として確定する
@@ -2039,11 +2118,17 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
         if item.get("is_bot_block"):
             bot_block_by_log[item["crawl_log_id"]] += 1
     for crawl_log_id, fail_count in final_failed_by_log.items():
-        update_crawl_log_after_escalation(client, crawl_log_id, final_failures=fail_count,
-                                           bot_block_detections=bot_block_by_log.get(crawl_log_id, 0))
+        update_crawl_log_after_escalation(
+            client, crawl_log_id, final_failures=fail_count,
+            bot_block_detections=bot_block_by_log.get(crawl_log_id, 0),
+            funnel_patch={"tiers": dict(log_tiers.get(crawl_log_id, {})), "final_failed": fail_count})
 
     print(f"\nPass2完了: 救済{recovered_count}件 / 最終的に失敗{len(remaining)}件"
           f"(うちBot対策検知{sum(bot_block_by_log.values())}件)")
+    # チャンクログ用のファネル要約（Pass1失敗 → 各段階の投入/成功 → 最終失敗）
+    print("[funnel] Pass1失敗(記事単位)=" + str(len(pending)) + " | "
+          + " | ".join(f"{t}: 投入{a}→成功{o}" for t, (a, o) in tier_totals.items())
+          + f" | 最終失敗={len(remaining)}")
     return {"recovered": recovered_count, "final_failed": len(remaining)}
 
 
@@ -2094,6 +2179,8 @@ def escalate_pending_listings(pending_listings: list, client: SupabaseClient, pr
         lookback = item["lookback"]
         started_at = item["started_at"]
         tiers = item.get("tiers")
+        # 直送した対象(tiersあり)はPass1の失敗ではないため、失敗と区別して記録する
+        listing_funnel = {"p1_routed_to_pass2": target["crawl_method"]} if tiers else {"p1_listing_failed": 1}
         if tiers:
             resolved_tier, candidates, http_status, single_page_mode, error_message, is_404 = \
                 _resolve_tiered_listing(target, proxies, verify, tiers)
@@ -2104,13 +2191,14 @@ def escalate_pending_listings(pending_listings: list, client: SupabaseClient, pr
                 _list_candidates_for_target(target, proxies, verify, allow_escalation=True)
         if error_message is not None and not is_404:
             _update_crawl_log_full(client, crawl_log_id, datetime.now(timezone.utc), "失敗", None,
-                                    0, 0, 0, 0, error_message)
+                                    0, 0, 0, 0, error_message,
+                                    notes=_compose_notes("", {**listing_funnel, "listing_retry": "failed"}))
             still_failed += 1
             continue
         result = _process_target_articles(
             target, client, proxies, verify, candidates, http_status, single_page_mode,
             error_message, use_browser, use_zyte, lookback, crawl_log_id, started_at,
-            is_recovery=True, article_tier=resolved_tier,
+            is_recovery=True, article_tier=resolved_tier, listing_funnel=listing_funnel,
         )
         merged_pending_escalations.extend(result.get("pending_escalations") or [])
         recovered += 1
