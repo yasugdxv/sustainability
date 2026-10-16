@@ -267,7 +267,12 @@ def test_escalate_pending_falls_through_all_stages_then_fails(monkeypatch):
     updated_log = client.select("crawl_logs", {"select": "*", "crawl_log_id": "eq.log-1"})[0]
     assert updated_log["extraction_failures"] == 1
     assert updated_log["run_result"] == "抽出失敗"
-    assert updated_log["notes"] == "Bot対策検知1件"
+    # Bot対策検知の表記は先頭に残し(自動降格の判定が前方一致で見るため)、ファネルを追記する
+    assert updated_log["notes"].startswith("Bot対策検知1件")
+    prefix, funnel = ac._split_notes(updated_log["notes"])
+    assert prefix == "Bot対策検知1件"
+    assert funnel["final_failed"] == 1
+    assert funnel["tiers"] == {"tinyfish_fetch": [1, 0], "zyte": [1, 0], "tinyfish_agent": [1, 0]}
 
 
 def test_escalate_pending_respects_agent_budget_cap(monkeypatch):
@@ -452,3 +457,55 @@ def test_escalate_pending_listings_still_failing_marks_log_as_failed(monkeypatch
 
 def test_escalate_pending_listings_empty_input_is_noop():
     assert ac.escalate_pending_listings([], None, {}, True) == []
+
+
+# ─── ファネル記録（crawl_logs.notes、2026-10-16追加） ──────────────────────
+def test_notes_helpers_roundtrip_and_keep_bot_block_prefix_first():
+    notes = ac._compose_notes("Bot対策検知2件", {"p1_article_failed": 3, "tiers": {"zyte": [3, 1]}})
+    assert notes.startswith("Bot対策検知")  # downgrade_bot_blocked_targets()の前方一致判定を壊さない
+    prefix, funnel = ac._split_notes(notes)
+    assert prefix == "Bot対策検知2件"
+    assert funnel == {"p1_article_failed": 3, "tiers": {"zyte": [3, 1]}}
+
+
+def test_notes_helpers_without_bot_block_do_not_look_like_bot_block():
+    notes = ac._compose_notes("", {"p1_listing_failed": 1})
+    assert not notes.startswith("Bot対策検知")
+    assert ac._split_notes(notes) == ("", {"p1_listing_failed": 1})
+    assert ac._compose_notes("", {}) is None
+    assert ac._split_notes(None) == ("", {})
+    assert ac._split_notes("funnel={broken") == ("", {})  # 壊れたJSONでも例外にしない
+
+
+def test_escalate_pending_records_tiers_in_notes_and_keeps_pass1_count(monkeypatch):
+    # Pass1で「記事単位の失敗2件」と記録済みの行。tinyfish_fetchで救済できる
+    client = FakeSupabaseClient({"crawl_logs": [
+        {"crawl_log_id": "log-1", "items_detected": 0, "new_items": 0, "updated_items": 0,
+         "extraction_failures": 0, "error_message": None,
+         "notes": ac._compose_notes("", {"p1_article_failed": 2})},
+    ]})
+    monkeypatch.setattr(ac, "save_article", lambda *a, **k: (True, True))
+    monkeypatch.setattr(ac, "extract_article", lambda url, proxies, verify, tier=None, **kw: _ok_extracted())
+
+    ac.escalate_pending([_pending_item(), _pending_item()], client, {}, True)
+
+    row = client.select("crawl_logs", {"select": "*", "crawl_log_id": "eq.log-1"})[0]
+    _, funnel = ac._split_notes(row["notes"])
+    assert funnel["p1_article_failed"] == 2          # Pass1の失敗件数が上書きされない
+    assert funnel["tiers"] == {"tinyfish_fetch": [2, 2]}
+
+
+def test_pass1_listing_failure_provisional_row_is_marked_in_notes(monkeypatch):
+    """一覧取得に失敗したtargetの暫定行は「更新なし」で保存されるが、Pass2まで到達しないと
+    そのまま残る。本物の更新なしと区別できるよう、notesに印を付ける"""
+    client = FakeSupabaseClient({"crawl_logs": []})
+    monkeypatch.setattr(ac, "_list_candidates_for_target",
+                        lambda *a, **k: ([], 403, False, "HTTPError: 403", False, False, False))
+    target = {"crawl_target_id": "t-1", "target_name": "x", "crawl_method": "HTML"}
+
+    result = ac.process_target(target, client, {}, True)
+
+    assert result["pending_listing_escalation"] is not None
+    row = client.inserted["crawl_logs"][0]
+    assert row["run_result"] == "更新なし"
+    assert ac._split_notes(row["notes"])[1] == {"p1_listing_failed": 1}
