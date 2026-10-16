@@ -948,6 +948,26 @@ def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool, use_zy
     return html, final_url, status_code
 
 
+def _fetch_page_with_tier(url: str, proxies: dict, verify: bool, tier: str, want_links: bool = False):
+    """ページ取得を、指定された1段階(tier: "tinyfish_fetch"/"zyte"/"tinyfish_agent")だけで
+    試す。(html, final_url, status_code)を返す。
+
+    2026-10-15追加: crawl_method='Zyte'のtargetは、通常のHTTP取得が機能しないと
+    既に分かっているため、Pass1では一切試行せずPass2のエスカレーション
+    (escalate_pending_listings)へ丸ごと回送する方式に変更した。そのPass2側で、
+    記事単位のエスカレーション(ESCALATION_TIERS)と同じ順序(TinyFish Fetch→Zyte→Agent)で
+    一覧取得も試せるようにするための、tier指定版の_fetch_page()"""
+    if tier == "tinyfish_fetch":
+        html, final_url, status_code = _call_tinyfish_fetch(url, proxies, verify, want_links=want_links)
+    elif tier == "zyte":
+        html, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify)
+    elif tier == "tinyfish_agent":
+        html, final_url, status_code = _call_tinyfish_agent(url, proxies, verify)
+    else:
+        raise ValueError(f"未対応のtier: {tier}")
+    return html, final_url, status_code
+
+
 # 社内プロキシ越しの通信が稀に瞬断・破損し、UTF-8バイト列がLatin-1として誤デコード
 # されたような文字化けタイトル・本文がそのまま保存されてしまうことがある
 # （sustainability_dashboard_core._looks_garbledと同種のヒューリスティック。
@@ -1211,25 +1231,32 @@ def _target_max_links(target: dict) -> int:
 
 
 def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser: bool = False,
-                          use_zyte: bool = False, allow_escalation: bool = True) -> list:
+                          use_zyte: bool = False, allow_escalation: bool = True, tier: str = None) -> list:
     """HTML一覧ページから候補記事リンクを抽出する（<a>を汎用的に収集し、
     include_paths/exclude_paths・ドメイン一致で絞り込む）。
     allow_escalation=Falseは_fetch_page()経由で_fetch_with_escalation()へ伝播し、
     一覧取得失敗時のZyte/TinyFishへの自動フォールバックを行わない
-    (2026-10-14追加、process_target()のPass1から呼ぶ場合用)"""
+    (2026-10-14追加、process_target()のPass1から呼ぶ場合用)。
+
+    tierを指定すると、use_browser/use_zyte/allow_escalationによらず_fetch_page_with_tier()で
+    その1段階だけを試す(2026-10-15追加。crawl_method='Zyte'のtargetをPass2で
+    ESCALATION_TIERS順に再試行するescalate_pending_listings()から使う)"""
     url = target["target_url"]
     domain = target.get("domain") or urlparse(url).netloc
     include_paths = [p.strip() for p in (target.get("include_paths") or "").split(",") if p.strip()]
     exclude_paths = [p.strip() for p in (target.get("exclude_paths") or "").split(",") if p.strip()]
 
-    # search_conditions列を「Zyte強制ブラウザレンダリング」フラグとして流用
-    # (2026-09-17、canada.caで確認: 通常のZyte自動判定ではBrowser Renderingへ
-    # エスカレーションされないが、実際には検索結果がクライアント側フェッチで
-    # 後から描画されるため長めの待機付きBrowser Renderingが必須なサイト向け)
-    force_zyte_browser = (target.get("search_conditions") == "force_zyte_browser")
-    html, final_url, status_code = _fetch_page(url, proxies, verify, use_browser, use_zyte=use_zyte,
-                                                force_zyte_browser=force_zyte_browser, want_links=True,
-                                                allow_escalation=allow_escalation)
+    if tier is not None:
+        html, final_url, status_code = _fetch_page_with_tier(url, proxies, verify, tier, want_links=True)
+    else:
+        # search_conditions列を「Zyte強制ブラウザレンダリング」フラグとして流用
+        # (2026-09-17、canada.caで確認: 通常のZyte自動判定ではBrowser Renderingへ
+        # エスカレーションされないが、実際には検索結果がクライアント側フェッチで
+        # 後から描画されるため長めの待機付きBrowser Renderingが必須なサイト向け)
+        force_zyte_browser = (target.get("search_conditions") == "force_zyte_browser")
+        html, final_url, status_code = _fetch_page(url, proxies, verify, use_browser, use_zyte=use_zyte,
+                                                    force_zyte_browser=force_zyte_browser, want_links=True,
+                                                    allow_escalation=allow_escalation)
     max_links = _target_max_links(target)
 
     tree = _safe_lxml_parse(html)
@@ -1303,16 +1330,28 @@ _JSON_TITLE_KEYS = ("title", "headline", "name")
 _JSON_DATE_KEYS = ("defaultDate", "publishDate", "date", "pubDate", "published")
 
 
-def list_json_api_candidates(target: dict, proxies: dict, verify: bool, use_zyte: bool = False) -> list:
+def list_json_api_candidates(target: dict, proxies: dict, verify: bool, use_zyte: bool = False,
+                              tier: str = None) -> list:
     """JSON API(記事一覧をJSON配列で返すエンドポイント)から候補記事を抽出する。
     2026-09-16、corporate.mcdonalds.comの/bin/getCategoryで確認: 通常のHTML一覧ページ
     には記事リンクが一切含まれず(ナビゲーションのみ)、実際の一覧はこのJSON APIから
     クライアント側で取得・描画される構造だった。レスポンス形式はサイトごとに異なる
-    ため、よくあるキー名を順に試す簡易実装（完全な汎用パーサではない）"""
+    ため、よくあるキー名を順に試す簡易実装（完全な汎用パーサではない）。
+
+    tierを指定する場合、"tinyfish_fetch"は非対応(TinyFish Fetchはページをリンク構造を
+    保持しない読みやすいmarkdownへ変換するため、JSON構造を壊してしまい使えない。
+    2026-10-15、_ZYTE_METHOD_TIERSでJSON API方式のtier順から意図的に除外済み)"""
     url = target["target_url"]
     domain = target.get("domain") or urlparse(url).netloc
 
-    if use_zyte:
+    if tier is not None:
+        if tier == "zyte":
+            text, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify)
+        elif tier == "tinyfish_agent":
+            text, final_url, status_code = _call_tinyfish_agent(url, proxies, verify)
+        else:
+            raise ValueError(f"JSON APIが対応していないtier: {tier}")
+    elif use_zyte:
         text, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify)
     else:
         resp = requests.get(url, proxies=proxies, verify=verify, timeout=REQUEST_TIMEOUT, headers=_HEADERS)
@@ -1709,6 +1748,53 @@ def _list_candidates_for_target(target: dict, proxies: dict, verify: bool, allow
     return candidates, http_status, single_page_mode, error_message, is_404, use_browser, use_zyte
 
 
+# crawl_method='Zyte'/'JSON API'のtargetは、通常のHTTP取得が機能しないと既に分かっている
+# ため、Pass1では一切試行せずPass2へ丸ごと回送し、ここに定義した順序でエスカレーション段階を
+# 試す(2026-10-15追加）。以前はPass1内でuse_zyte=Trueとして毎回同期的にZyteを呼んでおり、
+# 記事数の多いtarget(例: McKinsey)で一覧取得+全記事のZyte呼び出しが合計85分に達し、
+# Pass1全体の進行を圧迫していた(本番実測、2026-10-09以降にZyte APIキーが実際に有効化され
+# てから顕在化)。
+# JSON API方式は"tinyfish_fetch"を含めない: TinyFish FetchはページをJSON構造を保持しない
+# 読みやすいmarkdownへ変換してしまうため、JSON APIのレスポンスには使えない
+_ZYTE_METHOD_TIERS = {
+    "Zyte": ("tinyfish_fetch", "zyte", "tinyfish_agent"),
+    "JSON API": ("zyte", "tinyfish_agent"),
+}
+
+
+def _list_candidates_with_tier(target: dict, proxies: dict, verify: bool, tier: str):
+    """_list_candidates_for_target()のtier指定版。crawl_method='Zyte'/'JSON API'の
+    targetについて、指定された1段階(tier)だけで一覧取得を試す。
+    (candidates, http_status, single_page_mode, error_message, is_404)を返す
+    (_list_candidates_for_target()と異なりuse_browser/use_zyteは返さない。
+    これらのtargetではブラウザ操作は使わず、article_tierとしてtierをそのまま
+    記事取得にも使い回すため不要)"""
+    endpoint_type = target.get("endpoint_type") or ""
+    method = target["crawl_method"]
+    error_message = None
+    is_404 = False
+    http_status = None
+    candidates = []
+    single_page_mode = False
+    try:
+        if method == "JSON API":
+            candidates, http_status = list_json_api_candidates(target, proxies, verify, tier=tier)
+        elif endpoint_type == "サイトマップ":
+            candidates, http_status = list_sitemap_candidates(target, proxies, verify)
+        elif endpoint_type in LISTING_ENDPOINT_TYPES:
+            candidates, http_status = list_html_candidates(target, proxies, verify, tier=tier)
+        else:
+            single_page_mode = True
+            candidates = [{"url": target["target_url"], "title": None, "published_at": None}]
+    except requests.exceptions.HTTPError as e:
+        error_message = f"{type(e).__name__}: {e}"
+        if e.response is not None and e.response.status_code == 404:
+            is_404 = True
+    except Exception as e:
+        error_message = f"{type(e).__name__}: {e}"
+    return candidates, http_status, single_page_mode, error_message, is_404
+
+
 def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: bool) -> dict:
     """2026-10-13変更: 記事本文取得(extract_article)は「対象targetの通常の手段を
     1回だけ試す」(tier未指定)形に変更し、失敗した候補(明確な404を除く)は
@@ -1721,10 +1807,35 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
     エスカレーションなしの1回だけに留め、(明確な404を除き)失敗した場合はtarget全体を
     pending_listing_escalationとして返す。main()はPass2でescalate_pending_listings()を
     呼び、一覧取得からフルエスカレーション許可でやり直す(一覧取得だけが従来通り
-    Pass1内で同期的にフルエスカレーションしてしまっていた問題への対応)"""
+    Pass1内で同期的にフルエスカレーションしてしまっていた問題への対応)
+
+    2026-10-15変更: crawl_method='Zyte'/'JSON API'のtargetは、通常のHTTP取得が
+    機能しないと既に分かっているため、Pass1では一覧取得・記事取得とも一切試行せず
+    即座にpending_listing_escalationへ回送する(_ZYTE_METHOD_TIERS参照)。
+    以前はこれらのtargetもPass1内で同期的にZyteを呼んでおり、記事数の多いtargetで
+    合計85分かかることがあり他targetの処理を圧迫していた"""
     lookback = target.get("lookback_days") or DEFAULT_LOOKBACK_DAYS
     started_at = datetime.now(timezone.utc)
     crawl_log_id = str(uuid.uuid4())
+    method = target["crawl_method"]
+
+    if method in _ZYTE_METHOD_TIERS:
+        finished_at = datetime.now(timezone.utc)
+        # Pass1の失敗ではなく、最初からPass2へ直送した対象。Pass2まで到達しないと暫定行の
+        # 「更新なし」のまま残るため、notesのp1_routed_to_pass2で本物の更新なしと区別する
+        save_crawl_log(client, target, started_at, finished_at, "更新なし", None,
+                        0, 0, 0, 0, None, crawl_log_id=crawl_log_id,
+                        notes=_compose_notes("", {"p1_routed_to_pass2": method}))
+        return {
+            "run_result": "更新なし",
+            "items_detected": 0, "new_items": 0, "updated_items": 0,
+            "extraction_failures": 0, "error_message": None, "bot_block_detections": 0,
+            "crawl_log_id": crawl_log_id, "pending_escalations": [],
+            "pending_listing_escalation": {
+                "target": target, "crawl_log_id": crawl_log_id, "lookback": lookback,
+                "started_at": started_at, "tiers": _ZYTE_METHOD_TIERS[method],
+            },
+        }
 
     candidates, http_status, single_page_mode, error_message, is_404, use_browser, use_zyte = \
         _list_candidates_for_target(target, proxies, verify, allow_escalation=False)
@@ -1756,11 +1867,17 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
 def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict, verify: bool,
                               candidates: list, http_status, single_page_mode: bool, error_message,
                               use_browser: bool, use_zyte: bool, lookback: int, crawl_log_id: str,
-                              started_at, *, is_recovery: bool = False) -> dict:
+                              started_at, *, is_recovery: bool = False, article_tier: str = None,
+                              listing_funnel: dict = None) -> dict:
     """process_target()から一覧取得より後ろ(記事単位の抽出・保存・crawl_logs書き込み)を
     切り出したもの。is_recovery=Trueの場合、Pass1で既にcrawl_logsへ暫定行(件数0)を
     INSERT済みであることを前提に、その行をUPDATEで上書きする
-    (escalate_pending_listings()から一覧取得リトライ成功後に呼ばれる場合用、2026-10-14追加)"""
+    (escalate_pending_listings()から一覧取得リトライ成功後に呼ばれる場合用、2026-10-14追加)。
+
+    article_tierを指定すると、use_browser/use_zyteによらず各候補の記事取得を
+    その1段階(tier)だけで試す(2026-10-15追加。crawl_method='Zyte'/'JSON API'の
+    targetで、一覧取得が成功したtierをそのまま記事取得にも使い回すため。
+    一覧取得できたサイトは本文ページも同じ手段で取得できる可能性が高いという想定)"""
     items_detected = 0
     new_items = 0
     updated_items = 0
@@ -1771,7 +1888,11 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
     if error_message is None:
         extracted_pairs = []
         for cand in candidates:
-            extracted = extract_article(cand["url"], proxies, verify, use_browser=use_browser, use_zyte=use_zyte)
+            if article_tier is not None:
+                extracted = extract_article(cand["url"], proxies, verify, tier=article_tier)
+            else:
+                extracted = extract_article(cand["url"], proxies, verify, use_browser=use_browser,
+                                             use_zyte=use_zyte)
             time.sleep(ARTICLE_FETCH_SLEEP)
 
             if single_page_mode:
@@ -1866,7 +1987,7 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
 
     crawl_funnel = {}
     if is_recovery:
-        crawl_funnel.update({"p1_listing_failed": 1, "listing_retry": "ok"})
+        crawl_funnel.update({**(listing_funnel or {"p1_listing_failed": 1}), "listing_retry": "ok"})
     if pending_escalations:
         crawl_funnel["p1_article_failed"] = len(pending_escalations)
     crawl_notes = _compose_notes(
@@ -2011,6 +2132,24 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
     return {"recovered": recovered_count, "final_failed": len(remaining)}
 
 
+def _resolve_tiered_listing(target: dict, proxies: dict, verify: bool, tiers: tuple):
+    """tiersで指定された順(例: ESCALATION_TIERSと同じTinyFish Fetch→Zyte→Agent)に
+    一覧取得を試し、最初に成功した段階とその結果を返す。
+    (resolved_tier, candidates, http_status, single_page_mode, error_message, is_404)を返す。
+    全段階が失敗した場合はresolved_tier=Noneとなり、error_messageは最後に試した段階のもの
+    (2026-10-15追加、crawl_method='Zyte'/'JSON API'のtarget用)"""
+    error_message = None
+    is_404 = False
+    for tier in tiers:
+        candidates, http_status, single_page_mode, error_message, is_404 = \
+            _list_candidates_with_tier(target, proxies, verify, tier)
+        if error_message is None:
+            return tier, candidates, http_status, single_page_mode, error_message, is_404
+        if is_404:
+            break  # 明確な404はこれ以上他の段階を試しても無駄
+    return None, [], None, False, error_message, is_404
+
+
 def escalate_pending_listings(pending_listings: list, client: SupabaseClient, proxies: dict, verify: bool) -> list:
     """2026-10-14追加: Pass1で一覧取得自体が(明確な404を除き)失敗したtargetについて、
     一覧取得をフルエスカレーション許可(allow_escalation=True)で再試行する。
@@ -2019,6 +2158,12 @@ def escalate_pending_listings(pending_listings: list, client: SupabaseClient, pr
     既存のescalate_pending()(TinyFish Fetch→Zyte→TinyFish Agent)へまとめて渡せるよう、
     pending_escalationsのリストとして返す（一覧取得の救済と記事取得の救済を
     同じ3段エスカレーションの土俵に合流させる）。
+
+    2026-10-15追加: item内に"tiers"キーがある場合(process_target()がcrawl_method=
+    'Zyte'/'JSON API'のtargetをPass1で一切試行せず丸ごと回送したケース)は、
+    _list_candidates_for_target()の通常のエスカレーション順ではなく、"tiers"で
+    指定された順(TinyFish Fetch→Zyte→Agent)で一覧取得を試す。一覧取得が成功した
+    段階を、そのtargetの記事取得(article_tier)にもそのまま使い回す。
 
     一覧取得がこの再試行でも失敗した場合は、Pass1で保存した暫定crawl_logs行を
     「失敗」で確定させる"""
@@ -2033,18 +2178,27 @@ def escalate_pending_listings(pending_listings: list, client: SupabaseClient, pr
         crawl_log_id = item["crawl_log_id"]
         lookback = item["lookback"]
         started_at = item["started_at"]
-        candidates, http_status, single_page_mode, error_message, is_404, use_browser, use_zyte = \
-            _list_candidates_for_target(target, proxies, verify, allow_escalation=True)
+        tiers = item.get("tiers")
+        # 直送した対象(tiersあり)はPass1の失敗ではないため、失敗と区別して記録する
+        listing_funnel = {"p1_routed_to_pass2": target["crawl_method"]} if tiers else {"p1_listing_failed": 1}
+        if tiers:
+            resolved_tier, candidates, http_status, single_page_mode, error_message, is_404 = \
+                _resolve_tiered_listing(target, proxies, verify, tiers)
+            use_browser, use_zyte = False, False
+        else:
+            resolved_tier = None
+            candidates, http_status, single_page_mode, error_message, is_404, use_browser, use_zyte = \
+                _list_candidates_for_target(target, proxies, verify, allow_escalation=True)
         if error_message is not None and not is_404:
             _update_crawl_log_full(client, crawl_log_id, datetime.now(timezone.utc), "失敗", None,
                                     0, 0, 0, 0, error_message,
-                                    notes=_compose_notes("", {"p1_listing_failed": 1, "listing_retry": "failed"}))
+                                    notes=_compose_notes("", {**listing_funnel, "listing_retry": "failed"}))
             still_failed += 1
             continue
         result = _process_target_articles(
             target, client, proxies, verify, candidates, http_status, single_page_mode,
             error_message, use_browser, use_zyte, lookback, crawl_log_id, started_at,
-            is_recovery=True,
+            is_recovery=True, article_tier=resolved_tier, listing_funnel=listing_funnel,
         )
         merged_pending_escalations.extend(result.get("pending_escalations") or [])
         recovered += 1

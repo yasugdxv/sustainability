@@ -31,7 +31,7 @@ def summarize(logs: list) -> dict:
     out = {
         "targets": len({l["crawl_target_id"] for l in logs}), "logs": len(logs),
         "results": Counter(l["run_result"] for l in logs),
-        "p1_listing_failed_targets": 0, "p1_article_failed": 0,
+        "p1_listing_failed_targets": 0, "p1_routed_targets": 0, "p1_article_failed": 0,
         "listing_retry": Counter(), "tiers": {t: [0, 0] for t in TIERS},
         "final_failed": 0, "pass2_not_reached": 0, "with_funnel": 0,
     }
@@ -42,6 +42,8 @@ def summarize(logs: list) -> dict:
         out["with_funnel"] += 1
         if f.get("p1_listing_failed"):
             out["p1_listing_failed_targets"] += 1
+        if f.get("p1_routed_to_pass2"):
+            out["p1_routed_targets"] += 1
         if f.get("listing_retry"):
             out["listing_retry"][f["listing_retry"]] += 1
         out["p1_article_failed"] += f.get("p1_article_failed", 0)
@@ -53,7 +55,7 @@ def summarize(logs: list) -> dict:
         # Pass1で記事単位の失敗があるのに段階の記録が無い = Pass2未到達
         # （一覧取得失敗は「更新なし」の暫定行のまま、listing_retryが無い場合も未到達）
         if (f.get("p1_article_failed") and not f.get("tiers") and not f.get("final_failed")) or \
-                (f.get("p1_listing_failed") and not f.get("listing_retry")):
+                ((f.get("p1_listing_failed") or f.get("p1_routed_to_pass2")) and not f.get("listing_retry")):
             out["pass2_not_reached"] += 1
     return out
 
@@ -63,7 +65,8 @@ def render(s: dict, label: str) -> str:
              f"  実行ログ {s['logs']}件 / 対象 {s['targets']}件（うちfunnel記録あり {s['with_funnel']}件）",
              "  結果別: " + "、".join(f"{k} {v}" for k, v in s["results"].most_common()),
              "  [Pass1] 一覧取得の失敗(Pass2へ回送) " + str(s["p1_listing_failed_targets"])
-             + "対象 / 記事単位の失敗 " + str(s["p1_article_failed"]) + "件"]
+             + "対象 / 記事単位の失敗 " + str(s["p1_article_failed"]) + "件",
+             f"  [Pass1] 最初からPass2へ直送した対象(Zyte/JSON API方式) {s['p1_routed_targets']}対象"]
     if s["listing_retry"]:
         lines.append("  [Pass2: 一覧取得リトライ] " + "、".join(f"{k} {v}" for k, v in s["listing_retry"].items()))
     for t in TIERS:
