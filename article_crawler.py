@@ -609,6 +609,24 @@ ZYTE_MIN_HTML_CHARS = 500  # これ未満ならHTTP取得を失敗とみなしBr
 _zyte_api_key_cache = None
 
 
+def _env_flag(name: str, default: bool = False, environ=None) -> bool:
+    raw = ((environ if environ is not None else os.environ).get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# 2026-10-19: Zyteを一時停止する。ZyteのAPIアカウントが停止されていた
+# （応答: 403 /auth/account-suspended。利用上限・請求状況の確認が必要）ため、毎回失敗して
+# 時間を使うだけだった。TinyFish Fetch→TinyFish Agentだけで運用する。
+# 再開は、Zyteの請求状況を直した上で、環境変数 CRAWL_ZYTE_ENABLED=true を設定する（コード変更不要）。
+ZYTE_ENABLED = _env_flag("CRAWL_ZYTE_ENABLED", default=False)
+
+
+class ZyteDisabledError(RuntimeError):
+    """Zyteを停止中（CRAWL_ZYTE_ENABLEDが未設定）に、Zyte経由の取得が要求された"""
+
+
 def _get_zyte_api_key() -> str:
     """config.jsonのzyte.api_key（推奨）または既存のgeo_intelligence.zyte.api_keyから読む
     （scripts/zyte_poc/zyte_test.pyと同じ読み込み規約）"""
@@ -634,6 +652,8 @@ def _call_zyte(url: str, proxies: dict, verify: bool, browser: bool, wait_sec: i
     """Zyte APIを1回呼び出す（一時的な5xxはリトライする）。
     (html, final_url, status_code, raw_content)を返す。
     raw_contentはhttpResponseBody取得時のみ生バイト列（PDF/.docx抽出用）、Browser時はNone"""
+    if not ZYTE_ENABLED:
+        raise ZyteDisabledError("Zyteは停止中です（再開するには環境変数 CRAWL_ZYTE_ENABLED=true）")
     api_key = _get_zyte_api_key()
     if not api_key:
         raise RuntimeError("Zyte APIキーが未設定です(config.jsonのzyte.api_key)")
@@ -704,7 +724,9 @@ def _fetch_with_zyte(url: str, proxies: dict, verify: bool, force_browser: bool 
 TINYFISH_FETCH_URL = "https://api.fetch.tinyfish.ai"
 TINYFISH_AGENT_URL = "https://agent.tinyfish.ai/v1/automation/run-sse"
 TINYFISH_FETCH_TIMEOUT = 60
-TINYFISH_AGENT_TIMEOUT = 600  # Agentは自然言語タスク実行のため数分かかることがある
+# Agentは自然言語タスク実行のため数分かかることがある。2026-10-19の実測(3件): 成功は22〜51秒、
+# 失敗は512秒。失敗1件あたりの損失を減らしたい場合は、環境変数 TINYFISH_AGENT_TIMEOUT_SEC（例: 180）で短縮できる
+TINYFISH_AGENT_TIMEOUT = int(os.environ.get("TINYFISH_AGENT_TIMEOUT_SEC") or 600)
 TINYFISH_AGENT_GOAL = "Extract the main article title and the full body text of this page. Return as plain text."
 # 1回の実行(=1日分のバッチ)でAgentを呼び出せる上限。暴走防止の安全弁（適当値、
 # 実運用の呼び出し頻度を見ながら調整する）
@@ -841,12 +863,13 @@ def _fetch_with_escalation(url: str, proxies: dict, verify: bool, *, start_with_
     elif not allow_escalation:
         return _fetch_with_zyte(url, proxies, verify, force_browser=force_zyte_browser)
 
-    try:
-        html, final_url, status_code, raw_content = _fetch_with_zyte(url, proxies, verify,
-                                                                      force_browser=force_zyte_browser)
-        return html, final_url, status_code, raw_content
-    except Exception as e:
-        last_exc = e
+    if ZYTE_ENABLED:  # 停止中は、失敗が確定している呼び出しで時間を使わずTinyFishへ進む
+        try:
+            html, final_url, status_code, raw_content = _fetch_with_zyte(url, proxies, verify,
+                                                                          force_browser=force_zyte_browser)
+            return html, final_url, status_code, raw_content
+        except Exception as e:
+            last_exc = e
 
     try:
         html, final_url, status_code = _call_tinyfish_fetch(url, proxies, verify, want_links=want_links)
@@ -1789,10 +1812,28 @@ def _list_candidates_for_target(target: dict, proxies: dict, verify: bool, allow
 # てから顕在化)。
 # JSON API方式は"tinyfish_fetch"を含めない: TinyFish FetchはページをJSON構造を保持しない
 # 読みやすいmarkdownへ変換してしまうため、JSON APIのレスポンスには使えない
-_ZYTE_METHOD_TIERS = {
+_ZYTE_METHOD_TIERS_ALL = {
     "Zyte": ("tinyfish_fetch", "zyte", "tinyfish_agent"),
     "JSON API": ("zyte", "tinyfish_agent"),
 }
+_REQUIRES_ZYTE_METHODS = ("JSON API",)  # Zyte無しでは取得できない方式（Agentは構造を保持できず代替にならない）
+
+
+def _build_zyte_method_tiers(zyte_enabled: bool) -> dict:
+    """Zyte停止中は、各方式の段階から'zyte'を外す。JSON API方式はZyte無しでは取得できないため
+    段階を空にする（process_target()が「Zyte停止中のため取得できない」失敗として記録する）"""
+    out = {}
+    for method, tiers in _ZYTE_METHOD_TIERS_ALL.items():
+        if zyte_enabled:
+            out[method] = tiers
+        elif method in _REQUIRES_ZYTE_METHODS:
+            out[method] = ()
+        else:
+            out[method] = tuple(t for t in tiers if t != "zyte")
+    return out
+
+
+_ZYTE_METHOD_TIERS = _build_zyte_method_tiers(ZYTE_ENABLED)
 
 
 def _list_candidates_with_tier(target: dict, proxies: dict, verify: bool, tier: str):
@@ -1851,6 +1892,16 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
     started_at = datetime.now(timezone.utc)
     crawl_log_id = str(uuid.uuid4())
     method = target["crawl_method"]
+
+    if method in _ZYTE_METHOD_TIERS and not _ZYTE_METHOD_TIERS[method]:
+        message = f"{method}方式はZyte停止中のため取得できません（再開は環境変数 CRAWL_ZYTE_ENABLED=true）"
+        save_crawl_log(client, target, started_at, datetime.now(timezone.utc), "失敗", None,
+                        0, 0, 0, 0, message, crawl_log_id=crawl_log_id)
+        return {
+            "run_result": "失敗", "items_detected": 0, "new_items": 0, "updated_items": 0,
+            "extraction_failures": 0, "error_message": message, "bot_block_detections": 0,
+            "crawl_log_id": crawl_log_id, "pending_escalations": [],
+        }
 
     if method in _ZYTE_METHOD_TIERS:
         finished_at = datetime.now(timezone.utc)
@@ -2130,7 +2181,12 @@ def _tier_order_from_env(environ=None) -> tuple:
     return choose_tier_order()
 
 
-ESCALATION_TIERS = _tier_order_from_env()
+def _active_tiers(tiers: tuple, zyte_enabled: bool) -> tuple:
+    """Zyte停止中は、段階から'zyte'を外す（TinyFish Fetch→Agentの2段になる）"""
+    return tuple(t for t in tiers if zyte_enabled or t != "zyte")
+
+
+ESCALATION_TIERS = _active_tiers(_tier_order_from_env(), ZYTE_ENABLED)
 
 # ─── バックログ処理の時間予算（2026-10-19） ────────────────────────────────
 # 実測(10/17〜19): 通常クロール(HTML/RSS 410対象)に約5.5時間かかり、crawlステップの上限(6時間)に
@@ -2294,6 +2350,14 @@ def _resolve_tiered_listing(target: dict, proxies: dict, verify: bool, tiers: tu
     error_message = None
     is_404 = False
     for tier in tiers:
+        # 2026-10-19: 記事の再試行にしか効いていなかったAgentの上限を、一覧取得にも効かせる
+        # （Agentは1回数十秒〜数分・有料。上限を超えたら使わず、失敗として返す）
+        if tier == "tinyfish_agent":
+            if not _tinyfish_agent_budget_available():
+                error_message = (f"{error_message}（TinyFish Agentは上限に達したため未実施）" if error_message
+                                 else "TinyFish Agentの上限に達したため一覧取得を試行しませんでした")
+                continue
+            _record_tinyfish_agent_call()
         candidates, http_status, single_page_mode, error_message, is_404 = \
             _list_candidates_with_tier(target, proxies, verify, tier)
         if error_message is None:
@@ -2590,6 +2654,10 @@ def detect_anomalies(report: dict) -> list:
     for tier, (attempted, ok, sec) in (art.get("tiers") or {}).items():
         if attempted >= ANOMALY_MIN_TIER_ATTEMPTS and ok == 0:
             out.append(f"{tier}が{attempted}件試して成功0件です（サービス障害・鍵・ネットワークの可能性）")
+    zyte_403 = sum(v for k, v in (art.get("errors") or {}).items() if k.startswith("zyte|") and "403" in k)
+    if zyte_403 >= 5:
+        out.append(f"Zyteが403を{zyte_403}件返しています（アカウント停止・利用上限の可能性。"
+                   "https://app.zyte.com/o/settings/billing-subscriptions を確認）")
     attempted_items = art.get("attempted_items", 0)
     if attempted_items and art.get("final_failed", 0) / attempted_items >= ANOMALY_FAILURE_RATE:
         out.append(f"記事の最終失敗が{art['final_failed']}/{attempted_items}件と半数以上です")
@@ -2712,7 +2780,8 @@ def _run_pass2_backlog(budget_sec, client, proxies, verify, agent_cap, log_path:
     deadline = time.monotonic() + budget_sec
     print(f"Pass2バックログ: 記事単位{len(article_items)}件 / 一覧取得{len(listing_items)}対象 / "
           f"期限切れ{len(expired)}ログ行（時間予算{budget_sec}秒{'・件数から自動算出' if auto else ''}、"
-          f"段階の順番={'→'.join(ESCALATION_TIERS)}、Agent上限{TINYFISH_AGENT_RUN_CAP}件）")
+          f"段階の順番={'→'.join(ESCALATION_TIERS)}、Agent上限{TINYFISH_AGENT_RUN_CAP}件、"
+          f"Agentタイムアウト{TINYFISH_AGENT_TIMEOUT}秒、Zyte={'有効' if ZYTE_ENABLED else '停止中'}）")
     print(f"ログ: {log_path}")
     for row, funnel, prefix in expired:
         _expire_backlog_row(client, row, funnel, prefix)
