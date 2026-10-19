@@ -24,6 +24,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import re
 import sys
 import time
@@ -1622,9 +1623,40 @@ def _merge_funnel(existing: dict, patch: dict) -> dict:
     for k, v in (patch or {}).items():
         if k == "tiers":
             merged["tiers"] = {**(existing.get("tiers") or {}), **v}
+        elif v is None:
+            merged.pop(k, None)  # Noneは「このキーを消す」(再試行待ちの解消時に使う)
         else:
             merged[k] = v
     return merged
+
+
+# ─── 再試行待ち(Pass1で失敗した記事)の永続化（2026-10-19追加） ────────────────
+# 従来、再試行待ちはメモリ上のリストにしか無く、チャンクが時間切れで強制終了されるとPass2に
+# 到達しないまま失われていた（本番実測: 再試行待ちの記事の84〜100%にPass2の記録が無く、
+# しかも該当targetのcrawl_logsは「更新なし」等で残り、取りこぼしが見えなかった）。
+# Pass1でcrawl_logsを保存する時点で、再試行待ちの記事を notes の funnel.p1_pending に残し、
+# Pass2で解消されたら消す。未解消のものは専用ステップ(run_pass2_backlog)が引き継ぐ。
+PENDING_STORE_MAX = 40          # 1ログ行のnotesへ保存する再試行待ち記事の上限（超過分は件数のみ記録）
+PENDING_MAX_AGE_HOURS = 72      # これを超えて未解消のものは、再試行を諦めて失敗として確定する
+
+
+def _pending_entry(item: dict) -> dict:
+    """再試行待ちの1記事を、notesに保存できる小さな辞書にする（u=URL, t=タイトル, d=公開日, b=Bot対策）"""
+    cand = item["cand"]
+    entry = {"u": cand["url"]}
+    if cand.get("title"):
+        entry["t"] = str(cand["title"])[:80]
+    pub = cand.get("published_at")
+    if pub:
+        entry["d"] = pub.isoformat() if hasattr(pub, "isoformat") else str(pub)
+    if item.get("is_bot_block"):
+        entry["b"] = 1
+    return entry
+
+
+def _entry_to_cand(entry: dict) -> dict:
+    """_pending_entry()の逆変換（Pass2が使う候補の形に戻す）"""
+    return {"url": entry["u"], "title": entry.get("t"), "published_at": _parse_datetime(entry.get("d"))}
 
 
 def update_crawl_log_after_escalation(client: SupabaseClient, crawl_log_id: str, *,
@@ -1990,6 +2022,10 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
         crawl_funnel.update({**(listing_funnel or {"p1_listing_failed": 1}), "listing_retry": "ok"})
     if pending_escalations:
         crawl_funnel["p1_article_failed"] = len(pending_escalations)
+        # チャンクが時間切れで止まってもPass2を引き継げるよう、再試行待ちの記事をDBに残す
+        crawl_funnel["p1_pending"] = [_pending_entry(p) for p in pending_escalations[:PENDING_STORE_MAX]]
+        if len(pending_escalations) > PENDING_STORE_MAX:
+            crawl_funnel["p1_pending_overflow"] = len(pending_escalations) - PENDING_STORE_MAX
     crawl_notes = _compose_notes(
         f"Bot対策検知{bot_block_detections}件" if bot_block_detections else "", crawl_funnel)
     if is_recovery:
@@ -2054,16 +2090,84 @@ def _apply_recovered_candidate(client: SupabaseClient, target: dict, cand: dict,
 # 1回試す」だけで完了するため、他targetの処理が遅延・圧迫されない
 # (2026-10-09〜12の本番実測で、1記事ずつ最後までチェーンさせる旧方式は
 # 1targetの処理に最大87分かかり、1日の処理件数が507件→233件まで減っていた)。
-ESCALATION_TIERS = ("tinyfish_fetch", "zyte", "tinyfish_agent")
+# 段階の順番（2026-10-19）: 最初の2段(TinyFish Fetch / Zyte)は、1記事あたりの期待所要時間
+#   E(A→B) = t_A + (1 - p_A) × t_B   （t=1回の所要秒数, p=抽出成功率）
+# が小さい順に並べる。TinyFish Agentは遅く費用も大きいため、常に最後（残りだけを処理する）。
+# TIER_PROFILEは「通常取得で失敗した記事」に対する実測値。None(未計測)が1つでもあれば、
+# 比較できないため従来の順(TinyFish Fetch→Zyte)を維持する。計測できたら数値を入れるだけでよい。
+# 実測の取り方: crawl_funnel_report.pyのtiers(試行数・成功数・秒数)。ただし2段目は1段目の失敗分
+# だけを見るため成功率が低めに偏る。順番の比較には、同じ記事で両方を試した計測を使うこと。
+TIER_PROFILE = {
+    "tinyfish_fetch": {"p": 0.76, "t": None},  # p: 2026-10-18〜19の実測(投入155→成功118)。tは未計測
+    "zyte": {"p": None, "t": None},            # 未計測（タイムアウトはTinyFish Fetch 60秒 / Zyte 90秒）
+}
+_KNOWN_TIERS = ("tinyfish_fetch", "zyte", "tinyfish_agent")
 
 
-def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verify: bool) -> dict:
+def choose_tier_order(profile: dict = None, default: tuple = ("tinyfish_fetch", "zyte")) -> tuple:
+    """最初の2段の順を期待所要時間で決め、TinyFish Agentを最後に付けて返す"""
+    profile = profile or TIER_PROFILE
+    a, b = default
+    pa, pb = profile.get(a) or {}, profile.get(b) or {}
+    values = (pa.get("p"), pa.get("t"), pb.get("p"), pb.get("t"))
+    if any(v is None for v in values):
+        return (a, b, "tinyfish_agent")
+    expected_ab = pa["t"] + (1 - pa["p"]) * pb["t"]
+    expected_ba = pb["t"] + (1 - pb["p"]) * pa["t"]
+    return (a, b, "tinyfish_agent") if expected_ab <= expected_ba else (b, a, "tinyfish_agent")
+
+
+def _tier_order_from_env(environ=None) -> tuple:
+    """環境変数 CRAWL_TIER_ORDER（例: "zyte,tinyfish_fetch,tinyfish_agent"）で順番を上書きできる。
+    3段すべてを1回ずつ含む指定のみ有効。不正な指定は無視して、決定ロジックの結果を使う"""
+    raw = ((environ if environ is not None else os.environ).get("CRAWL_TIER_ORDER") or "").strip()
+    if raw:
+        tiers = tuple(t.strip() for t in raw.split(",") if t.strip())
+        if sorted(tiers) == sorted(_KNOWN_TIERS):
+            return tiers
+        print(f"[警告] CRAWL_TIER_ORDER={raw!r}は無効です（3段を1回ずつ含めてください）。既定の順を使います")
+    return choose_tier_order()
+
+
+ESCALATION_TIERS = _tier_order_from_env()
+
+# ─── バックログ処理の時間予算（2026-10-19） ────────────────────────────────
+# 実測(10/17〜19): 通常クロール(HTML/RSS 410対象)に約5.5時間かかり、crawlステップの上限(6時間)に
+# 余裕が無い。Pass1の失敗は毎日約480〜500記事、一覧取得が未完了の対象は毎日約70。
+# 予算は固定値ではなく、実際の件数から算出する。1件あたりの秒数は仮置き（段階別の所要秒数の
+# 記録が貯まったら、crawl_funnel_report.pyの平均秒数で見直すこと）。
+BACKLOG_ARTICLE_SEC = 30        # 仮置き: 1記事あたりの期待所要秒数（全段階を通した平均）
+BACKLOG_LISTING_SEC = 90        # 仮置き: 一覧取得の再試行1対象あたり
+BACKLOG_BUDGET_MIN_SEC = 1800
+BACKLOG_BUDGET_MAX_SEC = 7200
+BACKLOG_AGENT_CAP = 30          # バックログ処理で使うTinyFish Agentの上限件数（精度未検証のため無制限にしない）
+
+
+def compute_backlog_budget(n_articles: int, n_listing: int) -> int:
+    """件数からバックログの時間予算(秒)を算出する（下限・上限あり）"""
+    need = n_articles * BACKLOG_ARTICLE_SEC + n_listing * BACKLOG_LISTING_SEC
+    return int(min(BACKLOG_BUDGET_MAX_SEC, max(BACKLOG_BUDGET_MIN_SEC, need * 1.2)))
+
+
+def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verify: bool,
+                      deadline: float = None) -> dict:
     """pendingは process_target() が返した pending_escalations を全target分まとめたもの。
-    戻り値: {"recovered": 件数, "final_failed": 件数}"""
-    remaining = pending
+    戻り値: {"recovered": 件数, "final_failed": 件数}（時間切れで未完了が残った場合のみ"unfinished"を追加）
+
+    2026-10-19変更:
+    - deadline(time.monotonic()基準)を過ぎたら新しい試行を始めず、未完了の記事は
+      「再試行待ち(p1_pending)」としてnotesに残す（失敗としては確定しない）。
+      最終失敗は、全段階を試し切った記事だけに限る。
+    - 解消した(救済・最終失敗・対象外)ログ行は pass2=done にして p1_pending を消す。
+    - 各段階の投入数・成功数は、救済が無かった対象も含め、その場でnotesへ書く
+      （途中で打ち切られても、実際に試した件数が残るように）。"""
+    remaining = list(pending)
     recovered_count = 0
     log_tiers = defaultdict(dict)  # crawl_log_id -> {段階: [試行数, 抽出成功数]}（DBのnotesへ記録）
     tier_totals = {}               # 段階 -> [試行数, 抽出成功数]（チャンクログへの要約用）
+    all_log_ids = {item["crawl_log_id"] for item in pending}
+    timed_out = False
+    unfinished = []
     for tier in ESCALATION_TIERS:
         if not remaining:
             break
@@ -2072,12 +2176,20 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
         recovered_by_log = defaultdict(lambda: {"items_detected": 0, "new_items": 0, "updated_items": 0})
         tier_attempted = defaultdict(int)
         tier_ok = defaultdict(int)
-        for item in remaining:
+        tier_sec = defaultdict(float)  # 段階ごとの所要秒数（順番の見直し用。perf_counterで計測）
+        for idx, item in enumerate(remaining):
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                unfinished = still_failed + remaining[idx:]
+                print(f"[Pass2: {tier}] 時間予算を使い切ったため中断します（未完了{len(unfinished)}件は次回へ繰り越し）")
+                break
             if tier == "tinyfish_agent" and not _tinyfish_agent_budget_available():
                 still_failed.append(item)
                 continue
             tier_attempted[item["crawl_log_id"]] += 1
+            _t0 = time.perf_counter()
             extracted = extract_article(item["cand"]["url"], proxies, verify, tier=tier)
+            tier_sec[item["crawl_log_id"]] += time.perf_counter() - _t0
             if tier == "tinyfish_agent":
                 _record_tinyfish_agent_call()
             time.sleep(ARTICLE_FETCH_SLEEP)
@@ -2099,37 +2211,56 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
                     agg["updated_items"] += 1
             recovered_count += 1
         for crawl_log_id, n in tier_attempted.items():
-            log_tiers[crawl_log_id][tier] = [n, tier_ok.get(crawl_log_id, 0)]
-        tier_totals[tier] = [sum(tier_attempted.values()), sum(tier_ok.values())]
-        # 救済できた記事があるログ行は、その時点の段階別の試行・成功数もあわせて記録する
-        for crawl_log_id in set(recovered_by_log) | {k for k, v in tier_ok.items() if v}:
+            # [試行数, 抽出成功数, 所要秒数]
+            log_tiers[crawl_log_id][tier] = [n, tier_ok.get(crawl_log_id, 0), round(tier_sec[crawl_log_id], 1)]
+        tier_totals[tier] = [sum(tier_attempted.values()), sum(tier_ok.values()), round(sum(tier_sec.values()), 1)]
+        # 救済の有無によらず、この段階を試した全ログ行へ、段階別の試行・成功数をその場で記録する
+        for crawl_log_id in set(recovered_by_log) | set(tier_attempted):
             agg = recovered_by_log.get(crawl_log_id) or {"items_detected": 0, "new_items": 0, "updated_items": 0}
             update_crawl_log_after_escalation(
                 client, crawl_log_id, recovered_items_detected=agg["items_detected"],
                 recovered_new_items=agg["new_items"], recovered_updated_items=agg["updated_items"],
                 funnel_patch={"tiers": dict(log_tiers[crawl_log_id])})
+        if timed_out:
+            break
         remaining = still_failed
 
-    # 全段階を経ても失敗したままの候補は、ここで初めて抽出失敗として確定する
+    # 全段階を試し切っても失敗したままの候補だけを、抽出失敗として確定する（時間切れの場合は確定しない）
+    final = [] if timed_out else remaining
     final_failed_by_log = defaultdict(int)
     bot_block_by_log = defaultdict(int)
-    for item in remaining:
+    for item in final:
         final_failed_by_log[item["crawl_log_id"]] += 1
         if item.get("is_bot_block"):
             bot_block_by_log[item["crawl_log_id"]] += 1
-    for crawl_log_id, fail_count in final_failed_by_log.items():
+    unfinished_by_log = defaultdict(list)
+    for item in unfinished:
+        unfinished_by_log[item["crawl_log_id"]].append(item)
+    for crawl_log_id in all_log_ids:
+        left = unfinished_by_log.get(crawl_log_id)
+        patch = {"tiers": dict(log_tiers.get(crawl_log_id, {}))}
+        if left:
+            patch["p1_pending"] = [_pending_entry(i) for i in left]   # 未完了分だけを残す
+        else:
+            patch["p1_pending"] = None
+            patch["pass2"] = "done"
+        if crawl_log_id in final_failed_by_log:
+            patch["final_failed"] = final_failed_by_log[crawl_log_id]
         update_crawl_log_after_escalation(
-            client, crawl_log_id, final_failures=fail_count,
-            bot_block_detections=bot_block_by_log.get(crawl_log_id, 0),
-            funnel_patch={"tiers": dict(log_tiers.get(crawl_log_id, {})), "final_failed": fail_count})
+            client, crawl_log_id, final_failures=final_failed_by_log.get(crawl_log_id, 0),
+            bot_block_detections=bot_block_by_log.get(crawl_log_id, 0), funnel_patch=patch)
 
-    print(f"\nPass2完了: 救済{recovered_count}件 / 最終的に失敗{len(remaining)}件"
-          f"(うちBot対策検知{sum(bot_block_by_log.values())}件)")
+    print(f"\nPass2完了: 救済{recovered_count}件 / 最終的に失敗{len(final)}件"
+          f"(うちBot対策検知{sum(bot_block_by_log.values())}件)"
+          + (f" / 未完了{len(unfinished)}件(次回へ繰り越し)" if unfinished else ""))
     # チャンクログ用のファネル要約（Pass1失敗 → 各段階の投入/成功 → 最終失敗）
     print("[funnel] Pass1失敗(記事単位)=" + str(len(pending)) + " | "
-          + " | ".join(f"{t}: 投入{a}→成功{o}" for t, (a, o) in tier_totals.items())
-          + f" | 最終失敗={len(remaining)}")
-    return {"recovered": recovered_count, "final_failed": len(remaining)}
+          + " | ".join(f"{t}: 投入{a}→成功{o}（{sec:.0f}秒）" for t, (a, o, sec) in tier_totals.items())
+          + f" | 最終失敗={len(final)} | 未完了={len(unfinished)}")
+    result = {"recovered": recovered_count, "final_failed": len(final)}
+    if unfinished:
+        result["unfinished"] = len(unfinished)
+    return result
 
 
 def _resolve_tiered_listing(target: dict, proxies: dict, verify: bool, tiers: tuple):
@@ -2150,7 +2281,8 @@ def _resolve_tiered_listing(target: dict, proxies: dict, verify: bool, tiers: tu
     return None, [], None, False, error_message, is_404
 
 
-def escalate_pending_listings(pending_listings: list, client: SupabaseClient, proxies: dict, verify: bool) -> list:
+def escalate_pending_listings(pending_listings: list, client: SupabaseClient, proxies: dict, verify: bool,
+                               deadline: float = None) -> list:
     """2026-10-14追加: Pass1で一覧取得自体が(明確な404を除き)失敗したtargetについて、
     一覧取得をフルエスカレーション許可(allow_escalation=True)で再試行する。
     取得できた候補はそのまま通常の記事抽出パス(_process_target_articles、tier未指定の
@@ -2173,7 +2305,11 @@ def escalate_pending_listings(pending_listings: list, client: SupabaseClient, pr
     merged_pending_escalations = []
     recovered = 0
     still_failed = 0
+    skipped = 0
     for item in pending_listings:
+        if deadline is not None and time.monotonic() >= deadline:
+            skipped += 1  # 時間予算切れ。ログ行は触らず、次回のバックログ処理へ繰り越す
+            continue
         target = item["target"]
         crawl_log_id = item["crawl_log_id"]
         lookback = item["lookback"]
@@ -2202,6 +2338,8 @@ def escalate_pending_listings(pending_listings: list, client: SupabaseClient, pr
         )
         merged_pending_escalations.extend(result.get("pending_escalations") or [])
         recovered += 1
+    if skipped:
+        print(f"[Pass2: 一覧取得リトライ] 時間予算を使い切ったため{skipped}件を次回へ繰り越します")
     print(f"[Pass2: 一覧取得リトライ] 完了: 一覧取得成功{recovered}件 / 一覧取得も失敗{still_failed}件"
           f"（記事単位の再試行要求{len(merged_pending_escalations)}件は通常のPass2へ合流）")
     return merged_pending_escalations
@@ -2313,11 +2451,129 @@ def main(limit: int = None, methods=SUPPORTED_METHODS, skip_today_attempted: boo
     downgrade_bot_blocked_targets(client, targets)
 
 
+# ─── Pass2バックログ: 時間切れ等で未完了になったPass2を引き継ぐ（2026-10-19追加） ───────
+def load_pass2_backlog(client: SupabaseClient, now=None, max_age_hours: int = PENDING_MAX_AGE_HOURS) -> tuple:
+    """crawl_logs.notesから、未完了のPass2を復元する。
+    戻り値: (article_items, listing_items, expired)
+      article_items: 記事単位の再試行待ち（escalate_pending()へ渡せる形）
+      listing_items: 一覧取得が未完了のtarget（escalate_pending_listings()へ渡せる形）
+      expired: max_age_hoursを超えても未解消のログ行 [(row, funnel, prefix)]（失敗として確定する）"""
+    now = now or datetime.now(timezone.utc)
+    rows = client.select("crawl_logs", {
+        "select": "crawl_log_id,crawl_target_id,started_at,notes",
+        "started_at": f"gte.{(now - timedelta(days=14)).isoformat()}",
+        "or": "(notes.like.*p1_pending*,notes.like.*p1_listing_failed*,notes.like.*p1_routed_to_pass2*)",
+        "order": "started_at.asc",
+    })
+    targets = {t["crawl_target_id"]: t for t in client.select("crawl_targets", {"select": "*"})}
+    article_items, listing_items, expired = [], [], []
+    # 予算内で全部は終わらない場合に備え、新しいログ行から先に処理する（古いものは期限切れで
+    # 失敗として確定される。鮮度の高い記事を優先して取り込むため）。1行内の記事の並びは保つ
+    for row in reversed(rows):
+        prefix, funnel = _split_notes(row.get("notes"))
+        pending = funnel.get("p1_pending") or []
+        listing_open = bool(funnel.get("p1_listing_failed") or funnel.get("p1_routed_to_pass2")) \
+            and not funnel.get("listing_retry")
+        if not pending and not listing_open:
+            continue
+        started = _parse_datetime(row.get("started_at")) or now
+        target = targets.get(row["crawl_target_id"])
+        too_old = (now - started).total_seconds() / 3600 > max_age_hours
+        if too_old or target is None:
+            expired.append((row, funnel, prefix))
+            continue
+        lookback = target.get("lookback_days") or DEFAULT_LOOKBACK_DAYS
+        for entry in pending:
+            article_items.append({
+                "target": target, "cand": _entry_to_cand(entry), "crawl_log_id": row["crawl_log_id"],
+                "lookback": lookback, "is_bot_block": bool(entry.get("b")),
+            })
+        if listing_open:
+            item = {"target": target, "crawl_log_id": row["crawl_log_id"], "lookback": lookback,
+                    "started_at": started}
+            if funnel.get("p1_routed_to_pass2") and target.get("crawl_method") in _ZYTE_METHOD_TIERS:
+                item["tiers"] = _ZYTE_METHOD_TIERS[target["crawl_method"]]
+            listing_items.append(item)
+    return article_items, listing_items, expired
+
+
+def _expire_backlog_row(client: SupabaseClient, row: dict, funnel: dict, prefix: str) -> None:
+    """再試行できないまま期限切れになったログ行を、失敗として確定する
+    （「更新なし」のまま取りこぼしが見えなくなるのを防ぐ）"""
+    crawl_log_id = row["crawl_log_id"]
+    pending_count = len(funnel.get("p1_pending") or []) + int(funnel.get("p1_pending_overflow") or 0)
+    if funnel.get("p1_pending"):
+        update_crawl_log_after_escalation(
+            client, crawl_log_id, final_failures=pending_count,
+            funnel_patch={"p1_pending": None, "pass2": "expired", "final_failed": pending_count})
+    elif funnel.get("p1_listing_failed") or funnel.get("p1_routed_to_pass2"):
+        _update_crawl_log_full(
+            client, crawl_log_id, datetime.now(timezone.utc), "失敗", None, 0, 0, 0, 0,
+            "一覧取得のPass2が期限内に実行されないまま期限切れ",
+            notes=_compose_notes(prefix, {**funnel, "listing_retry": "expired"}))
+
+
+def run_pass2_backlog(budget_sec: int = None, client: SupabaseClient = None,
+                       proxies: dict = None, verify: bool = None, agent_cap: int = None) -> dict:
+    """未完了のPass2(記事単位の再試行待ち・一覧取得の再試行)を、時間予算つきで引き継ぐ。
+    run_daily.pyが、crawlステップの直後に呼ぶ。終わらなかった分は次回へ繰り越す。
+    順序: ①記事単位の再試行待ち(安価) → ②一覧取得の再試行(高価) → ③一覧から出た新しい記事
+    budget_sec=None(既定)なら、件数から自動算出する(compute_backlog_budget)。
+    agent_cap: このプロセスで使うTinyFish Agentの上限件数（既定BACKLOG_AGENT_CAP）"""
+    global TINYFISH_AGENT_RUN_CAP, _tinyfish_agent_call_count
+    TINYFISH_AGENT_RUN_CAP = BACKLOG_AGENT_CAP if agent_cap is None else agent_cap
+    _tinyfish_agent_call_count = 0
+    if client is None:
+        config = load_config()
+        client = SupabaseClient(config)
+        proxies = make_proxies(config)
+        verify = config.get("ssl", {}).get("verify", True)
+    article_items, listing_items, expired = load_pass2_backlog(client)
+    auto = budget_sec is None
+    if auto:
+        budget_sec = compute_backlog_budget(len(article_items), len(listing_items))
+    deadline = time.monotonic() + budget_sec
+    print(f"Pass2バックログ: 記事単位{len(article_items)}件 / 一覧取得{len(listing_items)}対象 / "
+          f"期限切れ{len(expired)}ログ行（時間予算{budget_sec}秒{'・件数から自動算出' if auto else ''}、"
+          f"段階の順番={'→'.join(ESCALATION_TIERS)}、Agent上限{TINYFISH_AGENT_RUN_CAP}件）")
+    for row, funnel, prefix in expired:
+        _expire_backlog_row(client, row, funnel, prefix)
+    result = {"article_items": len(article_items), "listing_items": len(listing_items), "expired": len(expired),
+              "budget_sec": budget_sec}
+    started = time.monotonic()
+    try:
+        if article_items:
+            result["articles"] = escalate_pending(article_items, client, proxies, verify, deadline=deadline)
+        articles_sec = time.monotonic() - started
+        if listing_items:
+            new_articles = escalate_pending_listings(listing_items, client, proxies, verify, deadline=deadline)
+            if new_articles:
+                result["listing_articles"] = escalate_pending(new_articles, client, proxies, verify,
+                                                               deadline=deadline)
+    finally:
+        close_browser()
+    total_sec = time.monotonic() - started
+    # 次回以降の時間予算(--budget-sec)の調整に使う所要時間
+    print(f"[backlog] 所要 {total_sec:.0f}秒/予算{budget_sec}秒（記事単位 {articles_sec:.0f}秒、"
+          f"一覧取得+その記事 {total_sec - articles_sec:.0f}秒）")
+    result["elapsed_sec"] = total_sec
+    return result
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("limit", nargs="?", type=int, default=None)
+    parser.add_argument("--pass2-backlog", action="store_true",
+                         help="未完了のPass2(再試行待ちの記事・一覧取得)を引き継いで処理する（run_daily.pyのcrawl直後に実行）")
+    parser.add_argument("--budget-sec", type=int, default=None,
+                         help="--pass2-backlogの時間予算（秒）。未指定なら件数から自動算出。超えた分は次回へ繰り越す")
+    parser.add_argument("--agent-cap", type=int, default=None,
+                         help=f"--pass2-backlogで使うTinyFish Agentの上限件数（既定{BACKLOG_AGENT_CAP}）")
     parser.add_argument("--resume", action="store_true",
                          help="本日(UTC)既に試行済みのtargetをスキップする（run_daily.pyのチャンク実行用）")
     args = parser.parse_args()
-    main(limit=args.limit, skip_today_attempted=args.resume)
+    if args.pass2_backlog:
+        run_pass2_backlog(budget_sec=args.budget_sec, agent_cap=args.agent_cap)
+    else:
+        main(limit=args.limit, skip_today_attempted=args.resume)

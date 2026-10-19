@@ -20,7 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from article_crawler import SupabaseClient, _split_notes, load_config  # noqa: E402
+from article_crawler import (SupabaseClient, _split_notes, choose_tier_order,  # noqa: E402
+                             load_config)
 
 JST = timezone(timedelta(hours=9))
 TIERS = ("tinyfish_fetch", "zyte", "tinyfish_agent")
@@ -32,7 +33,8 @@ def summarize(logs: list) -> dict:
         "targets": len({l["crawl_target_id"] for l in logs}), "logs": len(logs),
         "results": Counter(l["run_result"] for l in logs),
         "p1_listing_failed_targets": 0, "p1_routed_targets": 0, "p1_article_failed": 0,
-        "listing_retry": Counter(), "tiers": {t: [0, 0] for t in TIERS},
+        "pending_outstanding": 0, "pending_overflow": 0, "pass2_done": 0, "pass2_expired": 0,
+        "listing_retry": Counter(), "tiers": {t: [0, 0, 0.0] for t in TIERS},
         "final_failed": 0, "pass2_not_reached": 0, "with_funnel": 0,
     }
     for l in logs:
@@ -47,17 +49,36 @@ def summarize(logs: list) -> dict:
         if f.get("listing_retry"):
             out["listing_retry"][f["listing_retry"]] += 1
         out["p1_article_failed"] += f.get("p1_article_failed", 0)
+        out["pending_outstanding"] += len(f.get("p1_pending") or [])
+        out["pending_overflow"] += int(f.get("p1_pending_overflow") or 0)
+        if f.get("pass2") == "done":
+            out["pass2_done"] += 1
+        elif f.get("pass2") == "expired" or f.get("listing_retry") == "expired":
+            out["pass2_expired"] += 1
         out["final_failed"] += f.get("final_failed", 0)
-        for t, (attempted, ok) in (f.get("tiers") or {}).items():
+        for t, vals in (f.get("tiers") or {}).items():
             if t in out["tiers"]:
-                out["tiers"][t][0] += attempted
-                out["tiers"][t][1] += ok
+                out["tiers"][t][0] += vals[0]
+                out["tiers"][t][1] += vals[1]
+                out["tiers"][t][2] += vals[2] if len(vals) > 2 else 0  # 秒数は2026-10-19以降の記録のみ
         # Pass1で記事単位の失敗があるのに段階の記録が無い = Pass2未到達
         # （一覧取得失敗は「更新なし」の暫定行のまま、listing_retryが無い場合も未到達）
-        if (f.get("p1_article_failed") and not f.get("tiers") and not f.get("final_failed")) or \
+        # 再試行待ちが残っている(p1_pending)、または一覧取得が未完了 = Pass2未完了
+        if f.get("p1_pending") or \
                 ((f.get("p1_listing_failed") or f.get("p1_routed_to_pass2")) and not f.get("listing_retry")):
             out["pass2_not_reached"] += 1
     return out
+
+
+def tier_profile(summary: dict, min_samples: int = 30) -> dict:
+    """集計結果から、段階ごとの成功率(p)と1回あたりの平均秒数(t)を返す。
+    試行数がmin_samples未満、または秒数の記録が無い段階は、p/tをNoneにする"""
+    profile = {}
+    for tier, (attempted, ok, sec) in summary["tiers"].items():
+        enough = attempted >= min_samples
+        profile[tier] = {"p": ok / attempted if enough else None,
+                         "t": sec / attempted if enough and sec else None, "n": attempted}
+    return profile
 
 
 def render(s: dict, label: str) -> str:
@@ -70,9 +91,19 @@ def render(s: dict, label: str) -> str:
     if s["listing_retry"]:
         lines.append("  [Pass2: 一覧取得リトライ] " + "、".join(f"{k} {v}" for k, v in s["listing_retry"].items()))
     for t in TIERS:
-        a, o = s["tiers"][t]
-        lines.append(f"  [Pass2: {t}] 投入 {a}件 → 抽出成功 {o}件")
-    lines.append(f"  最終失敗 {s['final_failed']}件 / Pass2未到達のtarget {s['pass2_not_reached']}件")
+        a, o, sec = s["tiers"][t]
+        avg = f"、平均{sec / a:.0f}秒/件" if a and sec else ""
+        lines.append(f"  [Pass2: {t}] 投入 {a}件 → 抽出成功 {o}件" + (f"（成功率{o / a:.0%}{avg}）" if a else ""))
+    lines.append(f"  最終失敗 {s['final_failed']}件 / Pass2未完了のtarget {s['pass2_not_reached']}件"
+                 f"（再試行待ちの記事 {s['pending_outstanding']}件が繰越中、"
+                 f"保存上限超過で再試行不能 {s['pending_overflow']}件）")
+    lines.append(f"  Pass2完了 {s['pass2_done']}対象 / 期限切れで失敗確定 {s['pass2_expired']}対象")
+    prof = tier_profile(s)
+    order = choose_tier_order(prof)
+    ready = all(prof[t][k] is not None for t in ("tinyfish_fetch", "zyte") for k in ("p", "t"))
+    lines.append("  [段階の順番] " + (f"期待時間が小さい順の推奨 = {' → '.join(order)}"
+                                     "（参考: 2段目は1段目の失敗分のみのため成功率が低く出る）"
+                                     if ready else "成功率・秒数の記録が不足（各30件以上必要）のため、既定の順を維持"))
     return "\n".join(lines)
 
 

@@ -69,6 +69,12 @@ CRAWL_MAX_CHUNKS = 10  # 安全装置（507件 ÷ 100件 ≈ 6チャンクで足
 # (ステップ名, コマンド引数, タイムアウト秒)
 STEPS = [
     ("crawl", ["article_crawler.py"], 21600),
+    # 2026-10-19追加: crawl(チャンク)が時間切れで止まると、Pass1で失敗した記事の再試行(Pass2)が
+    # 実行されないまま失われていた。notesに残した再試行待ちを、時間予算つきで引き継ぐ。
+    # 終わらなかった分は次回へ繰り越し、72時間を超えたものは失敗として確定する
+    # 時間予算は件数から自動算出（30分〜2時間。article_crawler.compute_backlog_budget）。
+    # ステップのタイムアウトは、その上限(7200秒)に後始末の余裕を足した値
+    ("crawl_pass2_backlog", ["article_crawler.py", "--pass2-backlog"], 7800),
     ("reference_list", ["reference_list_monitor.py"], 900),
     ("api_articles", ["api_article_crawler.py"], 900),
     ("filter_coverage_check", ["check_filter_keyword_coverage.py"], 300),
@@ -227,13 +233,24 @@ def notify_failures(results: list) -> None:
         print(f"失敗通知の送信自体に失敗しました: {type(e).__name__}: {e}")
 
 
+def effective_skip(skip: set) -> set:
+    """--skip-*で指定されたステップ集合に、連動してスキップすべきステップを加える。
+    crawl_pass2_backlogはcrawlの後始末なので、crawlをスキップするジョブ
+    (競合クロール用のdaily-competitor-crawl等。個別のスキップ指定はrun.shに書かれている)では
+    指定が無くても動かさない（デプロイ用スクリプトを変えずに済む）"""
+    skip = set(skip)
+    if "crawl" in skip:
+        skip.add("crawl_pass2_backlog")
+    return skip
+
+
 def main():
     parser = argparse.ArgumentParser(description="日次パイプライン オーケストレーション")
     for name, _, _ in STEPS:
         parser.add_argument(f"--skip-{name.replace('_', '-')}", action="store_true",
                              dest=f"skip_{name}")
     args = parser.parse_args()
-    skip = {name for name, _, _ in STEPS if getattr(args, f"skip_{name}")}
+    skip = effective_skip({name for name, _, _ in STEPS if getattr(args, f"skip_{name}")})
 
     if not acquire_lock():
         sys.exit(1)
