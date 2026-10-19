@@ -22,7 +22,8 @@ NOW = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture(autouse=True)
-def _fast(monkeypatch):
+def _fast(monkeypatch, tmp_path):
+    monkeypatch.setattr(ac, "BACKLOG_LOG_DIR", tmp_path / "logs" / "backlog")  # レポートをリポジトリへ書かない
     monkeypatch.setattr(ac, "_tinyfish_api_key_cache", "dummy")
     monkeypatch.setattr(ac, "_tinyfish_agent_call_count", 0)
     monkeypatch.setattr(ac, "ARTICLE_FETCH_SLEEP", 0)

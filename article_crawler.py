@@ -33,6 +33,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import feedparser
@@ -2150,7 +2151,7 @@ def compute_backlog_budget(n_articles: int, n_listing: int) -> int:
 
 
 def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verify: bool,
-                      deadline: float = None) -> dict:
+                      deadline: float = None, stats: dict = None) -> dict:
     """pendingは process_target() が返した pending_escalations を全target分まとめたもの。
     戻り値: {"recovered": 件数, "final_failed": 件数}（時間切れで未完了が残った場合のみ"unfinished"を追加）
 
@@ -2166,6 +2167,7 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
     log_tiers = defaultdict(dict)  # crawl_log_id -> {段階: [試行数, 抽出成功数]}（DBのnotesへ記録）
     tier_totals = {}               # 段階 -> [試行数, 抽出成功数]（チャンクログへの要約用）
     all_log_ids = {item["crawl_log_id"] for item in pending}
+    error_counts = Counter()       # "段階|失敗理由" -> 件数（statsへ渡す。異常検出・原因調査用）
     timed_out = False
     unfinished = []
     for tier in ESCALATION_TIERS:
@@ -2194,6 +2196,9 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
                 _record_tinyfish_agent_call()
             time.sleep(ARTICLE_FETCH_SLEEP)
             if not extracted.get("ok") or extracted.get("encoding_suspect"):
+                reason = extracted.get("error") or f"http_{extracted.get('http_status')}" if not extracted.get("ok") \
+                    else "文字化け疑い"
+                error_counts[f"{tier}|{str(reason)[:60]}"] += 1
                 still_failed.append(item)
                 continue
             tier_ok[item["crawl_log_id"]] += 1
@@ -2257,6 +2262,23 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
     print("[funnel] Pass1失敗(記事単位)=" + str(len(pending)) + " | "
           + " | ".join(f"{t}: 投入{a}→成功{o}（{sec:.0f}秒）" for t, (a, o, sec) in tier_totals.items())
           + f" | 最終失敗={len(final)} | 未完了={len(unfinished)}")
+    if stats is not None:
+        acc = stats.setdefault("articles", {"attempted_items": 0, "recovered": 0, "final_failed": 0,
+                                            "unfinished": 0, "timed_out": False, "agent_cap_reached": False,
+                                            "tiers": {}, "errors": {}})
+        acc["attempted_items"] += len(pending)
+        acc["recovered"] += recovered_count
+        acc["final_failed"] += len(final)
+        acc["unfinished"] += len(unfinished)
+        acc["timed_out"] = acc["timed_out"] or timed_out
+        acc["agent_cap_reached"] = acc["agent_cap_reached"] or not _tinyfish_agent_budget_available()
+        for t, (a, o, sec) in tier_totals.items():
+            cur = acc["tiers"].setdefault(t, [0, 0, 0.0])
+            cur[0] += a
+            cur[1] += o
+            cur[2] = round(cur[2] + sec, 1)
+        for k, v in error_counts.items():
+            acc["errors"][k] = acc["errors"].get(k, 0) + v
     result = {"recovered": recovered_count, "final_failed": len(final)}
     if unfinished:
         result["unfinished"] = len(unfinished)
@@ -2281,8 +2303,17 @@ def _resolve_tiered_listing(target: dict, proxies: dict, verify: bool, tiers: tu
     return None, [], None, False, error_message, is_404
 
 
+def _record_listing_stat(stats: dict, target: dict, outcome: str, sec: float = 0.0, **extra) -> None:
+    """バックログ実行レポート用に、一覧取得の再試行1対象ぶんの結果を残す"""
+    if stats is None:
+        return
+    stats.setdefault("listing", []).append({
+        "target": (target.get("target_name") or "")[:40], "method": target.get("crawl_method"),
+        "outcome": outcome, "sec": round(sec, 1), **extra})
+
+
 def escalate_pending_listings(pending_listings: list, client: SupabaseClient, proxies: dict, verify: bool,
-                               deadline: float = None) -> list:
+                               deadline: float = None, stats: dict = None) -> list:
     """2026-10-14追加: Pass1で一覧取得自体が(明確な404を除き)失敗したtargetについて、
     一覧取得をフルエスカレーション許可(allow_escalation=True)で再試行する。
     取得できた候補はそのまま通常の記事抽出パス(_process_target_articles、tier未指定の
@@ -2309,7 +2340,9 @@ def escalate_pending_listings(pending_listings: list, client: SupabaseClient, pr
     for item in pending_listings:
         if deadline is not None and time.monotonic() >= deadline:
             skipped += 1  # 時間予算切れ。ログ行は触らず、次回のバックログ処理へ繰り越す
+            _record_listing_stat(stats, item["target"], "skipped")
             continue
+        _listing_t0 = time.perf_counter()
         target = item["target"]
         crawl_log_id = item["crawl_log_id"]
         lookback = item["lookback"]
@@ -2330,6 +2363,8 @@ def escalate_pending_listings(pending_listings: list, client: SupabaseClient, pr
                                     0, 0, 0, 0, error_message,
                                     notes=_compose_notes("", {**listing_funnel, "listing_retry": "failed"}))
             still_failed += 1
+            _record_listing_stat(stats, target, "failed", time.perf_counter() - _listing_t0,
+                                 error=str(error_message)[:80])
             continue
         result = _process_target_articles(
             target, client, proxies, verify, candidates, http_status, single_page_mode,
@@ -2338,6 +2373,9 @@ def escalate_pending_listings(pending_listings: list, client: SupabaseClient, pr
         )
         merged_pending_escalations.extend(result.get("pending_escalations") or [])
         recovered += 1
+        _record_listing_stat(stats, target, "ok", time.perf_counter() - _listing_t0,
+                             candidates=len(candidates), new_items=result.get("new_items", 0),
+                             pending=len(result.get("pending_escalations") or []))
     if skipped:
         print(f"[Pass2: 一覧取得リトライ] 時間予算を使い切ったため{skipped}件を次回へ繰り越します")
     print(f"[Pass2: 一覧取得リトライ] 完了: 一覧取得成功{recovered}件 / 一覧取得も失敗{still_failed}件"
@@ -2513,16 +2551,155 @@ def _expire_backlog_row(client: SupabaseClient, row: dict, funnel: dict, prefix:
             notes=_compose_notes(prefix, {**funnel, "listing_retry": "expired"}))
 
 
+# ─── バックログ実行の記録（ログファイル・JSONレポート・異常検出・前回比） ───────────────
+BACKLOG_LOG_DIR = Path(__file__).parent / "logs" / "backlog"
+_JST = timezone(timedelta(hours=9))
+# 異常検出のしきい値
+ANOMALY_MIN_TIER_ATTEMPTS = 10       # この件数以上試して成功0なら、段階（サービス・鍵・ネットワーク）の障害を疑う
+ANOMALY_FAILURE_RATE = 0.5           # 最終失敗または一覧取得失敗の割合がこれ以上なら警告
+ANOMALY_SLOWDOWN_FACTOR = 2.0        # 実測が仮置き(BACKLOG_*_SEC)の何倍以上遅ければ警告
+ANOMALY_OVERRUN_FACTOR = 1.1         # 予算の何倍を超えて動いたら警告
+
+
+class _Tee:
+    """標準出力・標準エラーを、画面とログファイルの両方へ書く"""
+
+    def __init__(self, stream, file):
+        self._stream, self._file = stream, file
+
+    def write(self, data):
+        self._stream.write(data)
+        try:
+            self._file.write(data)
+            self._file.flush()
+        except ValueError:
+            pass  # ファイルが閉じた後の書き込みは無視する
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def detect_anomalies(report: dict) -> list:
+    """実行レポートから、確認が必要な点を日本語の文のリストで返す（空なら異常なし）"""
+    out = []
+    art = report.get("articles") or {}
+    for tier, (attempted, ok, sec) in (art.get("tiers") or {}).items():
+        if attempted >= ANOMALY_MIN_TIER_ATTEMPTS and ok == 0:
+            out.append(f"{tier}が{attempted}件試して成功0件です（サービス障害・鍵・ネットワークの可能性）")
+    attempted_items = art.get("attempted_items", 0)
+    if attempted_items and art.get("final_failed", 0) / attempted_items >= ANOMALY_FAILURE_RATE:
+        out.append(f"記事の最終失敗が{art['final_failed']}/{attempted_items}件と半数以上です")
+    if art.get("unfinished"):
+        out.append(f"時間予算を使い切り、記事{art['unfinished']}件が次回へ繰り越されました（予算が足りない可能性）")
+    if art.get("agent_cap_reached"):
+        out.append(f"TinyFish Agentの上限（{report.get('agent_cap')}件）に達しました。残りは最終失敗として確定しています")
+    listing = report.get("listing") or []
+    done = [x for x in listing if x["outcome"] in ("ok", "failed")]
+    if done and sum(1 for x in done if x["outcome"] == "failed") / len(done) >= ANOMALY_FAILURE_RATE:
+        failed = sum(1 for x in done if x["outcome"] == "failed")
+        out.append(f"一覧取得の再試行が{failed}/{len(done)}対象で失敗しています")
+    skipped = sum(1 for x in listing if x["outcome"] == "skipped")
+    if skipped:
+        out.append(f"時間予算切れで、一覧取得{skipped}対象が次回へ繰り越されました")
+    if report.get("expired"):
+        out.append(f"期限切れ{report['expired']}ログ行を失敗として確定しました（再試行が間に合いませんでした）")
+    budget = report.get("budget_sec") or 0
+    if budget and report.get("elapsed_sec", 0) > budget * ANOMALY_OVERRUN_FACTOR:
+        out.append(f"実行時間{report['elapsed_sec']:.0f}秒が予算{budget}秒を超えました（1件の処理が長すぎる可能性）")
+    n_articles = attempted_items
+    if n_articles and report.get("phase_sec", {}).get("articles", 0) / n_articles > \
+            BACKLOG_ARTICLE_SEC * ANOMALY_SLOWDOWN_FACTOR:
+        per = report["phase_sec"]["articles"] / n_articles
+        out.append(f"記事1件あたり{per:.0f}秒で、仮置き({BACKLOG_ARTICLE_SEC}秒)の{ANOMALY_SLOWDOWN_FACTOR:.0f}倍以上です"
+                   "（予算の自動算出を見直してください）")
+    if done:
+        avg = sum(x["sec"] for x in done) / len(done)
+        if avg > BACKLOG_LISTING_SEC * ANOMALY_SLOWDOWN_FACTOR:
+            out.append(f"一覧取得は1対象あたり平均{avg:.0f}秒で、仮置き({BACKLOG_LISTING_SEC}秒)の"
+                       f"{ANOMALY_SLOWDOWN_FACTOR:.0f}倍以上です")
+    if report.get("error"):
+        out.append(f"実行中に例外が発生しました: {report['error']}")
+    return out
+
+
+def _previous_backlog_report(log_dir: Path, current_name: str):
+    """直前の実行レポート(JSON)を読む。無ければNone"""
+    try:
+        files = sorted(p for p in log_dir.glob("*_backlog.json") if p.name != current_name)
+        return json.loads(files[-1].read_text(encoding="utf-8")) if files else None
+    except (OSError, ValueError):
+        return None
+
+
+def _render_backlog_summary(report: dict, previous: dict = None) -> str:
+    art = report.get("articles") or {}
+    listing = report.get("listing") or []
+    ok = sum(1 for x in listing if x["outcome"] == "ok")
+    failed = sum(1 for x in listing if x["outcome"] == "failed")
+    skipped = sum(1 for x in listing if x["outcome"] == "skipped")
+    before, after = report["before"], report.get("after") or {}
+    lines = ["=" * 60, f"[backlog-summary] {report['started_at']} 〜 {report['finished_at']}",
+             f"  所要 {report['elapsed_sec']:.0f}秒 / 予算 {report['budget_sec']}秒"
+             f"（記事 {report['phase_sec']['articles']:.0f}秒、一覧取得 {report['phase_sec']['listing']:.0f}秒）"
+             f" / 段階の順番 {'→'.join(report['tier_order'])} / Agent上限 {report['agent_cap']}件",
+             f"  処理前: 記事{before['article_items']}件・一覧取得{before['listing_items']}対象・期限切れ{before['expired']}行"
+             + (f" → 処理後(繰越): 記事{after['article_items']}件・一覧取得{after['listing_items']}対象"
+                if after else ""),
+             f"  記事: 救済{art.get('recovered', 0)}件 / 最終失敗{art.get('final_failed', 0)}件 / "
+             f"未完了{art.get('unfinished', 0)}件（対象{art.get('attempted_items', 0)}件）",
+             f"  一覧取得: 成功{ok} / 失敗{failed} / 繰越{skipped}"]
+    for tier, (a, o, sec) in (art.get("tiers") or {}).items():
+        lines.append(f"  [{tier}] 投入{a}→成功{o}"
+                     + (f"（成功率{o / a:.0%}、平均{sec / a:.0f}秒/件）" if a else ""))
+    if art.get("errors"):
+        top = sorted(art["errors"].items(), key=lambda kv: -kv[1])[:5]
+        lines.append("  失敗理由の上位: " + " / ".join(f"{k}×{v}" for k, v in top))
+    if previous:
+        pb = previous.get("before", {})
+        lines.append(f"  前回比: 記事{pb.get('article_items', '?')}→{before['article_items']}件、"
+                     f"一覧取得{pb.get('listing_items', '?')}→{before['listing_items']}対象、"
+                     f"所要{previous.get('elapsed_sec', 0):.0f}→{report['elapsed_sec']:.0f}秒（前回 {previous.get('started_at')}）")
+    anomalies = report.get("anomalies") or []
+    lines.append("  異常: なし" if not anomalies else "  異常の可能性:")
+    lines += [f"    ! {a}" for a in anomalies]
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
 def run_pass2_backlog(budget_sec: int = None, client: SupabaseClient = None,
-                       proxies: dict = None, verify: bool = None, agent_cap: int = None) -> dict:
+                       proxies: dict = None, verify: bool = None, agent_cap: int = None,
+                       log_dir: Path = None) -> dict:
     """未完了のPass2(記事単位の再試行待ち・一覧取得の再試行)を、時間予算つきで引き継ぐ。
     run_daily.pyが、crawlステップの直後に呼ぶ。終わらなかった分は次回へ繰り越す。
     順序: ①記事単位の再試行待ち(安価) → ②一覧取得の再試行(高価) → ③一覧から出た新しい記事
     budget_sec=None(既定)なら、件数から自動算出する(compute_backlog_budget)。
-    agent_cap: このプロセスで使うTinyFish Agentの上限件数（既定BACKLOG_AGENT_CAP）"""
+    agent_cap: このプロセスで使うTinyFish Agentの上限件数（既定BACKLOG_AGENT_CAP）
+
+    実行の記録(2026-10-19): 画面に出る内容をlogs/backlog/<日時>_backlog.logへも保存し、
+    件数・段階別の成功率と秒数・失敗理由・一覧取得の対象別結果・異常の可能性・前回比を
+    logs/backlog/<日時>_backlog.json にまとめる（例外で止まった場合も書き出してから再送出する）"""
+    log_dir = Path(log_dir) if log_dir is not None else BACKLOG_LOG_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(_JST).strftime("%Y%m%d_%H%M%S")
+    log_path, json_path = log_dir / f"{stamp}_backlog.log", log_dir / f"{stamp}_backlog.json"
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = _Tee(old_out, log_file), _Tee(old_err, log_file)
+        try:
+            return _run_pass2_backlog(budget_sec, client, proxies, verify, agent_cap, log_path, json_path)
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+
+
+def _run_pass2_backlog(budget_sec, client, proxies, verify, agent_cap, log_path: Path, json_path: Path) -> dict:
     global TINYFISH_AGENT_RUN_CAP, _tinyfish_agent_call_count
     TINYFISH_AGENT_RUN_CAP = BACKLOG_AGENT_CAP if agent_cap is None else agent_cap
     _tinyfish_agent_call_count = 0
+    started_at = datetime.now(_JST)
     if client is None:
         config = load_config()
         client = SupabaseClient(config)
@@ -2536,27 +2713,64 @@ def run_pass2_backlog(budget_sec: int = None, client: SupabaseClient = None,
     print(f"Pass2バックログ: 記事単位{len(article_items)}件 / 一覧取得{len(listing_items)}対象 / "
           f"期限切れ{len(expired)}ログ行（時間予算{budget_sec}秒{'・件数から自動算出' if auto else ''}、"
           f"段階の順番={'→'.join(ESCALATION_TIERS)}、Agent上限{TINYFISH_AGENT_RUN_CAP}件）")
+    print(f"ログ: {log_path}")
     for row, funnel, prefix in expired:
         _expire_backlog_row(client, row, funnel, prefix)
     result = {"article_items": len(article_items), "listing_items": len(listing_items), "expired": len(expired),
               "budget_sec": budget_sec}
+    stats = {}
+    error_text = None
     started = time.monotonic()
+    articles_sec = 0.0
     try:
         if article_items:
-            result["articles"] = escalate_pending(article_items, client, proxies, verify, deadline=deadline)
+            result["articles"] = escalate_pending(article_items, client, proxies, verify,
+                                                  deadline=deadline, stats=stats)
         articles_sec = time.monotonic() - started
         if listing_items:
-            new_articles = escalate_pending_listings(listing_items, client, proxies, verify, deadline=deadline)
+            new_articles = escalate_pending_listings(listing_items, client, proxies, verify,
+                                                     deadline=deadline, stats=stats)
             if new_articles:
                 result["listing_articles"] = escalate_pending(new_articles, client, proxies, verify,
-                                                               deadline=deadline)
+                                                               deadline=deadline, stats=stats)
+    except Exception as e:  # noqa: BLE001  レポートを書き出してから再送出する
+        import traceback
+        error_text = f"{type(e).__name__}: {e}"
+        print(f"[backlog] 例外で中断: {error_text}\n{traceback.format_exc()}")
+        raise
     finally:
         close_browser()
-    total_sec = time.monotonic() - started
-    # 次回以降の時間予算(--budget-sec)の調整に使う所要時間
-    print(f"[backlog] 所要 {total_sec:.0f}秒/予算{budget_sec}秒（記事単位 {articles_sec:.0f}秒、"
-          f"一覧取得+その記事 {total_sec - articles_sec:.0f}秒）")
+        total_sec = time.monotonic() - started
+        # 処理後に残っている繰越を数える（読み取りのみ。失敗してもレポート出力は続ける）
+        try:
+            a_after, l_after, e_after = load_pass2_backlog(client)
+            after = {"article_items": len(a_after), "listing_items": len(l_after), "expired": len(e_after)}
+        except Exception:  # noqa: BLE001
+            after = None
+        report = {
+            "started_at": started_at.strftime("%Y-%m-%d %H:%M:%S JST"),
+            "finished_at": datetime.now(_JST).strftime("%Y-%m-%d %H:%M:%S JST"),
+            "budget_sec": budget_sec, "budget_auto": auto, "elapsed_sec": round(total_sec, 1),
+            "phase_sec": {"articles": round(articles_sec, 1),
+                          "listing": round(max(total_sec - articles_sec, 0), 1)},
+            "agent_cap": TINYFISH_AGENT_RUN_CAP, "tier_order": list(ESCALATION_TIERS),
+            "before": {"article_items": len(article_items), "listing_items": len(listing_items),
+                       "expired": len(expired)},
+            "after": after, "expired": len(expired),
+            "articles": stats.get("articles") or {}, "listing": stats.get("listing") or [],
+            "error": error_text,
+        }
+        report["anomalies"] = detect_anomalies(report)
+        previous = _previous_backlog_report(json_path.parent, json_path.name)
+        print(_render_backlog_summary(report, previous))
+        try:
+            json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[backlog] レポート: {json_path}")
+        except OSError as e:
+            print(f"[backlog] レポートの保存に失敗: {e}")
     result["elapsed_sec"] = total_sec
+    result["report_path"] = str(json_path)
+    result["anomalies"] = report["anomalies"]
     return result
 
 
