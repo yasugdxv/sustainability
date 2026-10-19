@@ -19,6 +19,15 @@ import article_crawler as ac  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _zyte_enabled(monkeypatch):
+    """このファイルは、Zyte有効時の挙動のテスト（Zyteは2026-10-19から既定で停止。停止中の挙動は
+    tests/test_zyte_disabled.pyで確認する）"""
+    monkeypatch.setattr(ac, "ZYTE_ENABLED", True)
+    monkeypatch.setattr(ac, "ESCALATION_TIERS", ("tinyfish_fetch", "zyte", "tinyfish_agent"))
+    monkeypatch.setattr(ac, "_ZYTE_METHOD_TIERS", ac._build_zyte_method_tiers(True))
+
+
+@pytest.fixture(autouse=True)
 def _reset_tinyfish_state(monkeypatch):
     """TinyFish APIキーのプロセス内キャッシュ・Agent呼び出し回数カウンタを
     テストごとにリセットする(グローバル状態が別テストへ漏れないように)"""

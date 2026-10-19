@@ -15,6 +15,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest  # noqa: E402
 
 import article_crawler as ac  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _zyte_enabled(monkeypatch):
+    """このファイルは、Zyte有効時の挙動のテスト（Zyteは2026-10-19から既定で停止。停止中の挙動は
+    tests/test_zyte_disabled.pyで確認する）"""
+    monkeypatch.setattr(ac, "ZYTE_ENABLED", True)
+    monkeypatch.setattr(ac, "ESCALATION_TIERS", ("tinyfish_fetch", "zyte", "tinyfish_agent"))
+    monkeypatch.setattr(ac, "_ZYTE_METHOD_TIERS", ac._build_zyte_method_tiers(True))
 import run_daily  # noqa: E402
 from tests._fakes import FakeSupabaseClient  # noqa: E402
 
@@ -309,7 +318,7 @@ def test_end_to_end_chunk_killed_before_pass2_then_backlog_recovers_every_articl
 # ─── 段階の順番・予算・Agent上限（2026-10-19） ───────────────────────────────
 def test_tier_order_defaults_to_tinyfish_fetch_then_zyte_then_agent_while_unmeasured():
     assert ac.choose_tier_order({"tinyfish_fetch": {"p": 0.76, "t": None}, "zyte": {"p": None, "t": None}}) ==         ("tinyfish_fetch", "zyte", "tinyfish_agent")
-    assert ac.ESCALATION_TIERS == ("tinyfish_fetch", "zyte", "tinyfish_agent")
+    assert ac._active_tiers(ac.choose_tier_order(), True) == ("tinyfish_fetch", "zyte", "tinyfish_agent")
 
 
 @pytest.mark.parametrize("tf,zy,expected_first", [
