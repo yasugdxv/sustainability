@@ -272,7 +272,8 @@ def test_escalate_pending_falls_through_all_stages_then_fails(monkeypatch):
     prefix, funnel = ac._split_notes(updated_log["notes"])
     assert prefix == "Bot対策検知1件"
     assert funnel["final_failed"] == 1
-    assert funnel["tiers"] == {"tinyfish_fetch": [1, 0], "zyte": [1, 0], "tinyfish_agent": [1, 0]}
+    assert {k: v[:2] for k, v in funnel["tiers"].items()} == {
+        "tinyfish_fetch": [1, 0], "zyte": [1, 0], "tinyfish_agent": [1, 0]}  # 3要素目は所要秒数
 
 
 def test_escalate_pending_respects_agent_budget_cap(monkeypatch):
@@ -492,7 +493,8 @@ def test_escalate_pending_records_tiers_in_notes_and_keeps_pass1_count(monkeypat
     row = client.select("crawl_logs", {"select": "*", "crawl_log_id": "eq.log-1"})[0]
     _, funnel = ac._split_notes(row["notes"])
     assert funnel["p1_article_failed"] == 2          # Pass1の失敗件数が上書きされない
-    assert funnel["tiers"] == {"tinyfish_fetch": [2, 2]}
+    assert {k: v[:2] for k, v in funnel["tiers"].items()} == {"tinyfish_fetch": [2, 2]}
+    assert len(funnel["tiers"]["tinyfish_fetch"]) == 3  # [試行, 成功, 所要秒数]
 
 
 def test_pass1_listing_failure_provisional_row_is_marked_in_notes(monkeypatch):
