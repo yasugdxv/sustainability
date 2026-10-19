@@ -33,7 +33,7 @@ def summarize(logs: list) -> dict:
         "targets": len({l["crawl_target_id"] for l in logs}), "logs": len(logs),
         "results": Counter(l["run_result"] for l in logs),
         "p1_listing_failed_targets": 0, "p1_routed_targets": 0, "p1_article_failed": 0,
-        "pending_outstanding": 0, "pending_overflow": 0, "pass2_done": 0, "pass2_expired": 0,
+        "pending_outstanding": 0, "pending_overflow": 0, "budget_deferred": 0, "budget_skipped_known": 0, "budget_targets": 0, "pass2_done": 0, "pass2_expired": 0,
         "listing_retry": Counter(), "tiers": {t: [0, 0, 0.0] for t in TIERS},
         "final_failed": 0, "pass2_not_reached": 0, "with_funnel": 0,
     }
@@ -50,6 +50,10 @@ def summarize(logs: list) -> dict:
             out["listing_retry"][f["listing_retry"]] += 1
         out["p1_article_failed"] += f.get("p1_article_failed", 0)
         out["pending_outstanding"] += len(f.get("p1_pending") or [])
+        if f.get("p1_budget_deferred") or f.get("p1_budget_skipped_known"):
+            out["budget_targets"] += 1
+            out["budget_deferred"] += int(f.get("p1_budget_deferred") or 0)
+            out["budget_skipped_known"] += int(f.get("p1_budget_skipped_known") or 0)
         out["pending_overflow"] += int(f.get("p1_pending_overflow") or 0)
         if f.get("pass2") == "done":
             out["pass2_done"] += 1
@@ -98,6 +102,8 @@ def render(s: dict, label: str) -> str:
                  f"（再試行待ちの記事 {s['pending_outstanding']}件が繰越中、"
                  f"保存上限超過で再試行不能 {s['pending_overflow']}件）")
     lines.append(f"  Pass2完了 {s['pass2_done']}対象 / 期限切れで失敗確定 {s['pass2_expired']}対象")
+    lines.append(f"  1対象の時間上限に達した対象 {s['budget_targets']}対象（再試行待ちへ繰越 {s['budget_deferred']}件、"
+                 f"既知のため省略 {s['budget_skipped_known']}件）")
     prof = tier_profile(s)
     order = choose_tier_order(prof)
     ready = all(prof[t][k] is not None for t in ("tinyfish_fetch", "zyte") for k in ("p", "t"))

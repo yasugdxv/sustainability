@@ -1948,6 +1948,33 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
     )
 
 
+# ─── 1対象あたりの時間上限（2026-10-19追加） ────────────────────────────────
+# 実測(10/17〜19): 1,337ログのうち、300秒を超えた8件が全体の14%(2.4時間)を使い、特にMcKinsey(RSS)は
+# 1回約38分(以前は約85分の例もある)かかる。候補を順番に全件取得するため、1件ごとの遅延が積み重なる。
+# 1チャンク(1時間)の半分以上を1対象が使うことがあるため、上限を超えたら残りの候補は再試行待ち
+# (Pass2・バックログのTinyFish Fetch)へ回し、次の対象へ進む。0以下で無効。
+PER_TARGET_BUDGET_SEC = int(os.environ.get("CRAWL_TARGET_BUDGET_SEC") or 600)
+
+
+def _defer_remaining_candidates(client: SupabaseClient, target: dict, remaining: list, crawl_log_id: str,
+                                 lookback: int) -> tuple:
+    """時間上限を超えた対象の、未取得の候補を再試行待ちにする。(再試行待ちのリスト, 既知でスキップした件数)。
+    すでにDBにある記事のURLは、毎回取得し直している既知の記事なので、有料の再試行に回さずスキップする"""
+    deferred, known = [], 0
+    for cand in remaining:
+        try:
+            seen = bool(client.select("articles", {"select": "article_id", "fetched_url": f"eq.{cand['url']}",
+                                                   "limit": "1"}))
+        except Exception:  # noqa: BLE001  DBに問い合わせられない場合は、取りこぼさないよう再試行待ちにする
+            seen = False
+        if seen:
+            known += 1
+            continue
+        deferred.append({"target": target, "cand": cand, "crawl_log_id": crawl_log_id,
+                         "lookback": lookback, "is_bot_block": False})
+    return deferred, known
+
+
 def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict, verify: bool,
                               candidates: list, http_status, single_page_mode: bool, error_message,
                               use_browser: bool, use_zyte: bool, lookback: int, crawl_log_id: str,
@@ -1968,10 +1995,19 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
     extraction_failures = 0
     bot_block_detections = 0
     pending_escalations = []
+    budget_deferred = 0        # 時間上限で再試行待ちへ回した候補の数
+    budget_skipped_known = 0   # 時間上限を超えたが、既知の記事なので取得しなかった候補の数
+    target_t0 = time.monotonic()
 
     if error_message is None:
         extracted_pairs = []
-        for cand in candidates:
+        for idx, cand in enumerate(candidates):
+            if PER_TARGET_BUDGET_SEC > 0 and time.monotonic() - target_t0 > PER_TARGET_BUDGET_SEC:
+                deferred, budget_skipped_known = _defer_remaining_candidates(
+                    client, target, candidates[idx:], crawl_log_id, lookback)
+                pending_escalations.extend(deferred)
+                budget_deferred = len(deferred)
+                break
             if article_tier is not None:
                 extracted = extract_article(cand["url"], proxies, verify, tier=article_tier)
             else:
@@ -2078,6 +2114,9 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
         crawl_funnel["p1_pending"] = [_pending_entry(p) for p in pending_escalations[:PENDING_STORE_MAX]]
         if len(pending_escalations) > PENDING_STORE_MAX:
             crawl_funnel["p1_pending_overflow"] = len(pending_escalations) - PENDING_STORE_MAX
+    if budget_deferred or budget_skipped_known:
+        crawl_funnel["p1_budget_deferred"] = budget_deferred          # 時間上限で再試行待ちへ回した候補
+        crawl_funnel["p1_budget_skipped_known"] = budget_skipped_known  # 既知の記事のため取得しなかった候補
     crawl_notes = _compose_notes(
         f"Bot対策検知{bot_block_detections}件" if bot_block_detections else "", crawl_funnel)
     if is_recovery:
@@ -2099,6 +2138,8 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
         "bot_block_detections": bot_block_detections,
         "crawl_log_id": crawl_log_id,
         "pending_escalations": pending_escalations,
+        "budget_deferred": budget_deferred,
+        "budget_skipped_known": budget_skipped_known,
     }
 
 
@@ -2492,6 +2533,15 @@ def _get_today_attempted_target_ids(client: SupabaseClient) -> set:
     return {r["crawl_target_id"] for r in rows}
 
 
+def _budget_note(summary: dict) -> str:
+    """Pass1の1行表示に付ける、1対象の時間上限で記事取得を打ち切ったことの注記（無ければ空）"""
+    deferred, known = summary.get("budget_deferred") or 0, summary.get("budget_skipped_known") or 0
+    if not deferred and not known:
+        return ""
+    return (f"・時間上限({PER_TARGET_BUDGET_SEC}秒)で{deferred}件を繰越"
+            + (f"、既知{known}件は省略" if known else ""))
+
+
 def main(limit: int = None, methods=SUPPORTED_METHODS, skip_today_attempted: bool = False):
     """skip_today_attempted=Trueの場合、本日既にcrawl_logsへ記録済みのtargetを除外してから
     limitを適用する(run_daily.pyがチャンク単位で繰り返し呼び出す際の「残りだけ処理する」用。
@@ -2534,7 +2584,8 @@ def main(limit: int = None, methods=SUPPORTED_METHODS, skip_today_attempted: boo
                   f"（検出{summary['items_detected']}件 新規{summary['new_items']}件"
                   f" 更新{summary['updated_items']}件 抽出失敗{summary['extraction_failures']}件"
                   f" 要再試行{len(summary.get('pending_escalations') or [])}件"
-                  f"{'・一覧取得は再試行へ回送' if summary.get('pending_listing_escalation') else ''}）")
+                  f"{'・一覧取得は再試行へ回送' if summary.get('pending_listing_escalation') else ''}"
+                  f"{_budget_note(summary)}）")
     finally:
         close_browser()
 
