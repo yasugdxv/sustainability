@@ -726,7 +726,10 @@ TINYFISH_AGENT_URL = "https://agent.tinyfish.ai/v1/automation/run-sse"
 TINYFISH_FETCH_TIMEOUT = 60
 # Agentは自然言語タスク実行のため数分かかることがある。2026-10-19の実測(3件): 成功は22〜51秒、
 # 失敗は512秒。失敗1件あたりの損失を減らしたい場合は、環境変数 TINYFISH_AGENT_TIMEOUT_SEC（例: 180）で短縮できる
-TINYFISH_AGENT_TIMEOUT = int(os.environ.get("TINYFISH_AGENT_TIMEOUT_SEC") or 600)
+TINYFISH_AGENT_TIMEOUT = int(os.environ.get("TINYFISH_AGENT_TIMEOUT_SEC") or 600)  # 1回の呼び出し全体の上限(秒)
+# イベントが途切れてよい最大の間隔(秒)。requestsのtimeoutは「データが来ない時間」の上限であって
+# 全体の所要時間の上限ではないため、全体の上限は_call_tinyfish_agent()内で別に時計で見張る
+TINYFISH_AGENT_READ_GAP_SEC = 180
 TINYFISH_AGENT_GOAL = "Extract the main article title and the full body text of this page. Return as plain text."
 # 1回の実行(=1日分のバッチ)でAgentを呼び出せる上限。暴走防止の安全弁（適当値、
 # 実運用の呼び出し頻度を見ながら調整する）
@@ -799,11 +802,18 @@ def _call_tinyfish_agent(url: str, proxies: dict, verify: bool):
         raise RuntimeError("TinyFish APIキーが未設定です(config.jsonのapi_keys.tinyfish)")
     final_result = None
     status = None
+    # 2026-10-19: stream=Trueのtimeoutは、接続と「次のデータが来るまでの待ち」の上限であり、全体の
+    # 所要時間の上限ではない。Agentが途中経過のイベントを送り続けて完了しない場合、本番の手動実行が
+    # 予算(2時間)を45分以上超えて止まらなかった。全体の上限は、時計で見張る
+    deadline = time.monotonic() + TINYFISH_AGENT_TIMEOUT
     with requests.post(TINYFISH_AGENT_URL, headers={"X-API-Key": api_key, "Content-Type": "application/json"},
                        json={"url": url, "goal": TINYFISH_AGENT_GOAL}, proxies=proxies, verify=verify,
-                       timeout=TINYFISH_AGENT_TIMEOUT, stream=True) as resp:
+                       timeout=(10, min(TINYFISH_AGENT_TIMEOUT, TINYFISH_AGENT_READ_GAP_SEC)),
+                       stream=True) as resp:
         resp.raise_for_status()
         for raw_line in resp.iter_lines(decode_unicode=True):
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"TinyFish Agent: {TINYFISH_AGENT_TIMEOUT}秒以内に完了しませんでした")
             if not raw_line:
                 continue
             line = raw_line[len("data:"):].strip() if raw_line.startswith("data:") else raw_line.strip()
