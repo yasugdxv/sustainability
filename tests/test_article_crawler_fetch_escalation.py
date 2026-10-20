@@ -234,9 +234,11 @@ def test_call_tinyfish_fetch_raises_without_api_key(monkeypatch):
 
 # ─── _call_tinyfish_agent(): SSEストリームのCOMPLETEイベントから本文を取り出す ──
 def test_call_tinyfish_agent_parses_complete_event(monkeypatch):
+    import json
+    result = {"status": "success", "title": "題", "body": "抽出された本文です。" * 30}
     lines = [
         'data: {"type": "PROGRESS", "message": "working"}',
-        'data: {"type": "COMPLETE", "status": "COMPLETED", "result": "抽出された本文"}',
+        "data: " + json.dumps({"type": "COMPLETE", "status": "COMPLETED", "result": result}, ensure_ascii=False),
     ]
     cm = MagicMock()
     cm.__enter__.return_value = cm

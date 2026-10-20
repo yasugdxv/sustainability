@@ -34,6 +34,9 @@ class _FakeStream:
         return iter(self._lines)
 
 
+OK_RESULT = {"status": "success", "title": "題", "body": "これは記事の本文です。" * 30}
+
+
 def _event(**kw):
     return "data: " + json.dumps(kw, ensure_ascii=False)
 
@@ -64,7 +67,7 @@ def test_endless_progress_events_are_cut_off_by_the_wall_clock_limit(monkeypatch
 def test_the_limit_follows_the_configured_timeout(monkeypatch):
     monkeypatch.setattr(ac, "TINYFISH_AGENT_TIMEOUT", 180)
     monkeypatch.setattr(ac.requests, "post",
-                        lambda *a, **k: _FakeStream(iter([_event(type="PROGRESS")] * 50 + [_event(type="COMPLETE", status="COMPLETED", result="本文")])))
+                        lambda *a, **k: _FakeStream(iter([_event(type="PROGRESS")] * 50 + [_event(type="COMPLETE", status="COMPLETED", result=OK_RESULT)])))
     now = [0.0]
     monkeypatch.setattr(ac.time, "monotonic", lambda: now.__setitem__(0, now[0] + 10) or now[0])  # 10秒ずつ進む → 約18回で180秒超
 
@@ -76,12 +79,12 @@ def test_the_limit_follows_the_configured_timeout(monkeypatch):
 
 def test_normal_completion_still_works_and_returns_the_text(monkeypatch):
     monkeypatch.setattr(ac.requests, "post", lambda *a, **k: _FakeStream(iter([
-        "", _event(type="PROGRESS", message="x"), _event(type="COMPLETE", status="COMPLETED", result="記事の本文です"),
+        "", _event(type="PROGRESS", message="x"), _event(type="COMPLETE", status="COMPLETED", result=OK_RESULT),
         _event(type="PROGRESS", message="完了後は読まない")])))
 
     html, final_url, status = ac._call_tinyfish_agent("https://example.com/a", {}, True)
 
-    assert "記事の本文です" in html and final_url == "https://example.com/a" and status == 200
+    assert "これは記事の本文です。" in html and final_url == "https://example.com/a" and status == 200
 
 
 def test_error_event_still_raises_runtime_error(monkeypatch):
@@ -95,7 +98,7 @@ def test_request_uses_a_connect_and_read_gap_timeout_not_the_whole_duration(monk
 
     def fake_post(*a, **k):
         seen.update(k)
-        return _FakeStream(iter([_event(type="COMPLETE", status="COMPLETED", result="ok")]))
+        return _FakeStream(iter([_event(type="COMPLETE", status="COMPLETED", result=OK_RESULT)]))
 
     monkeypatch.setattr(ac.requests, "post", fake_post)
 
@@ -107,6 +110,6 @@ def test_request_uses_a_connect_and_read_gap_timeout_not_the_whole_duration(monk
 def test_read_gap_never_exceeds_the_overall_limit(monkeypatch):
     monkeypatch.setattr(ac, "TINYFISH_AGENT_TIMEOUT", 60)
     seen = {}
-    monkeypatch.setattr(ac.requests, "post", lambda *a, **k: seen.update(k) or _FakeStream(iter([_event(type="COMPLETE", result="ok")])))
+    monkeypatch.setattr(ac.requests, "post", lambda *a, **k: seen.update(k) or _FakeStream(iter([_event(type="COMPLETE", result=OK_RESULT)])))
     ac._call_tinyfish_agent("https://example.com", {}, True)
     assert seen["timeout"] == (10, 60)
