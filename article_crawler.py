@@ -726,11 +726,31 @@ TINYFISH_AGENT_URL = "https://agent.tinyfish.ai/v1/automation/run-sse"
 TINYFISH_FETCH_TIMEOUT = 60
 # Agentは自然言語タスク実行のため数分かかることがある。2026-10-19の実測(3件): 成功は22〜51秒、
 # 失敗は512秒。失敗1件あたりの損失を減らしたい場合は、環境変数 TINYFISH_AGENT_TIMEOUT_SEC（例: 180）で短縮できる
-TINYFISH_AGENT_TIMEOUT = int(os.environ.get("TINYFISH_AGENT_TIMEOUT_SEC") or 600)  # 1回の呼び出し全体の上限(秒)
+# ── 2026-10-20 根本原因の修正 ────────────────────────────────────────────────
+# TinyFishの仕様: agent_config.max_duration_seconds(実行時間の上限)のデフォルトは「無制限」、
+# max_steps(操作回数の上限)のデフォルトは150。従来は両方を指定せずに呼んでいたため、ブロックされた
+# ページでAgentが延々と操作を試し続け(実測: 失敗は約512秒)、クライアントが切断してもサーバー側の
+# 実行と課金が続く恐れがあった。「こちらで待つのをやめる」のではなく、Agent自身に上限を渡して
+# サービス側で止まるようにする。実測(10/19): 成功は22〜51秒。
+TINYFISH_AGENT_MAX_DURATION_SEC = int(os.environ.get("TINYFISH_AGENT_MAX_DURATION_SEC") or 180)
+# max_stepsはベータ機能で、アカウントが未登録だと403(「Your account is not enabled for custom max steps yet」。
+# 2026-10-20に実サービスで確認)。既定は指定しない(0)。ベータ登録後に、環境変数で指定できる
+TINYFISH_AGENT_MAX_STEPS = int(os.environ.get("TINYFISH_AGENT_MAX_STEPS") or 0)
+TINYFISH_AGENT_CANCEL_URL = "https://agent.tinyfish.ai/v1/runs/{run_id}/cancel"
+# クライアント側の見張り(保険)。サービス側の上限(max_duration)に、通信・後処理の余裕を足した値
+TINYFISH_AGENT_TIMEOUT = int(os.environ.get("TINYFISH_AGENT_TIMEOUT_SEC") or (TINYFISH_AGENT_MAX_DURATION_SEC + 60))
 # イベントが途切れてよい最大の間隔(秒)。requestsのtimeoutは「データが来ない時間」の上限であって
 # 全体の所要時間の上限ではないため、全体の上限は_call_tinyfish_agent()内で別に時計で見張る
 TINYFISH_AGENT_READ_GAP_SEC = 180
-TINYFISH_AGENT_GOAL = "Extract the main article title and the full body text of this page. Return as plain text."
+TINYFISH_AGENT_GOAL = (
+    "Read this web page and extract the main article. Reply with ONLY a JSON object, no other text. "
+    'If you could read the article text: {"status": "success", "title": "<article title>", '
+    '"body": "<the full article body text>"}. '
+    "If the page is blocked, shows a bot-check / CAPTCHA / 'checking your browser' screen, requires login, "
+    "or you could not read the article text for any reason: "
+    '{"status": "failure", "reason": "<short reason>"}. '
+    "Never put an explanation of a failure into the body field."
+)
 # 1回の実行(=1日分のバッチ)でAgentを呼び出せる上限。暴走防止の安全弁（適当値、
 # 実運用の呼び出し頻度を見ながら調整する）
 TINYFISH_AGENT_RUN_CAP = 10
@@ -794,42 +814,128 @@ def _call_tinyfish_fetch(url: str, proxies: dict, verify: bool, want_links: bool
     return html, final_url, 200
 
 
+# Agentが「取得できなかった」ことを自然文で説明してくる場合の目印（先頭付近に現れたら失敗として扱う）。
+# 2026-10-20に、consilium.europa.euの記事2件で、この種の説明文が記事本文として保存されていたのを確認した
+_AGENT_FAILURE_PHRASES = (
+    "unable to extract", "was unable", "could not extract", "could not retrieve", "unable to access",
+    "unable to retrieve", "bot protection", "checking your browser", "captcha", "access denied",
+    "blocked by", "i cannot", "i can't", "i could not", "not able to",
+)
+_AGENT_MIN_BODY_CHARS = 200
+
+
+def _parse_agent_result(final_result) -> str:
+    """Agentの返答(result)から、記事本文のテキストを取り出す。取り出せない(=取得に失敗した)場合は例外。
+    - 指示どおりのJSON({"status":"success","title":...,"body":...})が最優先
+    - {"status":"failure","reason":...}、または失敗を説明する自然文は、本文として扱わず失敗にする
+    - 構造化されていない自然文は、失敗の言い回しが先頭付近に無く、十分な長さがある場合だけ受け入れる"""
+    def _as_obj(value):
+        if isinstance(value, dict):
+            inner = value.get("result")
+            if "status" not in value and isinstance(inner, (str, dict)):
+                return _as_obj(inner)        # {"result": "..."} の入れ子
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+            if text.startswith("{"):
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    pass
+            return text
+        return value
+
+    obj = _as_obj(final_result)
+    if isinstance(obj, dict):
+        if str(obj.get("status", "")).lower() == "failure":
+            raise RuntimeError(f"TinyFish Agent: 目標未達（{obj.get('reason') or obj}）")
+        body = obj.get("body") or obj.get("text") or obj.get("content")
+        if isinstance(body, str) and body.strip():
+            title = (obj.get("title") or "").strip()
+            text = f"{title}\n\n{body.strip()}" if title else body.strip()
+        else:
+            raise RuntimeError(f"TinyFish Agent: 本文が空の応答です（{json.dumps(obj, ensure_ascii=False)[:120]}）")
+    else:
+        text = obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)
+    head = text[:300].lower()
+    if any(p in head for p in _AGENT_FAILURE_PHRASES):
+        raise RuntimeError(f"TinyFish Agent: 取得できなかった旨の応答です（{text[:120]!r}）")
+    if len(text) < _AGENT_MIN_BODY_CHARS:
+        raise RuntimeError(f"TinyFish Agent: 本文が短すぎます（{len(text)}文字）")
+    return text
+
+
+def _cancel_tinyfish_run(run_id, api_key: str, proxies: dict, verify: bool) -> None:
+    """中断した実行を、サービス側でも取り消す（取り消さないと、実行と課金が続く恐れがある）。
+    取り消しの失敗は、元のエラーを隠さないよう握りつぶす（ベストエフォート）"""
+    if not run_id:
+        return
+    try:
+        requests.post(TINYFISH_AGENT_CANCEL_URL.format(run_id=run_id), headers={"X-API-Key": api_key},
+                      proxies=proxies, verify=verify, timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _call_tinyfish_agent(url: str, proxies: dict, verify: bool):
-    """TinyFish Agent APIを1回呼び出す（最後の手段。1件6〜9分・従量課金のため
-    呼び出し回数はTINYFISH_AGENT_RUN_CAPで抑える）。(html, final_url, status_code)を返す。"""
+    """TinyFish Agent APIを1回呼び出す（最後の手段。従量課金のため呼び出し回数はTINYFISH_AGENT_RUN_CAPで抑える）。
+    (html, final_url, status_code)を返す。
+
+    2026-10-20: agent_configで、Agent自身に実行時間・操作回数の上限を渡す（上記の定数のコメント参照）。
+    また、サービスは「実行は完了したが目標は未達」を COMPLETE + result={"status":"failure","reason":...} で
+    返す（仕様: COMPLETEは「インフラが動いた」ことしか保証しない）ため、これを成功として扱わず、
+    失敗理由つきのエラーにする。中断した場合は、サービス側の実行も取り消す"""
     api_key = _get_tinyfish_api_key()
     if not api_key:
         raise RuntimeError("TinyFish APIキーが未設定です(config.jsonのapi_keys.tinyfish)")
     final_result = None
     status = None
-    # 2026-10-19: stream=Trueのtimeoutは、接続と「次のデータが来るまでの待ち」の上限であり、全体の
-    # 所要時間の上限ではない。Agentが途中経過のイベントを送り続けて完了しない場合、本番の手動実行が
-    # 予算(2時間)を45分以上超えて止まらなかった。全体の上限は、時計で見張る
+    run_id = None
+    finished = False
+    # requestsのtimeout(stream=True)は「次のデータが来るまでの待ち」の上限で、全体の上限ではない。
+    # サービス側の上限が効かなかった場合に備えた、クライアント側の見張り（保険）
     deadline = time.monotonic() + TINYFISH_AGENT_TIMEOUT
-    with requests.post(TINYFISH_AGENT_URL, headers={"X-API-Key": api_key, "Content-Type": "application/json"},
-                       json={"url": url, "goal": TINYFISH_AGENT_GOAL}, proxies=proxies, verify=verify,
-                       timeout=(10, min(TINYFISH_AGENT_TIMEOUT, TINYFISH_AGENT_READ_GAP_SEC)),
-                       stream=True) as resp:
-        resp.raise_for_status()
-        for raw_line in resp.iter_lines(decode_unicode=True):
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"TinyFish Agent: {TINYFISH_AGENT_TIMEOUT}秒以内に完了しませんでした")
-            if not raw_line:
-                continue
-            line = raw_line[len("data:"):].strip() if raw_line.startswith("data:") else raw_line.strip()
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "COMPLETE":
-                status = event.get("status")
-                final_result = event.get("result")
-                break
-            if event.get("type") == "ERROR":
-                raise RuntimeError(f"TinyFish Agent error: {event.get('message') or event}")
+    agent_config = {"max_duration_seconds": TINYFISH_AGENT_MAX_DURATION_SEC}
+    if TINYFISH_AGENT_MAX_STEPS > 0:
+        agent_config["max_steps"] = TINYFISH_AGENT_MAX_STEPS
+    payload = {"url": url, "goal": TINYFISH_AGENT_GOAL, "agent_config": agent_config}
+    try:
+        with requests.post(TINYFISH_AGENT_URL, headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+                           json=payload, proxies=proxies, verify=verify,
+                           timeout=(10, min(TINYFISH_AGENT_TIMEOUT, TINYFISH_AGENT_READ_GAP_SEC)),
+                           stream=True) as resp:
+            resp.raise_for_status()
+            # SSEはUTF-8（仕様）。Content-Typeにcharsetが無いと、requestsはISO-8859-1と誤判定し、
+            # 日本語などの非ASCII文字が文字化けする（2026-10-20、失敗理由の日本語が化けて発覚）
+            resp.encoding = "utf-8"
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"TinyFish Agent: {TINYFISH_AGENT_TIMEOUT}秒以内に完了しませんでした")
+                if not raw_line:
+                    continue
+                line = raw_line[len("data:"):].strip() if raw_line.startswith("data:") else raw_line.strip()
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "STARTED":
+                    run_id = event.get("run_id") or run_id
+                if event.get("type") == "COMPLETE":
+                    status = event.get("status")
+                    final_result = event.get("result")
+                    finished = True
+                    break
+                if event.get("type") == "ERROR":
+                    raise RuntimeError(f"TinyFish Agent error: {event.get('message') or event}")
+    finally:
+        if not finished:
+            _cancel_tinyfish_run(run_id, api_key, proxies, verify)
+    if status and str(status).upper() != "COMPLETED":
+        raise RuntimeError(f"TinyFish Agent: 実行が{status}で終了しました（{final_result or event.get('error')}）")
     if final_result is None:
         raise RuntimeError(f"TinyFish Agent: 完了イベント未受信(最終status={status})")
-    text = final_result if isinstance(final_result, str) else json.dumps(final_result, ensure_ascii=False)
+    text = _parse_agent_result(final_result)
     html = f"<html><body><article>{html_escape(text)}</article></body></html>"
     return html, url, 200
 
@@ -2889,7 +2995,9 @@ def _run_pass2_backlog(budget_sec, client, proxies, verify, agent_cap, log_path:
     print(f"Pass2バックログ: 記事単位{len(article_items)}件 / 一覧取得{len(listing_items)}対象 / "
           f"期限切れ{len(expired)}ログ行（時間予算{budget_sec}秒{'・件数から自動算出' if auto else ''}、"
           f"段階の順番={'→'.join(ESCALATION_TIERS)}、Agent上限{TINYFISH_AGENT_RUN_CAP}件、"
-          f"Agentタイムアウト{TINYFISH_AGENT_TIMEOUT}秒、Zyte={'有効' if ZYTE_ENABLED else '停止中'}）")
+          f"Agent実行上限{TINYFISH_AGENT_MAX_DURATION_SEC}秒"
+          f"{('/' + str(TINYFISH_AGENT_MAX_STEPS) + '操作') if TINYFISH_AGENT_MAX_STEPS > 0 else ''}(サービス側)・"
+          f"クライアント見張り{TINYFISH_AGENT_TIMEOUT}秒、Zyte={'有効' if ZYTE_ENABLED else '停止中'}）")
     print(f"ログ: {log_path}")
     for row, funnel, prefix in expired:
         _expire_backlog_row(client, row, funnel, prefix)
