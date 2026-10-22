@@ -2002,6 +2002,33 @@ def _list_candidates_with_tier(target: dict, proxies: dict, verify: bool, tier: 
     return candidates, http_status, single_page_mode, error_message, is_404
 
 
+def _listing_fallback_without_zyte(target: dict, client: SupabaseClient, proxies: dict, verify: bool,
+                                    first_error: str, first_http_status, lookback: int, crawl_log_id: str,
+                                    started_at) -> dict:
+    """Zyte停止中に、HTML/RSSの一覧取得が通常HTTPで失敗した場合の処理（2026-10-20追加）。
+    従来は「更新なし」の暫定行を書いてPass2へ回していたが、Pass2はチャンクの時間切れとバックログの
+    予算切れで届かず、10/19〜20は20対象(HTML 13・RSS 7)が再試行すらされず、失敗理由も記録されなかった。
+    - HTML: その場でTinyFish Fetchで一覧取得を再試行し、取れたら記事もTinyFish Fetchで取得する
+    - RSS: フィードはXMLで、TinyFishは読みやすいテキストへ変換するため使えない（Zyteが無いと
+      フォールバックできない）。Pass2へ回しても必ず失敗するので、理由つきの「失敗」として記録する
+    どちらも失敗理由をcrawl_logsのerror_messageに残す（「更新なし」に隠さない）"""
+    method = target["crawl_method"]
+    if method == "RSS":
+        message = f"{first_error}（RSSはZyte停止中のためフォールバックできません）"
+        return _process_target_articles(target, client, proxies, verify, [], first_http_status, False, message,
+                                         False, False, lookback, crawl_log_id, started_at)
+    candidates, http_status, single_page_mode, error_message, is_404 = \
+        _list_candidates_with_tier(target, proxies, verify, "tinyfish_fetch")
+    if error_message is not None:
+        message = f"{first_error} / TinyFish Fetchでも失敗: {error_message}"
+        return _process_target_articles(target, client, proxies, verify, [], http_status, single_page_mode, message,
+                                         False, False, lookback, crawl_log_id, started_at)
+    return _process_target_articles(
+        target, client, proxies, verify, candidates, http_status, single_page_mode, None, False, False,
+        lookback, crawl_log_id, started_at, article_tier="tinyfish_fetch",
+        extra_funnel={"p1_listing_fallback": "tinyfish_fetch", "p1_tinyfish_direct": 1})
+
+
 def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: bool) -> dict:
     """2026-10-13変更: 記事本文取得(extract_article)は「対象targetの通常の手段を
     1回だけ試す」(tier未指定)形に変更し、失敗した候補(明確な404を除く)は
@@ -2036,6 +2063,22 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
             "crawl_log_id": crawl_log_id, "pending_escalations": [],
         }
 
+    # 2026-10-20: Zyte停止中のcrawl_method='Zyte'は、Pass1でTinyFish Fetchを直接使う。
+    # 従来はPass1で一切試さずPass2(チャンク末尾・バックログ)へ回していたが、Pass2はチャンクの時間切れで
+    # 届かず、バックログもAgentに予算を使い切られ、95対象のうち85対象(約9割)が一覧取得すら
+    # 行われず「更新なし」のまま残っていた(10/19〜20実測)。Pass2頼みをやめ、通常クロールの中で処理する。
+    # 一覧取得に失敗した場合は、記事を取れないだけで済むよう「失敗」として記録する（一覧取得をAgentへ
+    # 回すと、記事ごとにAgentを呼ぶ高コストの経路になるため、ここではPass2へ回さない）
+    tiers_for_method = _ZYTE_METHOD_TIERS.get(method)
+    if tiers_for_method and not ZYTE_ENABLED and tiers_for_method[0] == "tinyfish_fetch":
+        candidates, http_status, single_page_mode, error_message, is_404 = \
+            _list_candidates_with_tier(target, proxies, verify, "tinyfish_fetch")
+        return _process_target_articles(
+            target, client, proxies, verify, candidates, http_status, single_page_mode,
+            error_message, False, False, lookback, crawl_log_id, started_at,
+            article_tier="tinyfish_fetch", extra_funnel={"p1_tinyfish_direct": 1},
+        )
+
     if method in _ZYTE_METHOD_TIERS:
         finished_at = datetime.now(timezone.utc)
         # Pass1の失敗ではなく、最初からPass2へ直送した対象。Pass2まで到達しないと暫定行の
@@ -2056,6 +2099,10 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
 
     candidates, http_status, single_page_mode, error_message, is_404, use_browser, use_zyte = \
         _list_candidates_for_target(target, proxies, verify, allow_escalation=False)
+
+    if error_message is not None and not is_404 and not ZYTE_ENABLED and target["crawl_method"] in ("HTML", "RSS"):
+        return _listing_fallback_without_zyte(target, client, proxies, verify, error_message, http_status,
+                                               lookback, crawl_log_id, started_at)
 
     if error_message is not None and not is_404:
         finished_at = datetime.now(timezone.utc)
@@ -2112,7 +2159,7 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
                               candidates: list, http_status, single_page_mode: bool, error_message,
                               use_browser: bool, use_zyte: bool, lookback: int, crawl_log_id: str,
                               started_at, *, is_recovery: bool = False, article_tier: str = None,
-                              listing_funnel: dict = None) -> dict:
+                              listing_funnel: dict = None, extra_funnel: dict = None) -> dict:
     """process_target()から一覧取得より後ろ(記事単位の抽出・保存・crawl_logs書き込み)を
     切り出したもの。is_recovery=Trueの場合、Pass1で既にcrawl_logsへ暫定行(件数0)を
     INSERT済みであることを前提に、その行をUPDATEで上書きする
@@ -2238,7 +2285,7 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
     finished_at = datetime.now(timezone.utc)
     run_result = _compute_run_result(error_message, extraction_failures, new_items, updated_items)
 
-    crawl_funnel = {}
+    crawl_funnel = dict(extra_funnel or {})   # 例: Pass1でTinyFish Fetchを直接使った印(p1_tinyfish_direct)
     if is_recovery:
         crawl_funnel.update({**(listing_funnel or {"p1_listing_failed": 1}), "listing_retry": "ok"})
     if pending_escalations:

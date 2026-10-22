@@ -33,7 +33,7 @@ def summarize(logs: list) -> dict:
     out = {
         "targets": len({l["crawl_target_id"] for l in logs}), "logs": len(logs),
         "results": Counter(l["run_result"] for l in logs),
-        "p1_listing_failed_targets": 0, "p1_routed_targets": 0, "p1_article_failed": 0,
+        "p1_listing_failed_targets": 0, "p1_routed_targets": 0, "p1_tinyfish_direct_targets": 0, "p1_listing_fallback_targets": 0, "p1_article_failed": 0,
         "pending_outstanding": 0, "pending_overflow": 0, "budget_deferred": 0, "budget_skipped_known": 0, "budget_targets": 0, "pass2_done": 0, "pass2_expired": 0,
         "listing_retry": Counter(), "tiers": {t: [0, 0, 0.0] for t in TIERS},
         "final_failed": 0, "pass2_not_reached": 0, "with_funnel": 0,
@@ -48,6 +48,10 @@ def summarize(logs: list) -> dict:
             out["p1_listing_failed_targets"] += 1
         if f.get("p1_routed_to_pass2"):
             out["p1_routed_targets"] += 1
+        if f.get("p1_tinyfish_direct"):
+            out["p1_tinyfish_direct_targets"] += 1
+        if f.get("p1_listing_fallback"):
+            out["p1_listing_fallback_targets"] += 1
         if f.get("listing_retry"):
             out["listing_retry"][f["listing_retry"]] += 1
         out["p1_article_failed"] += f.get("p1_article_failed", 0)
@@ -95,7 +99,9 @@ def render(s: dict, label: str) -> str:
              "  結果別: " + "、".join(f"{k} {v}" for k, v in s["results"].most_common()),
              "  [Pass1] 一覧取得の失敗(Pass2へ回送) " + str(s["p1_listing_failed_targets"])
              + "対象 / 記事単位の失敗 " + str(s["p1_article_failed"]) + "件",
-             f"  [Pass1] 最初からPass2へ直送した対象(Zyte/JSON API方式) {s['p1_routed_targets']}対象"]
+             f"  [Pass1] 最初からPass2へ直送した対象(Zyte/JSON API方式) {s['p1_routed_targets']}対象"
+             f" / Pass1でTinyFish Fetchを直接使った対象(Zyte停止中のZyte方式・一覧取得の再試行を含む) "
+             f"{s['p1_tinyfish_direct_targets']}対象（うちHTMLの一覧取得をTinyFish Fetchで再試行 {s['p1_listing_fallback_targets']}対象）"]
     if s["listing_retry"]:
         lines.append("  [Pass2: 一覧取得リトライ] " + "、".join(f"{k} {v}" for k, v in s["listing_retry"].items()))
     for t in TIERS:
