@@ -15,6 +15,7 @@ funnel記録を入れる前の日付のログには、記録が無いため0件�
 """
 import sys
 from collections import Counter, defaultdict
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -36,6 +37,7 @@ def summarize(logs: list) -> dict:
         "pending_outstanding": 0, "pending_overflow": 0, "budget_deferred": 0, "budget_skipped_known": 0, "budget_targets": 0, "pass2_done": 0, "pass2_expired": 0,
         "listing_retry": Counter(), "tiers": {t: [0, 0, 0.0] for t in TIERS},
         "final_failed": 0, "pass2_not_reached": 0, "with_funnel": 0,
+        "fail_reasons": Counter(), "agent_skipped": 0,      # 2026-10-22追加: 最終失敗の理由(記事数)
     }
     for l in logs:
         _, f = _split_notes(l.get("notes"))
@@ -60,6 +62,8 @@ def summarize(logs: list) -> dict:
         elif f.get("pass2") == "expired" or f.get("listing_retry") == "expired":
             out["pass2_expired"] += 1
         out["final_failed"] += f.get("final_failed", 0)
+        out["fail_reasons"].update(f.get("fail_reasons") or {})
+        out["agent_skipped"] += int(f.get("agent_skipped") or 0)
         for t, vals in (f.get("tiers") or {}).items():
             if t in out["tiers"]:
                 out["tiers"][t][0] += vals[0]
@@ -101,6 +105,9 @@ def render(s: dict, label: str) -> str:
     lines.append(f"  最終失敗 {s['final_failed']}件 / Pass2未完了のtarget {s['pass2_not_reached']}件"
                  f"（再試行待ちの記事 {s['pending_outstanding']}件が繰越中、"
                  f"保存上限超過で再試行不能 {s['pending_overflow']}件）")
+    if s["fail_reasons"]:
+        lines.append("  [最終失敗の理由(記事数)] " + "、".join(f"{k} {v}" for k, v in s["fail_reasons"].most_common())
+                     + (f" / うちAgentの上限で未実施 {s['agent_skipped']}件" if s["agent_skipped"] else ""))
     lines.append(f"  Pass2完了 {s['pass2_done']}対象 / 期限切れで失敗確定 {s['pass2_expired']}対象")
     lines.append(f"  1対象の時間上限に達した対象 {s['budget_targets']}対象（再試行待ちへ繰越 {s['budget_deferred']}件、"
                  f"既知のため省略 {s['budget_skipped_known']}件）")
@@ -132,7 +139,8 @@ def main(argv: list):
     logs = fetch_logs(client, first, last + timedelta(days=1))
     by_day = defaultdict(list)
     for l in logs:
-        d = datetime.fromisoformat(l["started_at"].replace("Z", "+00:00")).astimezone(JST).strftime("%Y-%m-%d")
+        ts = re.sub(r"\.(\d+)", lambda m: "." + m.group(1).ljust(6, "0")[:6], l["started_at"].replace("Z", "+00:00"))  # 小数秒を6桁に（Python3.10対策）
+        d = datetime.fromisoformat(ts).astimezone(JST).strftime("%Y-%m-%d")
         by_day[d].append(l)
     for d in sorted(by_day):
         print(render(summarize(by_day[d]), d))

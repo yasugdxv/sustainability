@@ -751,9 +751,16 @@ TINYFISH_AGENT_GOAL = (
     '{"status": "failure", "reason": "<short reason>"}. '
     "Never put an explanation of a failure into the body field."
 )
-# 1回の実行(=1日分のバッチ)でAgentを呼び出せる上限。暴走防止の安全弁（適当値、
-# 実運用の呼び出し頻度を見ながら調整する）
-TINYFISH_AGENT_RUN_CAP = 10
+# ── Agentの上限（2026-10-21変更）──────────────────────────────────────────────
+# 従来は「1プロセスあたり10件(バックログは30件)」の先着順で、記事が多い1サイトが上限を使い切り、
+# 後ろのサイトにAgentが回らなかった（2026-10-21: 最終失敗40サイトのうち25サイトが未実施）。
+# 今は「Agentを使うサイト数」と「1サイトあたりの記事数」で上限を決める（いずれも1プロセスあたり）。
+# 環境変数 TINYFISH_AGENT_MAX_SITES / TINYFISH_AGENT_MAX_PER_SITE で変更できる。
+TINYFISH_AGENT_MAX_SITES = int(os.environ.get("TINYFISH_AGENT_MAX_SITES") or 50)
+TINYFISH_AGENT_MAX_PER_SITE = int(os.environ.get("TINYFISH_AGENT_MAX_PER_SITE") or 10)
+# 全体の安全弁（サイト数×1サイトの件数と同じ。--agent-capで、バックログ実行時に小さくもできる）
+TINYFISH_AGENT_RUN_CAP = TINYFISH_AGENT_MAX_SITES * TINYFISH_AGENT_MAX_PER_SITE
+_tinyfish_agent_site_calls = {}          # crawl_target_id -> このプロセスでAgentを呼んだ回数
 _tinyfish_api_key_cache = None
 _tinyfish_agent_call_count = 0
 
@@ -767,13 +774,23 @@ def _get_tinyfish_api_key() -> str:
     return _tinyfish_api_key_cache
 
 
-def _tinyfish_agent_budget_available() -> bool:
-    return _tinyfish_agent_call_count < TINYFISH_AGENT_RUN_CAP
+def _tinyfish_agent_budget_available(target_id=None) -> bool:
+    """Agentを呼べるか。target_idを渡すと、サイト数の上限と、そのサイトの記事数の上限も見る"""
+    if _tinyfish_agent_call_count >= TINYFISH_AGENT_RUN_CAP:
+        return False
+    if target_id is None:
+        return True
+    used = _tinyfish_agent_site_calls.get(target_id)
+    if used is None:                                    # このプロセスで初めてAgentを使うサイト
+        return len(_tinyfish_agent_site_calls) < TINYFISH_AGENT_MAX_SITES
+    return used < TINYFISH_AGENT_MAX_PER_SITE
 
 
-def _record_tinyfish_agent_call() -> None:
+def _record_tinyfish_agent_call(target_id=None) -> None:
     global _tinyfish_agent_call_count
     _tinyfish_agent_call_count += 1
+    if target_id is not None:
+        _tinyfish_agent_site_calls[target_id] = _tinyfish_agent_site_calls.get(target_id, 0) + 1
     if _tinyfish_agent_call_count == TINYFISH_AGENT_RUN_CAP:
         print(f"[TinyFish Agent] 1回の実行あたりの上限({TINYFISH_AGENT_RUN_CAP}件)に達しました。"
               f"以降はこの実行中エスカレーションしません。")
@@ -2354,13 +2371,46 @@ BACKLOG_ARTICLE_SEC = 30        # 仮置き: 1記事あたりの期待所要秒�
 BACKLOG_LISTING_SEC = 90        # 仮置き: 一覧取得の再試行1対象あたり
 BACKLOG_BUDGET_MIN_SEC = 1800
 BACKLOG_BUDGET_MAX_SEC = 7200
-BACKLOG_AGENT_CAP = 30          # バックログ処理で使うTinyFish Agentの上限件数（精度未検証のため無制限にしない）
+BACKLOG_AGENT_CAP = TINYFISH_AGENT_MAX_SITES * TINYFISH_AGENT_MAX_PER_SITE   # バックログ処理で使うTinyFish Agentの上限件数（サイト数×1サイトの件数）
 
 
 def compute_backlog_budget(n_articles: int, n_listing: int) -> int:
     """件数からバックログの時間予算(秒)を算出する（下限・上限あり）"""
     need = n_articles * BACKLOG_ARTICLE_SEC + n_listing * BACKLOG_LISTING_SEC
     return int(min(BACKLOG_BUDGET_MAX_SEC, max(BACKLOG_BUDGET_MIN_SEC, need * 1.2)))
+
+
+# ── 失敗理由の記録（2026-10-22追加）──────────────────────────────────────────
+# 従来は、記事ごとの失敗理由がDBに残らず（件数だけ）、「Fetchが全滅した原因がサイト側かTinyFish側か」を
+# 後から切り分けられなかった（2026-10-22: Fetch 223件・Agent 42件が全滅、原因不明）。
+# 最終失敗した記事について、理由の分類(件数)と、記事URLの例を、notesのfunnelに残す。
+FAIL_SAMPLE_MAX = 3             # 1ログ行に残す、失敗した記事URLの例の上限
+
+
+def _classify_failure(tier, reason) -> str:
+    """失敗理由の文字列を、集計しやすい短い分類にする（上から順に判定）"""
+    r = re.sub(r"https?://\S+", " ", str(reason or "").lower())    # 記事URLの数字(403など)を誤って拾わないよう除く
+    if re.search(r"402", r) or "payment required" in r:
+        return "credit_exhausted"          # TinyFishの残高切れ
+    if re.search(r"429", r) or "too many requests" in r or "rate limit" in r:
+        return "rate_limited"
+    if any(k in r for k in ("login", "log in", "password", "credentials", "authentication", "sign in")):
+        return "login_required"
+    if any(k in r for k in ("captcha", "cloudflare", "access denied", "security verification", "verify you are human",
+                            "bot protection", "bot-check", "blocked", "forbidden")) or re.search(r"403", r):
+        return "bot_blocked"
+    if any(k in r for k in ("not an article", "no article", "not found", "contact form", "does not exist",
+                            "job listing", "not article")) or re.search(r"404", r):
+        return "not_article"
+    if any(k in r for k in ("短すぎ", "本文が空", "empty")):
+        return "empty_or_short"
+    if any(k in r for k in ("timeout", "timed out", "chunkedencodingerror", "connection", "ended prematurely")):
+        return "network_error"
+    if "文書抽出エラー" in r:
+        return "document_error"
+    if tier == "tinyfish_fetch" and "取得失敗" in r:
+        return "fetch_failed"              # Fetchが理由を返さず失敗（サイト側の拒否の可能性）
+    return "other"
 
 
 def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verify: bool,
@@ -2398,7 +2448,8 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
                 unfinished = still_failed + remaining[idx:]
                 print(f"[Pass2: {tier}] 時間予算を使い切ったため中断します（未完了{len(unfinished)}件は次回へ繰り越し）")
                 break
-            if tier == "tinyfish_agent" and not _tinyfish_agent_budget_available():
+            if tier == "tinyfish_agent" and not _tinyfish_agent_budget_available(item["target"].get("crawl_target_id")):
+                item["agent_skipped"] = True     # Agentの上限で試せなかった（失敗理由の記録用）
                 still_failed.append(item)
                 continue
             tier_attempted[item["crawl_log_id"]] += 1
@@ -2406,12 +2457,13 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
             extracted = extract_article(item["cand"]["url"], proxies, verify, tier=tier)
             tier_sec[item["crawl_log_id"]] += time.perf_counter() - _t0
             if tier == "tinyfish_agent":
-                _record_tinyfish_agent_call()
+                _record_tinyfish_agent_call(item["target"].get("crawl_target_id"))
             time.sleep(ARTICLE_FETCH_SLEEP)
             if not extracted.get("ok") or extracted.get("encoding_suspect"):
                 reason = extracted.get("error") or f"http_{extracted.get('http_status')}" if not extracted.get("ok") \
                     else "文字化け疑い"
                 error_counts[f"{tier}|{str(reason)[:60]}"] += 1
+                item["last_fail"] = (tier, str(reason))     # 最後に失敗した段階と理由（最終失敗の記録用）
                 still_failed.append(item)
                 continue
             tier_ok[item["crawl_log_id"]] += 1
@@ -2447,10 +2499,20 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
     final = [] if timed_out else remaining
     final_failed_by_log = defaultdict(int)
     bot_block_by_log = defaultdict(int)
+    fail_reasons_by_log = defaultdict(Counter)
+    fail_samples_by_log = defaultdict(list)
+    agent_skipped_by_log = defaultdict(int)
     for item in final:
         final_failed_by_log[item["crawl_log_id"]] += 1
         if item.get("is_bot_block"):
             bot_block_by_log[item["crawl_log_id"]] += 1
+        last_tier, last_reason = item.get("last_fail") or (None, "")
+        fail_reasons_by_log[item["crawl_log_id"]][_classify_failure(last_tier, last_reason)] += 1
+        if len(fail_samples_by_log[item["crawl_log_id"]]) < FAIL_SAMPLE_MAX:
+            fail_samples_by_log[item["crawl_log_id"]].append(
+                {"u": item["cand"]["url"][:100], "r": f"{last_tier}:{last_reason}"[:100]})
+        if item.get("agent_skipped"):
+            agent_skipped_by_log[item["crawl_log_id"]] += 1
     unfinished_by_log = defaultdict(list)
     for item in unfinished:
         unfinished_by_log[item["crawl_log_id"]].append(item)
@@ -2464,6 +2526,10 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
             patch["pass2"] = "done"
         if crawl_log_id in final_failed_by_log:
             patch["final_failed"] = final_failed_by_log[crawl_log_id]
+            patch["fail_reasons"] = dict(fail_reasons_by_log[crawl_log_id])       # 例: {"bot_blocked": 3, "not_article": 1}
+            patch["fail_samples"] = fail_samples_by_log[crawl_log_id]             # 例: [{"u": URL, "r": "tinyfish_agent:..."}]
+            if agent_skipped_by_log.get(crawl_log_id):
+                patch["agent_skipped"] = agent_skipped_by_log[crawl_log_id]       # Agentの上限で試せなかった記事数
         update_crawl_log_after_escalation(
             client, crawl_log_id, final_failures=final_failed_by_log.get(crawl_log_id, 0),
             bot_block_detections=bot_block_by_log.get(crawl_log_id, 0), funnel_patch=patch)
@@ -2510,11 +2576,11 @@ def _resolve_tiered_listing(target: dict, proxies: dict, verify: bool, tiers: tu
         # 2026-10-19: 記事の再試行にしか効いていなかったAgentの上限を、一覧取得にも効かせる
         # （Agentは1回数十秒〜数分・有料。上限を超えたら使わず、失敗として返す）
         if tier == "tinyfish_agent":
-            if not _tinyfish_agent_budget_available():
+            if not _tinyfish_agent_budget_available(target.get("crawl_target_id")):
                 error_message = (f"{error_message}（TinyFish Agentは上限に達したため未実施）" if error_message
                                  else "TinyFish Agentの上限に達したため一覧取得を試行しませんでした")
                 continue
-            _record_tinyfish_agent_call()
+            _record_tinyfish_agent_call(target.get("crawl_target_id"))
         candidates, http_status, single_page_mode, error_message, is_404 = \
             _list_candidates_with_tier(target, proxies, verify, tier)
         if error_message is None:
@@ -2934,6 +3000,7 @@ def _run_pass2_backlog(budget_sec, client, proxies, verify, agent_cap, log_path:
     global TINYFISH_AGENT_RUN_CAP, _tinyfish_agent_call_count
     TINYFISH_AGENT_RUN_CAP = BACKLOG_AGENT_CAP if agent_cap is None else agent_cap
     _tinyfish_agent_call_count = 0
+    _tinyfish_agent_site_calls.clear()
     started_at = datetime.now(_JST)
     if client is None:
         config = load_config()

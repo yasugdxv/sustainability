@@ -370,7 +370,8 @@ def test_run_backlog_auto_budget_and_agent_cap(monkeypatch):
     result = ac.run_pass2_backlog(client=client, proxies={}, verify=True)       # 予算・上限とも指定なし
 
     assert result["budget_sec"] == ac.compute_backlog_budget(result["article_items"], result["listing_items"])
-    assert ac.TINYFISH_AGENT_RUN_CAP == ac.BACKLOG_AGENT_CAP == 30               # バックログ用の上限に切り替わる
+    assert ac.TINYFISH_AGENT_RUN_CAP == ac.BACKLOG_AGENT_CAP == \
+        ac.TINYFISH_AGENT_MAX_SITES * ac.TINYFISH_AGENT_MAX_PER_SITE             # バックログ用の上限に切り替わる
     # 手動指定は自動算出より優先される
     again = ac.run_pass2_backlog(budget_sec=123, agent_cap=5, client=client, proxies={}, verify=True)
     assert again["budget_sec"] == 123 and ac.TINYFISH_AGENT_RUN_CAP == 5
