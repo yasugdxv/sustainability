@@ -343,8 +343,19 @@ VERIFY_SYSTEM_PROMPT = """あなたは一次情報の実在確認だけを行う
 """
 
 
+def is_summary_only(article: dict) -> bool:
+    """本文を取得できず、RSSの題名と要約で代用して保存された記事か（article_crawler.RSS_SUMMARY_ONLY_MARK）"""
+    return str(article.get("extraction_error") or "").startswith("RSS_SUMMARY_ONLY")
+
+
+SUMMARY_ONLY_NOTICE = ("【注意】この記事は、本文を取得できず、RSSに載っている題名と要約のみです。"
+                       "要約に書かれていない事実を補わず、判断できない項目は「不明」としてください。\n\n")
+
+
 def build_user_prompt(article: dict, target: dict) -> str:
     text = (article.get("extracted_text") or "")[:MAX_ARTICLE_CHARS]
+    if is_summary_only(article):
+        text = SUMMARY_ONLY_NOTICE + text
     return (
         f"タイトル: {article.get('title') or ''}\n"
         f"発信元: {target.get('publisher_name') or ''}（{target.get('domain') or ''}）\n"
@@ -425,6 +436,8 @@ def analyze_article(azure_client, model: str, rubric_text: str, tag_text: str,
     if data is None:
         raise last_error
     data["_evidence"] = []
+    if is_summary_only(article):          # 要約のみで判定した記事は、必ず、人の確認の対象にする
+        data["needs_review"] = True
 
     # call2: call1がWeb検索確認を必要と判断した場合のみ、検証専用の呼び出しを行う
     claim = data.get("primary_source_claim")
@@ -669,7 +682,7 @@ def save_keyword_filtered_stub(client: SupabaseClient, article: dict) -> None:
 # ─── 対象記事の抽出 ─────────────────────────────────────────────
 def fetch_unanalyzed_articles(client: SupabaseClient, limit: int = None) -> list:
     articles = client.select("articles", {
-        "select": "article_id,title,extracted_text,published_at,final_url,fetched_url,crawl_target_id",
+        "select": "article_id,title,extracted_text,published_at,final_url,fetched_url,crawl_target_id,extraction_error",
         "is_current": "eq.true",
     })
     analyzed = client.select("article_analysis", {"select": "article_id", "is_current": "eq.true"})
