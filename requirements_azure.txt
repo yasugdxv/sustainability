@@ -21,6 +21,8 @@ trafilatura>=1.8.0
 lxml>=5.0.0
 python-docx>=1.1.0
 pypdf>=4.0.0
+# 暗号化(AES)されたPDFの本文抽出に必要（pypdfが内部で使う。無いと「cryptography>=3.1 is required for AES algorithm」で失敗する）
+cryptography>=3.1
 python-dateutil>=2.9.0
 playwright>=1.40.0
 
