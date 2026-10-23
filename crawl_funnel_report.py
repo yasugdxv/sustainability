@@ -38,6 +38,7 @@ def summarize(logs: list) -> dict:
         "listing_retry": Counter(), "tiers": {t: [0, 0, 0.0] for t in TIERS},
         "final_failed": 0, "pass2_not_reached": 0, "with_funnel": 0,
         "fail_reasons": Counter(), "agent_skipped": 0,      # 2026-10-22追加: 最終失敗の理由(記事数)
+        "include_nomatch": [],      # 2026-10-23追加: 条件に合う記事が0件なのに、記事らしいリンクが一覧にある対象 [(対象ID, {n, top})]
     }
     for l in logs:
         _, f = _split_notes(l.get("notes"))
@@ -66,6 +67,8 @@ def summarize(logs: list) -> dict:
         elif f.get("pass2") == "expired" or f.get("listing_retry") == "expired":
             out["pass2_expired"] += 1
         out["final_failed"] += f.get("final_failed", 0)
+        if f.get("include_nomatch"):
+            out["include_nomatch"].append((l["crawl_target_id"], f["include_nomatch"]))
         out["fail_reasons"].update(f.get("fail_reasons") or {})
         out["agent_skipped"] += int(f.get("agent_skipped") or 0)
         for t, vals in (f.get("tiers") or {}).items():
@@ -111,6 +114,9 @@ def render(s: dict, label: str) -> str:
     lines.append(f"  最終失敗 {s['final_failed']}件 / Pass2未完了のtarget {s['pass2_not_reached']}件"
                  f"（再試行待ちの記事 {s['pending_outstanding']}件が繰越中、"
                  f"保存上限超過で再試行不能 {s['pending_overflow']}件）")
+    if s["include_nomatch"]:
+        lines.append(f"  [警告] 条件(include_paths)に合う記事が0件なのに、記事らしいリンクが一覧にある対象 "
+                     f"{len(s['include_nomatch'])}件（設定ミス・サイト構成の変更の疑い）")
     if s["fail_reasons"]:
         lines.append("  [最終失敗の理由(記事数)] " + "、".join(f"{k} {v}" for k, v in s["fail_reasons"].most_common())
                      + (f" / うちAgentの上限で未実施 {s['agent_skipped']}件" if s["agent_skipped"] else ""))
@@ -148,8 +154,16 @@ def main(argv: list):
         ts = re.sub(r"\.(\d+)", lambda m: "." + m.group(1).ljust(6, "0")[:6], l["started_at"].replace("Z", "+00:00"))  # 小数秒を6桁に（Python3.10対策）
         d = datetime.fromisoformat(ts).astimezone(JST).strftime("%Y-%m-%d")
         by_day[d].append(l)
+    names = None
     for d in sorted(by_day):
-        print(render(summarize(by_day[d]), d))
+        summary = summarize(by_day[d])
+        print(render(summary, d))
+        if summary["include_nomatch"]:
+            if names is None:
+                names = {t["crawl_target_id"]: t["target_name"] for t in client.select(
+                    "crawl_targets", {"select": "crawl_target_id,target_name"})}
+            for tid, info in summary["include_nomatch"][:30]:
+                print(f"    - {names.get(tid, tid)[:30]}: 除外された記事らしいリンク{info.get('n')}件 例: {', '.join(info.get('top') or [])}")
         print()
     if len(by_day) > 1:
         print(render(summarize(logs), f"{first:%Y-%m-%d}〜{last:%Y-%m-%d} 合計"))

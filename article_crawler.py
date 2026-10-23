@@ -75,6 +75,46 @@ NON_ARTICLE_PATH_SEGMENTS = frozenset({
 NON_ARTICLE_HOST_PREFIXES = ("jobs.", "careers.", "idp.", "auth.", "login.", "sso.", "accounts.")
 
 
+# ── フィード型の判定とサイレント故障の検知（2026-10-23追加）──────────────────────
+# 方式を「RSS→Zyte/HTML」に変えても、種別(endpoint_type)がRSSのままだと、フィードのURLを「1ページ」として
+# 扱い、中の記事を取りに行かなかった（8対象が、全期間で記事0件。Amnestyはフィードの XML 7万文字を1件の
+# 「記事」として保存していた）。種別がRSSで、URLがフィードの形なら、方式によらずRSSとして一覧を読む。
+_FEED_PATH_RE = re.compile(r"(rss|feed|atom|\.xml$)", re.IGNORECASE)
+
+
+def _is_feed_target(target: dict) -> bool:
+    """種別がRSSで、一覧のURLがフィードの形(rss/feed/atom/.xml)か（HTMLのニュース一覧は含めない）"""
+    if (target.get("endpoint_type") or "") != "RSS":
+        return False
+    return bool(_FEED_PATH_RE.search(urlparse(target.get("target_url") or "").path))
+
+
+# 「条件(include_paths)に合う記事が0件なのに、一覧には記事らしいリンクがある」を検知する
+# （include_pathsの設定ミス・サイト構成の変更。2026-10-23: 6対象が半年近く記事0件のまま気づかれなかった）
+INCLUDE_NOMATCH_MIN_LINKS = 3
+_ARTICLE_PATH_WORDS = ("news", "press", "blog", "insight", "publication", "report", "article", "stor", "media",
+                       "resource", "update", "event", "release", "research", "analysis", "statement", "speech",
+                       "newsroom", "magazine", "ニュース", "お知らせ", "プレス")
+_DATE_IN_PATH_RE = re.compile(r"(19|20)\d{2}([/\-_]|$|\d)|/\d{4}/\d{1,2}/")
+
+
+def _looks_article_like(path: str) -> bool:
+    """URLのパスが、記事らしいか（2階層以上で、日付・記事系の語・長いスラッグのいずれかがある）"""
+    segs = [x for x in path.split("/") if x]
+    if len(segs) < 2:
+        return False
+    low = path.lower()
+    return bool(_DATE_IN_PATH_RE.search(low)) or any(w in low for w in _ARTICLE_PATH_WORDS) or len(segs[-1]) > 25
+
+
+def _include_nomatch_funnel(target: dict) -> dict:
+    """list_html_candidates()が残した統計から、funnelへ入れる警告を作る（無ければ空）"""
+    st = target.get("_listing_stats") or {}
+    if not st.get("include_nomatch"):
+        return {}
+    return {"include_nomatch": {"n": st["include_nomatch"], "top": st.get("top", [])}}
+
+
 def _is_non_article_url(parsed, path: str, include_paths: list) -> bool:
     """記事ではないURL(問い合わせ・登録・求人・検索・API・ログイン等)か。
     include_pathsで、"/"以外の具体的なパスが明示的に指定されている場合は、その指定を優先して除外しない"""
@@ -1550,6 +1590,7 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
     self_urls.add(f"{final_parsed.scheme}://{final_parsed.netloc}{final_parsed.path.rstrip('/') or '/'}")
     seen = set()
     candidates = []
+    excluded_like = []      # include_pathsで除外された、記事らしいリンク（サイレント故障の検知用）
     for href in tree.xpath("//a/@href"):
         full = urljoin(link_base, href)
         parsed = urlparse(full)
@@ -1567,6 +1608,8 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
             if path.lower().endswith(NON_ARTICLE_EXTENSIONS):
                 continue
             if include_paths and not any(_path_matches(path, p) for p in include_paths):
+                if _looks_article_like(path) and not _is_non_article_url(parsed, path, []):
+                    excluded_like.append(path)
                 continue
             if exclude_paths and any(_path_matches(path, p) for p in exclude_paths):
                 continue
@@ -1583,6 +1626,11 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
         candidates.append({"url": normalized, "title": None, "published_at": None})
         if len(candidates) >= max_links:
             break
+    # 条件に合う記事が0件なのに、記事らしいリンクが複数ある場合は、統計を残す（funnelに警告として記録される）
+    target.pop("_listing_stats", None)
+    if not candidates and len(excluded_like) >= INCLUDE_NOMATCH_MIN_LINKS:
+        top = Counter("/" + "/".join([x for x in p.split("/") if x][:2]) for p in excluded_like)
+        target["_listing_stats"] = {"include_nomatch": len(excluded_like), "top": [k for k, _ in top.most_common(3)]}
     return candidates, status_code
 
 
@@ -2034,7 +2082,11 @@ def _list_candidates_for_target(target: dict, proxies: dict, verify: bool, allow
         elif method == "JSON API":
             candidates, http_status = list_json_api_candidates(target, proxies, verify, use_zyte=True)
         elif method in ("HTML", "ブラウザ操作", "Zyte"):
-            if endpoint_type == "サイトマップ":
+            if _is_feed_target(target):
+                # 種別RSS+フィードURL: 方式がZyte/HTMLでも、フィードとして読む（1ページ扱いにしない）
+                candidates, http_status = list_rss_candidates(target, proxies, verify,
+                                                                allow_escalation=allow_escalation)
+            elif endpoint_type == "サイトマップ":
                 candidates, http_status = list_sitemap_candidates(target, proxies, verify)
             elif endpoint_type in LISTING_ENDPOINT_TYPES:
                 candidates, http_status = list_html_candidates(target, proxies, verify, use_browser=use_browser,
@@ -2105,6 +2157,11 @@ def _list_candidates_with_tier(target: dict, proxies: dict, verify: bool, tier: 
     try:
         if method == "JSON API":
             candidates, http_status = list_json_api_candidates(target, proxies, verify, tier=tier)
+        elif _is_feed_target(target):
+            # フィード(XML)は、Fetch/Agentでは構造が壊れて読めない。通常のHTTPで読み、Agentでは試さない（無駄な課金を避ける）
+            if tier == "tinyfish_agent":
+                raise ValueError("RSSフィードはAgentでは取得しません（XMLの構造が保てないため）")
+            candidates, http_status = list_rss_candidates(target, proxies, verify, allow_escalation=False)
         elif endpoint_type == "サイトマップ":
             candidates, http_status = list_sitemap_candidates(target, proxies, verify)
         elif endpoint_type in LISTING_ENDPOINT_TYPES:
@@ -2413,6 +2470,7 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
         crawl_funnel["p1_pending"] = [_pending_entry(p) for p in pending_escalations[:PENDING_STORE_MAX]]
         if len(pending_escalations) > PENDING_STORE_MAX:
             crawl_funnel["p1_pending_overflow"] = len(pending_escalations) - PENDING_STORE_MAX
+    crawl_funnel.update(_include_nomatch_funnel(target))     # 条件に合う記事が0件なのに、記事らしいリンクがある（設定ミスの疑い）
     if budget_deferred or budget_skipped_known:
         crawl_funnel["p1_budget_deferred"] = budget_deferred          # 時間上限で再試行待ちへ回した候補
         crawl_funnel["p1_budget_skipped_known"] = budget_skipped_known  # 既知の記事のため取得しなかった候補
