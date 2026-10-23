@@ -179,12 +179,24 @@ _BOT_BLOCK_TEXT_PATTERNS = [
     re.compile(r"access to this page has been denied", re.IGNORECASE),
     re.compile(r"ロボットではないことを確認"),
     re.compile(r"アクセスが拒否されました"),
+    # 2026-10-23追加: PEFCが、Bot確認の画面(HTTP 200)を返し、題名「Security check」の中身のない記事が保存される寸前だった
+    re.compile(r"complete a short check", re.IGNORECASE),
+    re.compile(r"javascript is required to (continue|view|proceed)", re.IGNORECASE),
+    re.compile(r"checking your browser", re.IGNORECASE),
+    re.compile(r"enable javascript and cookies to continue", re.IGNORECASE),
+    re.compile(r"\bjust a moment\b.{0,80}\b(verif|check|wait)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"ddos protection by", re.IGNORECASE),
+    re.compile(r"cloudflare ray id", re.IGNORECASE),
 ]
+# Bot確認の画面は、題名にも特徴が出る（本文が短い場合に限り、題名だけで判定する）
+_BOT_BLOCK_TITLE_PATTERN = re.compile(
+    r"^\s*(security check|just a moment\.*|attention required!?( \| cloudflare)?|access denied|robot check|human verification|"
+    r"verifying you are human.*|please wait\.*|one moment, please\.*|are you a robot\??)\s*$", re.IGNORECASE)
 
 
-def _detect_bot_block(final_url: str, text: str) -> str | None:
+def _detect_bot_block(final_url: str, text: str, title: str = "") -> str | None:
     """本文がBot対策（人間認証・アクセス拒否）ページと判定できれば、その理由文字列を返す。
-    該当しなければNone。"""
+    該当しなければNone。titleを渡すと、本文が短い場合に、題名(例: Security check)でも判定する"""
     domain = urlparse(final_url).netloc.lower()
     for blocked_domain in _BOT_BLOCK_URL_DOMAINS:
         if blocked_domain in domain:
@@ -193,6 +205,8 @@ def _detect_bot_block(final_url: str, text: str) -> str | None:
         for pat in _BOT_BLOCK_TEXT_PATTERNS:
             if pat.search(text):
                 return f"Bot対策の定型文を検知（\"{pat.pattern}\"）"
+        if title and _BOT_BLOCK_TITLE_PATTERN.match(title):
+            return f"Bot対策の画面の題名を検知（\"{title.strip()[:40]}\"）"
     return None
 
 
@@ -1307,7 +1321,7 @@ def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bo
     if not text:
         return {"ok": False, "error": "本文抽出に失敗（空）", "http_status": status_code}
 
-    bot_block_reason = _detect_bot_block(final_url, text)
+    bot_block_reason = _detect_bot_block(final_url, text, (data.get("title") or ""))
     if bot_block_reason:
         return {"ok": False, "error": bot_block_reason, "http_status": status_code}
 
@@ -2659,17 +2673,17 @@ FAIL_SAMPLE_MAX = 3             # 1ログ行に残す、失敗した記事URLの
 def _classify_failure(tier, reason) -> str:
     """失敗理由の文字列を、集計しやすい短い分類にする（上から順に判定）"""
     r = re.sub(r"https?://\S+", " ", str(reason or "").lower())    # 記事URLの数字(403など)を誤って拾わないよう除く
-    if re.search(r"402", r) or "payment required" in r:
+    if re.search(r"\b402\b", r) or "payment required" in r:
         return "credit_exhausted"          # TinyFishの残高切れ
-    if re.search(r"429", r) or "too many requests" in r or "rate limit" in r:
+    if re.search(r"\b429\b", r) or "too many requests" in r or "rate limit" in r:
         return "rate_limited"
     if any(k in r for k in ("login", "log in", "password", "credentials", "authentication", "sign in")):
         return "login_required"
     if any(k in r for k in ("captcha", "cloudflare", "access denied", "security verification", "verify you are human",
-                            "bot protection", "bot-check", "blocked", "forbidden")) or re.search(r"403", r):
+                            "bot protection", "bot-check", "blocked", "forbidden")) or re.search(r"\b403\b", r):
         return "bot_blocked"
     if any(k in r for k in ("not an article", "no article", "not found", "contact form", "does not exist",
-                            "job listing", "not article")) or re.search(r"404", r):
+                            "job listing", "not article")) or re.search(r"\b404\b", r):
         return "not_article"
     if any(k in r for k in ("短すぎ", "本文が空", "empty")):
         return "empty_or_short"
