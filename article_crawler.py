@@ -60,6 +60,7 @@ DOCUMENT_EXTENSIONS = (".pdf", ".docx")
 NON_ARTICLE_EXTENSIONS = (
     ".xlsx", ".xls", ".csv", ".doc", ".pptx", ".ppt",
     ".zip", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mp3",
+    ".md",      # 記事と同じ内容のMarkdown版（例: CDPのサイトマップに、記事URL+.mdが並ぶ。重複して保存しない）
 )
 # ── 記事ではないURLの除外（2026-10-23追加）──────────────────────────────────────
 # include_paths="/" の一覧では、問い合わせフォーム・登録・求人・検索・APIなどのリンクまで候補になり、
@@ -1364,6 +1365,31 @@ def _sitemap_sort_key(pub_dt, path: str):
     return None
 
 
+SITEMAP_MAX_CHILDREN = 40      # サイトマップ索引から読む、子サイトマップの上限（lastmodが新しい順。search_conditionsの max_children:N で変更可）
+
+
+def _clean_loc(text: str) -> str:
+    """<loc>の中身。CDATAで包まれている場合(例: WBCSDの索引)も、取り除く"""
+    return re.sub(r"<!\[CDATA\[|\]\]>", "", text).strip()
+
+
+def _fetch_sitemap_text(url: str, proxies: dict, verify: bool) -> str:
+    resp = requests.get(url, proxies=proxies, verify=verify, timeout=REQUEST_TIMEOUT, headers=_HEADERS)
+    resp.raise_for_status()
+    if url.lower().endswith(".gz"):                 # 圧縮された子サイトマップ(.xml.gz)
+        import gzip
+        return gzip.decompress(resp.content).decode("utf-8", errors="replace")
+    return resp.text
+
+
+def _parse_lastmod(text):
+    try:
+        d = dateutil_parser.parse(text.strip())
+        return d.astimezone(timezone.utc) if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
     """XMLサイトマップ(<url><loc>...</loc><lastmod>...</lastmod></url>)から候補記事を
     一覧する。<a href>を汎用収集するlist_html_candidates()とは構造が異なる
@@ -1372,7 +1398,11 @@ def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
     2026-10-23: 従来は、ファイルの先頭から上限(既定30件)まで取っていたため、古い順に並ぶサイトマップ
     (ISSB/IFRS: 2018年〜。ニュース記事2,135件)では、古い30件しか見ず、新しい記事に届かなかった。
     条件に合う候補をすべて集め、新しい順(lastmod、無ければURLの日付)に並べてから、上限を適用する。
-    日付がまったく無いサイトマップは、従来どおり、ファイルの順で上限まで取る"""
+    日付がまったく無いサイトマップは、従来どおり、ファイルの順で上限まで取る
+
+    2026-10-23: サイトマップ索引(<sitemapindex>。EPA=38件の子、WBCSD、IEAなど)に対応。子サイトマップを
+    lastmodの新しい順に、最大max_children件(既定40)読み、全体を新しい順に並べてから、上限を適用する。
+    子の取得に失敗しても、他の子で続ける"""
     url = target["target_url"]
     domain = target.get("domain") or urlparse(url).netloc
     include_paths = [p.strip() for p in (target.get("include_paths") or "").split(",") if p.strip()]
@@ -1381,32 +1411,49 @@ def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
     resp = requests.get(url, proxies=proxies, verify=verify, timeout=REQUEST_TIMEOUT, headers=_HEADERS)
     resp.raise_for_status()
 
+    root_text = resp.text
+    if "<sitemapindex" in root_text:
+        children = []
+        for sm in re.findall(r"<sitemap>(.*?)</sitemap>", root_text, re.S):
+            m = re.search(r"<loc>(.*?)</loc>", sm, re.S)
+            if m:
+                lm = re.search(r"<lastmod>(.*?)</lastmod>", sm)
+                children.append((_clean_loc(m.group(1)), _parse_lastmod(lm.group(1)) if lm else None))
+        if any(c[1] for c in children):             # lastmodが新しい順（無いものは最後。同じ時刻は、索引の順）
+            children = sorted(children, key=lambda c: (c[1] is None, -(c[1].timestamp() if c[1] else 0)))
+        try:
+            limit = int(_search_setting(target, "max_children", SITEMAP_MAX_CHILDREN))
+        except ValueError:
+            limit = SITEMAP_MAX_CHILDREN
+        blocks = []
+        for child_url, _ in children[:limit]:
+            try:
+                blocks.extend(re.findall(r"<url>(.*?)</url>", _fetch_sitemap_text(child_url, proxies, verify), re.S))
+            except Exception:       # 子の1つが失敗しても、他の子で続ける
+                continue
+    else:
+        blocks = re.findall(r"<url>(.*?)</url>", root_text, re.S)
+
     candidates = []
     sort_keys = []
-    for block in re.findall(r"<url>(.*?)</url>", resp.text, re.S):
-        loc_match = re.search(r"<loc>(.*?)</loc>", block)
+    for block in blocks:
+        loc_match = re.search(r"<loc>(.*?)</loc>", block, re.S)
         if not loc_match:
             continue
-        loc = loc_match.group(1).strip()
+        loc = _clean_loc(loc_match.group(1))
         parsed = urlparse(loc)
         if not parsed.scheme.startswith("http") or domain not in parsed.netloc:
             continue
         path = parsed.path
         if path.lower().endswith(NON_ARTICLE_EXTENSIONS):
             continue
-        if include_paths and not any(path.startswith(p) for p in include_paths):
+        if include_paths and not any(_path_matches(path, p) for p in include_paths):
             continue
-        if exclude_paths and any(path.startswith(p) for p in exclude_paths):
+        if exclude_paths and any(_path_matches(path, p) for p in exclude_paths):
             continue
 
-        pub_dt = None
         lastmod_match = re.search(r"<lastmod>(.*?)</lastmod>", block)
-        if lastmod_match:
-            try:
-                pub_dt = dateutil_parser.parse(lastmod_match.group(1).strip())
-                pub_dt = pub_dt.astimezone(timezone.utc) if pub_dt.tzinfo else pub_dt.replace(tzinfo=timezone.utc)
-            except Exception:
-                pub_dt = None
+        pub_dt = _parse_lastmod(lastmod_match.group(1)) if lastmod_match else None
 
         candidates.append({"url": loc, "title": None, "published_at": pub_dt})
         sort_keys.append(_sitemap_sort_key(pub_dt, path))
@@ -1430,6 +1477,16 @@ def _path_matches(path: str, pattern: str) -> bool:
     return path.startswith(pattern)
 
 
+def _search_setting(target: dict, key: str, default=None):
+    """search_conditions列の「キー:値」の指定を読む。複数ある場合は「;」区切り（例: max_links:60;max_children:50）。
+    従来の単独指定(max_links:30)も、そのまま読める（2026-10-23: サイトマップ索引の子の上限を足すため、複数指定に対応）"""
+    for part in re.split(r"[;；]", target.get("search_conditions") or ""):
+        part = part.strip()
+        if part.startswith(key + ":"):
+            return part.split(":", 1)[1].strip()
+    return default
+
+
 def _target_max_links(target: dict) -> int:
     """search_conditions列に"max_links:N"形式の指定があれば、このターゲットの一覧候補上限として
     使う（既定はMAX_HTML_LINKS_PER_TARGET=30）。2026-10-01、環境省(水規制)で確認:
@@ -1439,10 +1496,10 @@ def _target_max_links(target: dict) -> int:
     このsearch_conditions指定で対象ターゲットだけ上限を緩和できるようにする
     （同列はforce_zyte_browserフラグとしても流用済みのため、形式が重複しないよう
     "max_links:"プレフィックスで判別する）"""
-    sc = target.get("search_conditions") or ""
-    if sc.startswith("max_links:"):
+    value = _search_setting(target, "max_links")
+    if value:
         try:
-            return int(sc.split(":", 1)[1])
+            return int(value)
         except ValueError:
             pass
     return MAX_HTML_LINKS_PER_TARGET
