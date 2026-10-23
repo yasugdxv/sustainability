@@ -1355,6 +1355,27 @@ def list_rss_candidates(target: dict, proxies: dict, verify: bool, allow_escalat
     return candidates, status_code  # 全リトライ後もダメならそのまま返す(呼び出し元でextracted["title"]優先により救済される場合がある)
 
 
+# ── RSSの要約での代用保存（2026-10-23追加）────────────────────────────────────────
+# FT・McKinsey・Reuters・Council of the EU・ICG等は、記事ページがBot対策で、Fetch・Agentでも取得できない。
+# しかし、RSSには、題名と要約(150〜300字)がある。ニューラルは、この程度の情報から、記事を選んでいる。
+# 全段階で本文を取得できず、最終失敗した記事に限り、フィードの題名＋要約を、記事として保存する（補った内容は足さない）。
+# 保存した記事は、extraction_errorに RSS_SUMMARY_ONLY を記録し、分析では「要約のみ」と明示し、人の確認が必要(needs_review)にする。
+# 後で本文を取得できれば、既存の仕組み(本文が違えば新版)で、自動で全文に置き換わる。
+RSS_SUMMARY_ONLY_MARK = "RSS_SUMMARY_ONLY"
+RSS_SUMMARY_MIN_CHARS = 80       # これ未満の要約は、記事として使えないため、代用しない
+RSS_SUMMARY_MAX_CHARS = 1500
+
+
+def _rss_entry_summary(entry) -> str:
+    """フィードの1項目から、要約のテキストを取り出す(HTMLタグを除き、空白を整える)。content:encodedが、より長ければそちらを使う"""
+    import html as _html
+    parts = [entry.get("summary") or entry.get("description") or ""]
+    for c in entry.get("content") or []:
+        parts.append(c.get("value") or "")
+    best = max((re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", p))).strip() for p in parts), key=len, default="")
+    return best[:RSS_SUMMARY_MAX_CHARS]
+
+
 def _list_rss_candidates_once(target: dict, proxies: dict, verify: bool, allow_escalation: bool = True) -> list:
     """RSS取得。素のHTTPがBot対策等で失敗した場合はZyte経由に自動フォールバックする
     (2026-09-17、unwater.org/stand.earth等で確認: 素のrequestsは403でも、Zyteの
@@ -1383,7 +1404,7 @@ def _list_rss_candidates_once(target: dict, proxies: dict, verify: bool, allow_e
         link = urljoin(final_url, link)
         pp = entry.get("published_parsed") or entry.get("updated_parsed")
         pub_dt = datetime(*pp[:6], tzinfo=timezone.utc) if pp else None
-        candidates.append({"url": link, "title": title, "published_at": pub_dt})
+        candidates.append({"url": link, "title": title, "published_at": pub_dt, "summary": _rss_entry_summary(entry)})
     return candidates, status_code
 
 
@@ -1776,7 +1797,7 @@ def looks_like_listing_page(text: str) -> bool:
 
 def save_article(client: SupabaseClient, target: dict, article_url: str, fetched_url: str,
                   final_url: str, title: str, pub_dt, updated_dt, text: str,
-                  document_info: dict = None) -> tuple:
+                  document_info: dict = None, extraction_error: str = None) -> tuple:
     """article_urls / articles へ保存する。document_info(PDF/.docx用)があれば
     article_filesにも本文ファイルとして記録する。(is_new_url, is_new_version)を返す。
     本文が一覧・検索結果ページの特徴を持つ場合や、最終URLがクロール先のtarget_url自体
@@ -1832,6 +1853,7 @@ def save_article(client: SupabaseClient, target: dict, article_url: str, fetched
         "extracted_text": text,
         "extraction_status": "成功",
         "character_count": len(text) if text else 0,
+        **({"extraction_error": extraction_error} if extraction_error else {}),
     }])
 
     if document_info:
@@ -1975,12 +1997,14 @@ def _pending_entry(item: dict) -> dict:
         entry["d"] = pub.isoformat() if hasattr(pub, "isoformat") else str(pub)
     if item.get("is_bot_block"):
         entry["b"] = 1
+    if cand.get("summary"):
+        entry["s"] = cand["summary"][:300]       # RSSの要約（最終失敗時の代用保存用。notesが大きくなりすぎないよう300字まで）
     return entry
 
 
 def _entry_to_cand(entry: dict) -> dict:
     """_pending_entry()の逆変換（Pass2が使う候補の形に戻す）"""
-    return {"url": entry["u"], "title": entry.get("t"), "published_at": _parse_datetime(entry.get("d"))}
+    return {"url": entry["u"], "title": entry.get("t"), "published_at": _parse_datetime(entry.get("d")), "summary": entry.get("s") or ""}
 
 
 def update_crawl_log_after_escalation(client: SupabaseClient, crawl_log_id: str, *,
@@ -2500,6 +2524,27 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
     }
 
 
+def _save_rss_summary_fallback(client: SupabaseClient, item: dict, reason: str):
+    """全段階で本文を取得できなかった記事を、フィードの題名＋要約で代用保存する。保存した場合は(is_new_url, is_new_version)、
+    対象外(要約が短い・期間外・サイト名のみの題名・一覧ページ等)ならNoneを返す"""
+    cand, target = item["cand"], item["target"]
+    summary = (cand.get("summary") or "").strip()
+    title = (cand.get("title") or "").strip()
+    if len(summary) < RSS_SUMMARY_MIN_CHARS or not title:
+        return None
+    if not _within_lookback(cand.get("published_at"), item.get("lookback") or DEFAULT_LOOKBACK_DAYS):
+        return None
+    if title.lower() in {(target.get("publisher_name") or "").strip().lower(), (target.get("target_name") or "").strip().lower()}:
+        return None
+    if summary.lower().startswith(title.lower()):          # 題名の繰り返しで始まる要約は、題名を重ねない
+        text = summary
+    else:
+        text = f"{title}\n\n{summary}"
+    url = cand["url"]
+    return save_article(client, target, normalize_url(url), url, url, title, cand.get("published_at"), None, text,
+                        extraction_error=f"{RSS_SUMMARY_ONLY_MARK}: 本文を取得できなかったため、RSSの題名と要約で代用(理由: {(reason or '不明')[:80]})")
+
+
 def _apply_recovered_candidate(client: SupabaseClient, target: dict, cand: dict, extracted: dict,
                                 lookback: int):
     """Pass2(escalate_pending)で再取得に成功した候補へ、process_target()後半と同じ
@@ -2726,12 +2771,19 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
     fail_reasons_by_log = defaultdict(Counter)
     fail_samples_by_log = defaultdict(list)
     agent_skipped_by_log = defaultdict(int)
+    summary_saved_by_log = defaultdict(int)
     for item in final:
         final_failed_by_log[item["crawl_log_id"]] += 1
         if item.get("is_bot_block"):
             bot_block_by_log[item["crawl_log_id"]] += 1
         last_tier, last_reason = item.get("last_fail") or (None, "")
         fail_reasons_by_log[item["crawl_log_id"]][_classify_failure(last_tier, last_reason)] += 1
+        if _classify_failure(last_tier, last_reason) != "not_article":
+            try:                     # 失敗しても、Pass2全体は止めない（Failure Isolation）
+                if _save_rss_summary_fallback(client, item, str(last_reason)):
+                    summary_saved_by_log[item["crawl_log_id"]] += 1
+            except Exception as e:  # noqa: BLE001
+                print(f"  [RSS要約の代用保存に失敗] {item['cand']['url'][:80]}: {type(e).__name__}: {str(e)[:80]}")
         if len(fail_samples_by_log[item["crawl_log_id"]]) < FAIL_SAMPLE_MAX:
             fail_samples_by_log[item["crawl_log_id"]].append(
                 {"u": item["cand"]["url"][:100], "r": f"{last_tier}:{last_reason}"[:100]})
@@ -2754,6 +2806,8 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
             patch["fail_samples"] = fail_samples_by_log[crawl_log_id]             # 例: [{"u": URL, "r": "tinyfish_agent:..."}]
             if agent_skipped_by_log.get(crawl_log_id):
                 patch["agent_skipped"] = agent_skipped_by_log[crawl_log_id]       # Agentの上限で試せなかった記事数
+            if summary_saved_by_log.get(crawl_log_id):
+                patch["summary_saved"] = summary_saved_by_log[crawl_log_id]       # RSSの要約で代用保存した記事数
         update_crawl_log_after_escalation(
             client, crawl_log_id, final_failures=final_failed_by_log.get(crawl_log_id, 0),
             bot_block_detections=bot_block_by_log.get(crawl_log_id, 0), funnel_patch=patch)

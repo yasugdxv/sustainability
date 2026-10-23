@@ -37,6 +37,7 @@ def summarize(logs: list) -> dict:
         "pending_outstanding": 0, "pending_overflow": 0, "budget_deferred": 0, "budget_skipped_known": 0, "budget_targets": 0, "pass2_done": 0, "pass2_expired": 0,
         "listing_retry": Counter(), "tiers": {t: [0, 0, 0.0] for t in TIERS},
         "final_failed": 0, "pass2_not_reached": 0, "with_funnel": 0,
+        "summary_saved": 0,          # 2026-10-23追加: 本文を取得できず、RSSの要約で代用保存した記事数
         "fail_reasons": Counter(), "agent_skipped": 0,      # 2026-10-22追加: 最終失敗の理由(記事数)
         "include_nomatch": [],      # 2026-10-23追加: 条件に合う記事が0件なのに、記事らしいリンクが一覧にある対象 [(対象ID, {n, top})]
     }
@@ -71,6 +72,7 @@ def summarize(logs: list) -> dict:
             out["include_nomatch"].append((l["crawl_target_id"], f["include_nomatch"]))
         out["fail_reasons"].update(f.get("fail_reasons") or {})
         out["agent_skipped"] += int(f.get("agent_skipped") or 0)
+        out["summary_saved"] += int(f.get("summary_saved") or 0)
         for t, vals in (f.get("tiers") or {}).items():
             if t in out["tiers"]:
                 out["tiers"][t][0] += vals[0]
@@ -114,6 +116,8 @@ def render(s: dict, label: str) -> str:
     lines.append(f"  最終失敗 {s['final_failed']}件 / Pass2未完了のtarget {s['pass2_not_reached']}件"
                  f"（再試行待ちの記事 {s['pending_outstanding']}件が繰越中、"
                  f"保存上限超過で再試行不能 {s['pending_overflow']}件）")
+    if s["summary_saved"]:
+        lines.append(f"  [RSS要約で代用保存] {s['summary_saved']}件（本文を取得できず、題名＋要約のみ。分析は、要確認つき）")
     if s["include_nomatch"]:
         lines.append(f"  [警告] 条件(include_paths)に合う記事が0件なのに、記事らしいリンクが一覧にある対象 "
                      f"{len(s['include_nomatch'])}件（設定ミス・サイト構成の変更の疑い）")
