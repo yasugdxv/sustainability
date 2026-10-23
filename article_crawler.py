@@ -61,6 +61,30 @@ NON_ARTICLE_EXTENSIONS = (
     ".xlsx", ".xls", ".csv", ".doc", ".pptx", ".ppt",
     ".zip", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mp3",
 )
+# ── 記事ではないURLの除外（2026-10-23追加）──────────────────────────────────────
+# include_paths="/" の一覧では、問い合わせフォーム・登録・求人・検索・APIなどのリンクまで候補になり、
+# 取得に失敗して、有料のAgentまで使い切っていた（2026-10-23: 最終失敗170記事のうち13件が記事ではないページ。
+# 例: gea.com/ja/contact、jobs.yum.com、globallivingwage.org/subscribe、generalmills.com/api/download）。
+# パスの「区切りごとの完全一致」で判定し、記事のスラッグ(例: contact-center-report)は巻き込まない。
+NON_ARTICLE_PATH_SEGMENTS = frozenset({
+    "contact", "contacts", "contact-us", "contactus", "regional-contacts", "inquiry", "forms", "form",
+    "subscribe", "subscription", "newsletter-signup", "recruit", "career", "careers", "jobs",
+    "search", "sitemap", "login", "signin", "sign-in", "auth", "api", "wp-content", "wp-admin", "wp-json",
+})
+NON_ARTICLE_HOST_PREFIXES = ("jobs.", "careers.", "idp.", "auth.", "login.", "sso.", "accounts.")
+
+
+def _is_non_article_url(parsed, path: str, include_paths: list) -> bool:
+    """記事ではないURL(問い合わせ・登録・求人・検索・API・ログイン等)か。
+    include_pathsで、"/"以外の具体的なパスが明示的に指定されている場合は、その指定を優先して除外しない"""
+    explicit = [p for p in include_paths if p.rstrip("/") not in ("", "/")]
+    if explicit and any(_path_matches(path, p) for p in explicit):
+        return False
+    if parsed.netloc.lower().startswith(NON_ARTICLE_HOST_PREFIXES):
+        return True
+    return any(seg.lower() in NON_ARTICLE_PATH_SEGMENTS for seg in path.split("/") if seg)
+
+
 DOCUMENT_MIME_TYPES = {
     "application/pdf": "pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
@@ -503,13 +527,22 @@ def _detect_document_kind(url: str, content_type: str = "") -> str:
 def _extract_pdf(content: bytes) -> dict:
     reader = PdfReader(io.BytesIO(content))
     meta = reader.metadata
-    title = (getattr(meta, "title", None) or "").strip() if meta else ""
+
+    def _meta(attr):
+        # メタデータの日付が壊れているPDF(例: 伊藤忠の一部のPDFで "Can not convert date")は、
+        # 属性の参照でValueErrorになる。本文は読めるので、メタデータだけを諦めて続ける(2026-10-23)
+        try:
+            return getattr(meta, attr, None) if meta else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    title = (_meta("title") or "").strip()
     text = "\n\n".join((page.extract_text() or "") for page in reader.pages).strip()
     return {
         "title": title,
         "text": text,
-        "published_at": getattr(meta, "creation_date", None) if meta else None,
-        "updated_at": getattr(meta, "modification_date", None) if meta else None,
+        "published_at": _meta("creation_date"),
+        "updated_at": _meta("modification_date"),
     }
 
 
@@ -1452,6 +1485,8 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
             if include_paths and not any(_path_matches(path, p) for p in include_paths):
                 continue
             if exclude_paths and any(_path_matches(path, p) for p in exclude_paths):
+                continue
+            if _is_non_article_url(parsed, path, include_paths):
                 continue
         normalized_path = path.rstrip("/") or "/"
         if is_query_id_article:
