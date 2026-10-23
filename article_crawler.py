@@ -1347,10 +1347,32 @@ def _list_rss_candidates_once(target: dict, proxies: dict, verify: bool, allow_e
 
 
 # ─── XMLサイトマップ ─────────────────────────────────────────────
+_URL_DATE_RE = re.compile(r"/((?:19|20)\d{2})/(\d{1,2})(?:/(\d{1,2}))?(?=/|$)")
+
+
+def _sitemap_sort_key(pub_dt, path: str):
+    """サイトマップの候補を、新しい順に並べるための日時。lastmodがあればそれを、無ければURLの中の日付
+    (/2026/10/ や /2026/10/20/)を使う（並べ替えにだけ使い、記事の公開日としては扱わない）。日付が無ければNone"""
+    if pub_dt is not None:
+        return pub_dt
+    m = _URL_DATE_RE.search(path)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3) or 1), tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
 def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
     """XMLサイトマップ(<url><loc>...</loc><lastmod>...</lastmod></url>)から候補記事を
     一覧する。<a href>を汎用収集するlist_html_candidates()とは構造が異なる
-    （例: Paboco等、更新頻度は低いがJS一覧の代わりにsitemap.xmlで全ページを把握できるサイト向け）"""
+    （例: Paboco等、更新頻度は低いがJS一覧の代わりにsitemap.xmlで全ページを把握できるサイト向け）
+
+    2026-10-23: 従来は、ファイルの先頭から上限(既定30件)まで取っていたため、古い順に並ぶサイトマップ
+    (ISSB/IFRS: 2018年〜。ニュース記事2,135件)では、古い30件しか見ず、新しい記事に届かなかった。
+    条件に合う候補をすべて集め、新しい順(lastmod、無ければURLの日付)に並べてから、上限を適用する。
+    日付がまったく無いサイトマップは、従来どおり、ファイルの順で上限まで取る"""
     url = target["target_url"]
     domain = target.get("domain") or urlparse(url).netloc
     include_paths = [p.strip() for p in (target.get("include_paths") or "").split(",") if p.strip()]
@@ -1360,6 +1382,7 @@ def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
     resp.raise_for_status()
 
     candidates = []
+    sort_keys = []
     for block in re.findall(r"<url>(.*?)</url>", resp.text, re.S):
         loc_match = re.search(r"<loc>(.*?)</loc>", block)
         if not loc_match:
@@ -1386,9 +1409,13 @@ def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
                 pub_dt = None
 
         candidates.append({"url": loc, "title": None, "published_at": pub_dt})
-        if len(candidates) >= MAX_HTML_LINKS_PER_TARGET:
-            break
-    return candidates, resp.status_code
+        sort_keys.append(_sitemap_sort_key(pub_dt, path))
+
+    max_links = _target_max_links(target)
+    if any(k is not None for k in sort_keys):
+        order = sorted(range(len(candidates)), key=lambda i: (sort_keys[i] is None, -(sort_keys[i].timestamp() if sort_keys[i] else 0), i))
+        candidates = [candidates[i] for i in order]      # 新しい順。日付の無いものは、最後（ファイルの順）
+    return candidates[:max_links], resp.status_code
 
 
 # ─── HTML（汎用） ─────────────────────────────────────────────────
