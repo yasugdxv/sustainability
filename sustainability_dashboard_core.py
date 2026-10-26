@@ -343,6 +343,12 @@ _LANG_NAME = {"ja": "日本語", "en": "English"}
 _short_cache: dict = {}
 _body_cache: dict = {}
 _translation_db_client = None
+# 翻訳に失敗した時刻（キーは_short_cacheと同じ）。失敗は保存せず、この時間は再試行しない
+_short_failed_at: dict = {}
+SHORT_RETRY_COOLDOWN_SEC = 3600
+# DBの翻訳を先読みした時刻（(言語, 記事ID) -> 時刻）。DBに無い記事のために、一覧を開くたびに問い合わせない
+_db_checked_at: dict = {}
+DB_PREFETCH_COOLDOWN_SEC = 600
 
 
 def init_translation_cache(config: dict) -> int:
@@ -360,6 +366,33 @@ def init_translation_cache(config: dict) -> int:
         cache = _body_cache if r["namespace"] == "body" else _short_cache
         cache[key] = r["text"]
     return len(rows)
+
+
+def prefetch_translations_from_db(article_ids: list, target_lang: str) -> int:
+    """日次バッチ(pretranslate_articles.py)がtranslation_cacheへ保存した翻訳を、動いているAPIサーバーの
+    メモリへ取り込む（サーバーは起動時にしか全件を読まないため、バッチの結果に気づけない）。
+    メモリに無い記事だけを、まとめて問い合わせる。失敗しても、通常の表示には影響させない。戻り値は取り込んだ件数"""
+    if _translation_db_client is None or not article_ids:
+        return 0
+    now = time.time()
+    ids = [i for i in article_ids if now - _db_checked_at.get((target_lang, i), 0) >= DB_PREFETCH_COOLDOWN_SEC]
+    loaded = 0
+    for start in range(0, len(ids), 100):
+        chunk = ids[start:start + 100]
+        try:
+            rows = _translation_db_client.select("translation_cache", {
+                "select": "namespace,target_lang,article_id,text", "target_lang": f"eq.{target_lang}",
+                "namespace": "in.(title,summary)", "article_id": f"in.({','.join(chunk)})"})
+        except Exception:
+            continue
+        for i in chunk:
+            _db_checked_at[(target_lang, i)] = now
+        for r in rows:
+            key = (r["namespace"], r["target_lang"], r["article_id"])
+            if key not in _short_cache:
+                _short_cache[key] = r["text"]
+                loaded += 1
+    return loaded
 
 
 def _persist_translation(namespace: str, target_lang: str, article_id: str, text: str) -> None:
@@ -432,6 +465,10 @@ def _translate_short(azure_client, model: str, namespace: str, article_id: str,
     if not azure_client or not _needs_translation(text, target_lang):
         _short_cache[key] = text
         return text
+    # 2026-10-26: 直前に失敗した記事は、一定時間は再試行しない（一覧を開くたびにLLMを呼び直さないため）
+    failed_at = _short_failed_at.get(key)
+    if failed_at is not None and time.time() - failed_at < SHORT_RETRY_COOLDOWN_SEC:
+        return text
     lang_name = _LANG_NAME.get(target_lang, "日本語")
     try:
         resp = azure_client.chat.completions.create(
@@ -447,7 +484,10 @@ def _translate_short(azure_client, model: str, namespace: str, article_id: str,
         if _looks_garbled(result):
             result = text
     except Exception:
-        result = text
+        # 2026-10-26: 一時的な失敗(混雑・エラー)の原文を、翻訳済みとして保存してしまうと、
+        # その記事が、ずっと翻訳されなくなる。失敗は保存せず、時間をおいて再試行する
+        _short_failed_at[key] = time.time()
+        return text
     _short_cache[key] = result
     try:
         _persist_translation(namespace, target_lang, article_id, result)

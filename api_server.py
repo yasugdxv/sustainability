@@ -143,6 +143,16 @@ def _warm_translation_cache(articles: list, lang: str) -> None:
     一覧表示（list_articles）は_to_ui_article(..., blocking=False)で「キャッシュに無ければ
     原文のまま返す」経路に変えたため、ここではfire-and-forgetで投げるだけでよい
     （このリクエストのレスポンスは原文のまま返り、次回以降のリクエストから翻訳済みで返る）。"""
+    # 2026-10-26: 日次バッチが先回りで保存した翻訳を、メモリへ取り込んでから不足分だけを判定する
+    # （バッチの結果に、起動中のサーバーが気づけず、保存済みの記事まで再翻訳・原文表示になるのを防ぐ）
+    missing_ids = [a["article_id"] for a in articles
+                   if ("title", lang, a["article_id"]) not in core._short_cache
+                   or ("summary", lang, a["article_id"]) not in core._short_cache]
+    if missing_ids:
+        try:
+            core.prefetch_translations_from_db(missing_ids, lang)
+        except Exception:
+            pass
     for a in articles:
         if ("title", lang, a["article_id"]) not in core._short_cache:
             _translate_pool.submit(

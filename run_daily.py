@@ -96,6 +96,9 @@ STEPS = [
     ("filter_coverage_check", ["check_filter_keyword_coverage.py"], 300),
     ("crawl_health_check", ["crawl_health_check.py"], 300),
     ("analyze", ["article_analyzer.py", "9999", "5"], 5400),
+    # 2026-10-26追加: 新着のタイトル・要約を、誰かが一覧を開く前に翻訳しておく(日本語・英語UI)。
+    # 翻訳済み・翻訳不要のものはLLMを呼ばない。内部の時間予算は2400秒
+    ("translate", ["pretranslate_articles.py"], 3000),
     ("competitor_crawl", ["competitor_crawler.py"], 5400),
     ("selector", ["sustainability_article_selector.py", "--top-n-per-theme", "10"], 3600),
     # 記事一覧ダッシュボード(api_server.py)の共有キャッシュを先回りして温める。
@@ -344,6 +347,8 @@ def effective_skip(skip: set) -> set:
     skip = set(skip)
     if "crawl" in skip:
         skip.add("crawl_pass2_backlog")
+    if "analyze" in skip:
+        skip.add("translate")  # 翻訳は分析の後始末（記事系ジョブだけで動かす）
     return skip
 
 
