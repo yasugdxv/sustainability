@@ -36,9 +36,12 @@ cache/へのプレビューHTML保存にフォールバックする＝実送信�
 使い方:
     python run_daily.py                     # 全ステップ実行
     python run_daily.py --skip-selector      # 選定ステップだけ除外（他ステップも同様に--skip-<step>）
+    python run_daily.py --catchup            # 追い込み実行（止まった日の続き。完了済みなら何もしない）
 """
 import argparse
+import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -57,6 +60,17 @@ LOG_DIR = BASE / "logs" / "daily"
 _lock_suffix = os.environ.get("WEBJOBS_NAME", "default")
 LOCK_PATH = BASE / f"run_daily_{_lock_suffix}.lock"
 MAX_LOCK_AGE_HOURS = 6  # これを超えて残っているロックは前回異常終了とみなし上書きする
+
+# 2026-10-26追加: 追い込み実行(--catchup)。10/24は、日次ジョブの開始5分後にAzure側のコンテナ入れ替えで
+# プロセスごと強制終了され(Pythonの例外は残らない)、その日の分析まで丸ごと止まった。
+# 止まった日は、同じUTC日のうちに、続きから再開する。本体のジョブと同じロック・進捗を使うため、
+# 本体が動いている間は動かず、完了済みの日は何もしない。
+CATCHUP_JOB_NAME = "daily-crawl-analyze"
+# --resumeは「UTCの今日」に試行済みの対象を飛ばす。UTC日付が変わった後に追い込むと、全対象を
+# 再クロールしてしまうため、本体の開始時刻(15:00 UTC)より前、または日付をまたぐ前後は実行しない
+CATCHUP_EARLIEST_UTC_HOUR = 15
+# クロールの処理済み対象が、有効な対象のこの割合に満たない日は、異常として通知する
+COVERAGE_ALERT_RATIO = 0.9
 
 # 2026-10-15追加: "crawl"ステップは、原因不明のまま全507target中190〜282件で
 # プロセスごと停止する事象が本番で続けて発生したため(Pythonの例外は一切残らず、
@@ -91,17 +105,102 @@ STEPS = [
 ]
 
 
+_PROC = Path("/proc")  # Linuxのプロセス情報（テストで差し替える）
+
+
+def _set_job_name(name: str) -> None:
+    """ロック・進捗ファイルの名前に使うジョブ名を切り替える(追い込み実行が本体と共有するため)"""
+    global _lock_suffix, LOCK_PATH
+    _lock_suffix = name
+    LOCK_PATH = BASE / f"run_daily_{_lock_suffix}.lock"
+
+
+def _lock_holder_alive(lock_text: str):
+    """ロックを書いたプロセスが今も動いているか。True=動いている / False=もう無い / None=判定できない。
+    コンテナが入れ替わると、前のプロセスは消えるのにロックだけが残る(10/24の事象)。
+    その場合に、時間の経過(6時間)を待たず、すぐに引き継げるようにする。/procがある環境(Linux)のみ判定する"""
+    m = re.search(r"pid=(\d+)", lock_text or "")
+    if not m or not _PROC.is_dir():
+        return None
+    try:
+        cmdline = (_PROC / m.group(1) / "cmdline").read_bytes().decode("utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "run_daily" in cmdline
+
+
 def acquire_lock() -> bool:
     if LOCK_PATH.exists():
+        try:
+            alive = _lock_holder_alive(LOCK_PATH.read_text(errors="ignore"))
+        except OSError:
+            alive = None
         age_hours = (time.time() - LOCK_PATH.stat().st_mtime) / 3600
-        if age_hours < MAX_LOCK_AGE_HOURS:
+        if alive is True:
+            print(f"ロックを持つプロセスが実行中です（{age_hours:.1f}時間前から）。多重実行防止のため終了します（{LOCK_PATH}）。")
+            return False
+        if alive is False:
+            print(f"ロックファイルは残っていますが、持ち主のプロセスは既にありません（{age_hours:.1f}時間前の実行が"
+                  "強制終了されたとみなします）。引き継いで実行します。")
+        elif age_hours < MAX_LOCK_AGE_HOURS:
             print(f"ロックファイルが{age_hours:.1f}時間前から存在します。多重実行防止のため終了します"
                   f"（{LOCK_PATH}）。前回の実行が異常終了した場合は手動で削除してください。")
             return False
-        print(f"ロックファイルは{age_hours:.1f}時間前のものです（{MAX_LOCK_AGE_HOURS}時間超）。"
-              "前回実行が異常終了したとみなし上書きします。")
+        else:
+            print(f"ロックファイルは{age_hours:.1f}時間前のものです（{MAX_LOCK_AGE_HOURS}時間超）。"
+                  "前回実行が異常終了したとみなし上書きします。")
     LOCK_PATH.write_text(f"pid={os.getpid()} started_at={datetime.now(timezone.utc).isoformat()}")
     return True
+
+
+# ─── 進捗の記録（追い込み実行が、終わっているステップを飛ばすため。2026-10-26追加） ───
+def _run_day() -> str:
+    """crawlの--resumeが基準にする、UTCの日付"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def progress_path(day: str) -> Path:
+    return LOG_DIR / f"progress_{day}_{_lock_suffix}.json"
+
+
+def load_progress(day: str) -> set:
+    try:
+        return set(json.loads(progress_path(day).read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def mark_step_done(day: str, name: str) -> None:
+    """終わったステップを記録する。記録に失敗しても、本体の処理は止めない"""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        progress_path(day).write_text(json.dumps(sorted(load_progress(day) | {name}), ensure_ascii=False),
+                                      encoding="utf-8")
+    except OSError as e:
+        print(f"進捗の記録に失敗しました（処理は続けます）: {e}")
+
+
+def check_crawl_coverage(ratio: float = COVERAGE_ALERT_RATIO) -> dict:
+    """本日(UTC)のクロール処理済み対象が、有効な対象の何割かを確認する。
+    ratioに満たなければ ok=False（失敗通知の対象）。確認自体に失敗したときも、静かに見逃さない"""
+    started = time.monotonic()
+    try:
+        sys.path.insert(0, str(BASE))
+        import article_crawler as ac
+        client = ac.SupabaseClient(ac.load_config())
+        active = {t["crawl_target_id"] for t in client.select("crawl_targets", {
+            "select": "crawl_target_id", "crawl_method": f"in.({','.join(ac.SUPPORTED_METHODS)})"})}
+        done = ac._get_today_attempted_target_ids(client) & active
+        rate = len(done) / len(active) if active else 1.0
+        ok = rate >= ratio
+        msg = f"処理済み {len(done)}/{len(active)}対象（{rate:.0%}）"
+        error = None if ok else f"{msg}。基準{ratio:.0%}未満（途中停止の疑い）"
+        print(f"[crawl_coverage] {msg}")
+    except Exception as e:  # noqa: BLE001
+        ok, error = False, f"処理率の確認に失敗: {type(e).__name__}: {e}"
+        print(f"[crawl_coverage] {error}")
+    return {"name": "crawl_coverage", "ok": ok, "elapsed_sec": time.monotonic() - started,
+            "log_path": "-", "error": error}
 
 
 def release_lock():
@@ -159,6 +258,7 @@ def run_crawl_step_with_resume(name: str, overall_timeout_sec: int) -> dict:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     overall_started = time.monotonic()
     chunk_results = []
+    drained = False  # 本日の残りtargetが0件になるまで処理できたか（追い込み実行の要否の判断に使う）
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
     for chunk_i in range(1, CRAWL_MAX_CHUNKS + 1):
@@ -197,6 +297,7 @@ def run_crawl_step_with_resume(name: str, overall_timeout_sec: int) -> dict:
             chunk_log_text = ""
         if "クロール対象: 0件" in chunk_log_text:
             print(f"[{name}] 本日の残りtarget 0件を確認したため終了します")
+            drained = True
             break
     else:
         print(f"[{name}] チャンク数の上限（{CRAWL_MAX_CHUNKS}）に達したため打ち切ります")
@@ -207,7 +308,7 @@ def run_crawl_step_with_resume(name: str, overall_timeout_sec: int) -> dict:
     return {
         "name": name, "ok": all_ok, "elapsed_sec": total_elapsed,
         "log_path": "; ".join(r["log_path"] for r in chunk_results),
-        "error": error, "chunks": chunk_results,
+        "error": error, "chunks": chunk_results, "drained": drained,
     }
 
 
@@ -251,11 +352,28 @@ def main():
     for name, _, _ in STEPS:
         parser.add_argument(f"--skip-{name.replace('_', '-')}", action="store_true",
                              dest=f"skip_{name}")
+    parser.add_argument("--catchup", action="store_true",
+                         help="追い込み実行。本日(UTC)すでに終わったステップは飛ばし、残りだけ続きから実行する")
     args = parser.parse_args()
     skip = effective_skip({name for name, _, _ in STEPS if getattr(args, f"skip_{name}")})
 
+    if args.catchup:
+        _set_job_name(CATCHUP_JOB_NAME)  # 本体のジョブと、ロック・進捗を共有する
+        if datetime.now(timezone.utc).hour < CATCHUP_EARLIEST_UTC_HOUR:
+            print(f"追い込み実行は、UTC {CATCHUP_EARLIEST_UTC_HOUR}時以降のみ動かします"
+                  "（UTCの日付が変わると、全対象を再クロールしてしまうため）。何もせず終了します")
+            return
+    day = _run_day()
+    done = load_progress(day) if args.catchup else set()
+    if args.catchup:
+        pending = [name for name, _, _ in STEPS if name not in skip and name not in done]
+        if not pending:
+            print(f"本日({day} UTC)分は全ステップ完了済みです。何もせず終了します")
+            return
+        print(f"追い込み実行: 残りのステップ = {', '.join(pending)}")
+
     if not acquire_lock():
-        sys.exit(1)
+        sys.exit(0 if args.catchup else 1)
 
     results = []
     try:
@@ -263,10 +381,20 @@ def main():
             if name in skip:
                 print(f"[{name}] スキップ指定によりスキップ")
                 continue
+            if name in done:
+                print(f"[{name}] 本日分は完了済みのためスキップ（追い込み実行）")
+                continue
             if name == "crawl":
-                results.append(run_crawl_step_with_resume(name, timeout_sec))
+                r = run_crawl_step_with_resume(name, timeout_sec)
+                finished = r.get("drained", False)  # 残りが0件になるまで進んだ場合だけ「完了」とする
             else:
-                results.append(run_step(name, step_args, timeout_sec))
+                r = run_step(name, step_args, timeout_sec)
+                finished = True  # 失敗(終了コード≠0)でも最後まで走った。強制終了なら、ここに来ない
+            results.append(r)
+            if finished:
+                mark_step_done(day, name)
+        if "crawl" not in skip:
+            results.append(check_crawl_coverage())
     finally:
         release_lock()
 
