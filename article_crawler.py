@@ -1978,11 +1978,17 @@ def _compose_notes(prefix: str, funnel: dict):
 
 
 def _merge_funnel(existing: dict, patch: dict) -> dict:
-    """tiersは段階ごとにマージし、それ以外のキーは上書きする"""
+    """tiers・tier_failは段階ごとにマージし、rec_roundsは回数を足し合わせ、それ以外のキーは上書きする"""
     merged = dict(existing)
     for k, v in (patch or {}).items():
-        if k == "tiers":
-            merged["tiers"] = {**(existing.get("tiers") or {}), **v}
+        if k in ("tiers", "tier_fail"):
+            merged[k] = {**(existing.get(k) or {}), **v}
+        elif k == "rec_rounds":
+            # 何回目のPass2で取れたか（"1": 件数, "2": 件数…）。日をまたぐ再試行でも累積する
+            total = dict(existing.get("rec_rounds") or {})
+            for rounds, n in v.items():
+                total[rounds] = total.get(rounds, 0) + n
+            merged["rec_rounds"] = total
         elif v is None:
             merged.pop(k, None)  # Noneは「このキーを消す」(再試行待ちの解消時に使う)
         else:
@@ -2013,6 +2019,10 @@ def _pending_entry(item: dict) -> dict:
         entry["b"] = 1
     if cand.get("summary"):
         entry["s"] = cand["summary"][:300]       # RSSの要約（最終失敗時の代用保存用。notesが大きくなりすぎないよう300字まで）
+    if item.get("last_class"):
+        entry["r"] = item["last_class"]          # 直近の失敗理由の分類（2026-10-27: 「待てば取れる失敗」か切り分けるため）
+    if item.get("rounds"):
+        entry["n"] = item["rounds"]              # これまでにPass2で再試行した回数
     return entry
 
 
@@ -2423,6 +2433,7 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
                 pending_escalations.append({
                     "target": target, "cand": cand, "crawl_log_id": crawl_log_id,
                     "lookback": lookback, "is_bot_block": is_bot_block,
+                    "last_class": _classify_failure("pass1", extracted.get("error") or f"http_{extracted.get('http_status')}"),
                 })
                 continue
 
@@ -2504,6 +2515,8 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
         crawl_funnel.update({**(listing_funnel or {"p1_listing_failed": 1}), "listing_retry": "ok"})
     if pending_escalations:
         crawl_funnel["p1_article_failed"] = len(pending_escalations)
+        # 通常クロール(Pass1)で失敗した理由の内訳（2026-10-27追加。例: {"bot_blocked": 5, "fetch_failed": 2}）
+        crawl_funnel["p1_fail_reasons"] = dict(Counter(p.get("last_class") or "other" for p in pending_escalations))
         # チャンクが時間切れで止まってもPass2を引き継げるよう、再試行待ちの記事をDBに残す
         crawl_funnel["p1_pending"] = [_pending_entry(p) for p in pending_escalations[:PENDING_STORE_MAX]]
         if len(pending_escalations) > PENDING_STORE_MAX:
@@ -2680,7 +2693,7 @@ def _classify_failure(tier, reason) -> str:
     if any(k in r for k in ("login", "log in", "password", "credentials", "authentication", "sign in")):
         return "login_required"
     if any(k in r for k in ("captcha", "cloudflare", "access denied", "security verification", "verify you are human",
-                            "bot protection", "bot-check", "blocked", "forbidden")) or re.search(r"\b403\b", r):
+                            "bot protection", "bot-check", "blocked", "forbidden", "bot対策")) or re.search(r"\b403\b", r):
         return "bot_blocked"
     if any(k in r for k in ("not an article", "no article", "not found", "contact form", "does not exist",
                             "job listing", "not article")) or re.search(r"\b404\b", r):
@@ -2709,7 +2722,12 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
     - 各段階の投入数・成功数は、救済が無かった対象も含め、その場でnotesへ書く
       （途中で打ち切られても、実際に試した件数が残るように）。"""
     remaining = list(pending)
+    for _item in pending:
+        _item["rounds"] = int(_item.get("rounds") or 0) + 1      # この記事のPass2の再試行回数（日をまたいで累積）
     recovered_count = 0
+    # 2026-10-27追加: 失敗理由を、段階ごと・記事ごとに追えるようにする（待てば取れる失敗か、恒常的に取れないかの切り分け用）
+    log_tier_fail = defaultdict(lambda: defaultdict(Counter))   # crawl_log_id -> {段階: Counter(失敗理由の分類)}
+    rec_rounds_by_log = defaultdict(Counter)                    # crawl_log_id -> Counter(何回目の再試行で取れたか)
     log_tiers = defaultdict(dict)  # crawl_log_id -> {段階: [試行数, 抽出成功数]}（DBのnotesへ記録）
     tier_totals = {}               # 段階 -> [試行数, 抽出成功数]（チャンクログへの要約用）
     all_log_ids = {item["crawl_log_id"] for item in pending}
@@ -2733,6 +2751,7 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
                 break
             if tier == "tinyfish_agent" and not _tinyfish_agent_budget_available(item["target"].get("crawl_target_id")):
                 item["agent_skipped"] = True     # Agentの上限で試せなかった（失敗理由の記録用）
+                log_tier_fail[item["crawl_log_id"]][tier]["cap_skipped"] += 1
                 still_failed.append(item)
                 continue
             tier_attempted[item["crawl_log_id"]] += 1
@@ -2747,9 +2766,12 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
                     else "文字化け疑い"
                 error_counts[f"{tier}|{str(reason)[:60]}"] += 1
                 item["last_fail"] = (tier, str(reason))     # 最後に失敗した段階と理由（最終失敗の記録用）
+                item["last_class"] = _classify_failure(tier, reason)
+                log_tier_fail[item["crawl_log_id"]][tier][item["last_class"]] += 1
                 still_failed.append(item)
                 continue
             tier_ok[item["crawl_log_id"]] += 1
+            rec_rounds_by_log[item["crawl_log_id"]][str(item["rounds"])] += 1     # 何回目の再試行で取れたか
             applied = _apply_recovered_candidate(client, item["target"], item["cand"], extracted,
                                                   item["lookback"])
             if applied is None:
@@ -2773,7 +2795,9 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
             update_crawl_log_after_escalation(
                 client, crawl_log_id, recovered_items_detected=agg["items_detected"],
                 recovered_new_items=agg["new_items"], recovered_updated_items=agg["updated_items"],
-                funnel_patch={"tiers": dict(log_tiers[crawl_log_id])})
+                funnel_patch={"tiers": dict(log_tiers[crawl_log_id]),
+                              "tier_fail": {tier: dict(log_tier_fail[crawl_log_id][tier])}
+                              if log_tier_fail[crawl_log_id].get(tier) else {}})
         if timed_out:
             break
         remaining = still_failed
@@ -2809,6 +2833,10 @@ def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verif
     for crawl_log_id in all_log_ids:
         left = unfinished_by_log.get(crawl_log_id)
         patch = {"tiers": dict(log_tiers.get(crawl_log_id, {}))}
+        if crawl_log_id in log_tier_fail:
+            patch["tier_fail"] = {t: dict(c) for t, c in log_tier_fail[crawl_log_id].items() if c}
+        if rec_rounds_by_log.get(crawl_log_id):
+            patch["rec_rounds"] = dict(rec_rounds_by_log[crawl_log_id])       # 例: {"1": 3, "2": 1}（累積）
         if left:
             patch["p1_pending"] = [_pending_entry(i) for i in left]   # 未完了分だけを残す
         else:
@@ -3114,6 +3142,7 @@ def load_pass2_backlog(client: SupabaseClient, now=None, max_age_hours: int = PE
             article_items.append({
                 "target": target, "cand": _entry_to_cand(entry), "crawl_log_id": row["crawl_log_id"],
                 "lookback": lookback, "is_bot_block": bool(entry.get("b")),
+                "last_class": entry.get("r"), "rounds": int(entry.get("n") or 0),     # 前回までの失敗理由・再試行回数を引き継ぐ
             })
         if listing_open:
             item = {"target": target, "crawl_log_id": row["crawl_log_id"], "lookback": lookback,

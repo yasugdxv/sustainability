@@ -4,6 +4,7 @@
     python crawl_funnel_report.py                 # 昨日(日本時間)
     python crawl_funnel_report.py 2026-10-16      # 指定日(日本時間の暦日)
     python crawl_funnel_report.py 2026-10-16 2026-10-18   # 期間(両端を含む)
+    python crawl_funnel_report.py 2026-10-28 2026-11-03 --by-target   # クロール先別の失敗の切り分け表も出す
 
 集計内容:
   - 実行対象数 / 結果別件数
@@ -40,6 +41,10 @@ def summarize(logs: list) -> dict:
         "summary_saved": 0,          # 2026-10-23追加: 本文を取得できず、RSSの要約で代用保存した記事数
         "fail_reasons": Counter(), "agent_skipped": 0,      # 2026-10-22追加: 最終失敗の理由(記事数)
         "include_nomatch": [],      # 2026-10-23追加: 条件に合う記事が0件なのに、記事らしいリンクが一覧にある対象 [(対象ID, {n, top})]
+        # 2026-10-27追加: 失敗理由を追えるようにする記録
+        "p1_fail_reasons": Counter(),                 # 通常クロール(Pass1)で失敗した理由(記事数)
+        "tier_fail": {t: Counter() for t in TIERS},   # 再試行の段階ごとの失敗理由(記事数、cap_skipped=Agentの上限で未実施)
+        "rec_rounds": Counter(),                      # 何回目の再試行で取れたか
     }
     for l in logs:
         _, f = _split_notes(l.get("notes"))
@@ -71,6 +76,11 @@ def summarize(logs: list) -> dict:
         if f.get("include_nomatch"):
             out["include_nomatch"].append((l["crawl_target_id"], f["include_nomatch"]))
         out["fail_reasons"].update(f.get("fail_reasons") or {})
+        out["p1_fail_reasons"].update(f.get("p1_fail_reasons") or {})
+        for t, reasons in (f.get("tier_fail") or {}).items():
+            if t in out["tier_fail"]:
+                out["tier_fail"][t].update(reasons)
+        out["rec_rounds"].update(f.get("rec_rounds") or {})
         out["agent_skipped"] += int(f.get("agent_skipped") or 0)
         out["summary_saved"] += int(f.get("summary_saved") or 0)
         for t, vals in (f.get("tiers") or {}).items():
@@ -124,6 +134,14 @@ def render(s: dict, label: str) -> str:
     if s["fail_reasons"]:
         lines.append("  [最終失敗の理由(記事数)] " + "、".join(f"{k} {v}" for k, v in s["fail_reasons"].most_common())
                      + (f" / うちAgentの上限で未実施 {s['agent_skipped']}件" if s["agent_skipped"] else ""))
+    if s["p1_fail_reasons"]:
+        lines.append("  [通常クロールの失敗理由(記事数)] " + "、".join(f"{k} {v}" for k, v in s["p1_fail_reasons"].most_common()))
+    for t in TIERS:
+        if s["tier_fail"][t]:
+            lines.append(f"  [Pass2: {t}の失敗理由(記事数)] " + "、".join(f"{k} {v}" for k, v in s["tier_fail"][t].most_common()))
+    if s["rec_rounds"]:
+        lines.append("  [何回目の再試行で取れたか(記事数)] " + "、".join(
+            f"{k}回目 {v}" for k, v in sorted(s["rec_rounds"].items(), key=lambda kv: int(kv[0]))))
     lines.append(f"  Pass2完了 {s['pass2_done']}対象 / 期限切れで失敗確定 {s['pass2_expired']}対象")
     lines.append(f"  1対象の時間上限に達した対象 {s['budget_targets']}対象（再試行待ちへ繰越 {s['budget_deferred']}件、"
                  f"既知のため省略 {s['budget_skipped_known']}件）")
@@ -136,6 +154,57 @@ def render(s: dict, label: str) -> str:
     return "\n".join(lines)
 
 
+NO_RETRY_VALUE = ("login_required", "not_article")      # 再試行しても取れない・取る価値が低い失敗の分類
+BY_TARGET_MIN_ATTEMPTS = 10
+
+
+def judge_target(s: dict) -> str:
+    """1つのクロール先の集計(summarize()の結果)から、失敗の性質を判定する（2026-10-27追加）。
+    Pass2の試行(段階の合計)に対する成功の割合と、失敗理由の分類で振り分ける"""
+    attempted = sum(v[0] for v in s["tiers"].values())
+    ok = sum(v[1] for v in s["tiers"].values())
+    reasons = Counter()
+    for t in TIERS:
+        reasons.update(s["tier_fail"][t])
+    reasons.update(s["fail_reasons"])
+    total_reasons = sum(v for k, v in reasons.items() if k != "cap_skipped")
+    if total_reasons and sum(reasons[k] for k in NO_RETRY_VALUE) / total_reasons >= 0.5:
+        return "要ログイン・記事ではないページが中心（取得を諦める/除外を検討）"
+    if attempted < BY_TARGET_MIN_ATTEMPTS:
+        return f"データ不足（再試行{attempted}回）"
+    rate = ok / attempted
+    if rate >= 0.6:
+        return "再試行でほぼ取れる"
+    if rate >= 0.2:
+        return "一部だけ取れる（待てば取れる分あり）"
+    return "ほぼ取れない（恒常的な拒否の疑い・要対策）"
+
+
+def render_by_target(logs: list, names: dict, min_failed: int = 1) -> str:
+    """クロール先ごとに、再試行の成功率・失敗理由・判定を一覧にする（失敗が無い対象は出さない）"""
+    by_tid = defaultdict(list)
+    for l in logs:
+        by_tid[l["crawl_target_id"]].append(l)
+    rows = []
+    for tid, ls in by_tid.items():
+        s = summarize(ls)
+        failed = s["p1_article_failed"]
+        if failed < min_failed:
+            continue
+        rows.append((failed, tid, s))
+    lines = ["■ クロール先別の失敗の切り分け（通常クロールで記事の失敗があった対象。失敗の多い順）",
+             "  対象 | 通常失敗 | Fetch成功/試行 | Agent成功/試行 | 主な失敗理由 | 取れた時の再試行回数 | 判定"]
+    for failed, tid, s in sorted(rows, key=lambda r: -r[0]):
+        f, a = s["tiers"]["tinyfish_fetch"], s["tiers"]["tinyfish_agent"]
+        reasons = Counter(s["p1_fail_reasons"])
+        for t in TIERS:
+            reasons.update(s["tier_fail"][t])
+        top = "、".join(f"{k}{v}" for k, v in reasons.most_common(3)) or "(記録なし)"
+        rec = "、".join(f"{k}回目{v}" for k, v in sorted(s["rec_rounds"].items(), key=lambda kv: int(kv[0]))) or "-"
+        lines.append(f"  {names.get(tid, tid)[:30]} | {failed} | {f[1]}/{f[0]} | {a[1]}/{a[0]} | {top} | {rec} | {judge_target(s)}")
+    return "\n".join(lines)
+
+
 def fetch_logs(client, start_jst: datetime, end_jst: datetime) -> list:
     return client.select("crawl_logs", {
         "select": "crawl_target_id,run_result,notes,started_at",
@@ -145,6 +214,8 @@ def fetch_logs(client, start_jst: datetime, end_jst: datetime) -> list:
 
 
 def main(argv: list):
+    by_target = "--by-target" in argv       # 2026-10-27追加: クロール先別の切り分け表を出す
+    argv = [a for a in argv if a != "--by-target"]
     today = datetime.now(JST).replace(hour=0, minute=0, second=0, microsecond=0)
     if len(argv) >= 2:
         first = datetime.strptime(argv[1], "%Y-%m-%d").replace(tzinfo=JST)
@@ -171,6 +242,11 @@ def main(argv: list):
         print()
     if len(by_day) > 1:
         print(render(summarize(logs), f"{first:%Y-%m-%d}〜{last:%Y-%m-%d} 合計"))
+    if by_target and logs:
+        names = {t["crawl_target_id"]: t["target_name"] for t in client.select(
+            "crawl_targets", {"select": "crawl_target_id,target_name"})}
+        print()
+        print(render_by_target(logs, names))
     if not logs:
         print("該当期間のcrawl_logsがありません。")
 
