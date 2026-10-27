@@ -265,17 +265,17 @@ def test_html_listing_failure_records_both_reasons_when_tinyfish_also_fails(monk
     assert "403 Forbidden" in msg and "TinyFish Fetchでも失敗" in msg       # 失敗理由が残る（「更新なし」に隠さない）
 
 
-def test_rss_listing_failure_is_recorded_as_failure_with_reason_and_no_tinyfish_call(monkeypatch):
+def test_rss_listing_failure_records_both_reasons_when_tinyfish_fetch_also_fails(monkeypatch):
     client = FakeSupabaseClient({"crawl_logs": []})
     _normal_listing_fails(monkeypatch, "HTTPError: 403 Forbidden")
-    monkeypatch.setattr(ac, "_list_candidates_with_tier",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("RSSにTinyFishを使ってはいけない")))
+    monkeypatch.setattr(ac, "list_rss_candidates_via_fetch",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("TinyFish Fetch: 取得失敗(bot_blocked)")))
 
     result = ac.process_target(_target("RSS"), client, {}, True)
 
     assert result["run_result"] == "失敗" and not result.get("pending_listing_escalation")
     msg = client.inserted["crawl_logs"][0]["error_message"]
-    assert "403 Forbidden" in msg and "RSSはZyte停止中のためフォールバックできません" in msg
+    assert "403 Forbidden" in msg and "TinyFish Fetchでも失敗" in msg and "bot_blocked" in msg
 
 
 def test_listing_404_is_unchanged_by_the_fallback(monkeypatch):
