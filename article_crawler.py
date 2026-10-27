@@ -1369,6 +1369,101 @@ def list_rss_candidates(target: dict, proxies: dict, verify: bool, allow_escalat
     return candidates, status_code  # 全リトライ後もダメならそのまま返す(呼び出し元でextracted["title"]優先により救済される場合がある)
 
 
+# ── RSSを、TinyFish Fetch経由で読む（2026-10-27追加）──────────────────────────────────
+# 通常のHTTPが403・タイムアウト等で失敗するフィード(Amnesty・VCMI・Business Wire・Google Blog・Molson Coors・
+# Longevity等)を、Zyte停止中でも読めるようにする。format="html"で取ると、XMLに近い形で返るが、
+#   - <link>タグが消え、URLが題名の直後に裸の文字で残る
+#   - <pubDate>が小文字(<pubdate>)になる
+#   - サイトによっては、全体が<pre>の中でエスケープされて返る(&lt;item&gt;)
+# ため、feedparserでは読めない。そのため、題名・URL・日付・要約を、緩く取り出す専用の読み方を使う
+_FEED_ITEM_RE = re.compile(r"<(item|entry)[ >].*?</\1>", re.IGNORECASE | re.DOTALL)
+_FEED_TEXT_FIELDS_RE = re.compile(r"<(title|description|summary|content:encoded|guid|id)[ >].*?</\1>", re.IGNORECASE | re.DOTALL)
+_FEED_BARE_URL_RE = re.compile(r"https?://[^\s<]+", re.IGNORECASE)
+
+
+def _feed_bare_url(block: str) -> str:
+    """<link>が消えて、裸の文字として残ったURLを探す(位置は、題名の直後・説明文の後ろ等、サイトによって違う)。
+    題名・説明・guid等の中身と、タグ(属性内のURLを含む)を除いた残りの、最初のURL"""
+    rest = re.sub(r"<[^>]+>", " ", _FEED_TEXT_FIELDS_RE.sub(" ", block))
+    m = _FEED_BARE_URL_RE.search(rest)
+    return m.group(0) if m else ""
+FEED_MAX_ENTRIES = 50
+
+
+def _feed_tag_text(block: str, *names: str) -> str:
+    """項目の中から、最初に見つかったタグの中身(CDATAとタグを除き、HTMLの実体参照を戻す)を返す"""
+    import html as _html
+    for name in names:
+        m = re.search(rf"<{name}(?: [^>]*)?>(.*?)</{name}>", block, re.IGNORECASE | re.DOTALL)
+        if m:
+            text = re.sub(r"<!\[CDATA\[|\]\]>", "", m.group(1))
+            return re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", text))).strip()
+    return ""
+
+
+def _parse_feed_date(text: str):
+    """RSS(RFC822)・Atom(ISO8601)の日付を、UTCの日時にする。読めなければNone"""
+    from email.utils import parsedate_to_datetime
+    if not text:
+        return None
+    for parse in (parsedate_to_datetime, lambda s: datetime.fromisoformat(s.replace("Z", "+00:00"))):
+        try:
+            dt = parse(text)
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except (TypeError, ValueError, IndexError):
+            continue
+    return None
+
+
+def _parse_fetched_feed(text: str, base_url: str) -> list:
+    """TinyFish Fetch(format="html")で返ったフィードのテキストから、候補記事を取り出す。
+    list_rss_candidates()と同じ形({url, title, published_at, summary})のリストを返す"""
+    import html as _html
+    if "<item" not in text.lower() and "<entry" not in text.lower() and "&lt;item" in text.lower():
+        text = _html.unescape(text)                      # <pre>の中でエスケープされて返った場合
+    candidates = []
+    for m in _FEED_ITEM_RE.finditer(text):
+        block = m.group(0)
+        title = _feed_tag_text(block, "title")
+        link = _feed_tag_text(block, "link") if "</link>" in block.lower() else ""    # Atomの<link href=.../>は、閉じタグが無い
+        if not link:
+            href = re.search(r"<link[^>]*href=[\"']([^\"']+)[\"']", block, re.IGNORECASE)    # Atom
+            link = href.group(1) if href else _feed_bare_url(block)                             # <link>が消えて裸のURLだけ残った形
+        if not link:
+            guid = _feed_tag_text(block, "guid", "id")
+            link = guid if guid.startswith("http") else ""
+        if not link or not title:
+            continue
+        pub = _parse_feed_date(_feed_tag_text(block, "pubdate", "published", "updated", "dc:date"))
+        summary = _rss_entry_summary({"summary": _feed_tag_text(block, "description", "summary")})
+        candidates.append({"url": urljoin(base_url, link), "title": title, "published_at": pub, "summary": summary})
+        if len(candidates) >= FEED_MAX_ENTRIES:
+            break
+    return candidates
+
+
+def list_rss_candidates_via_fetch(target: dict, proxies: dict, verify: bool):
+    """RSSフィードを、TinyFish Fetch経由で読み、(候補のリスト, 200)を返す。
+    フィードとして読めない(記事が0件。例: RSSではない通常のページへ転送された)場合は例外"""
+    api_key = _get_tinyfish_api_key()
+    if not api_key:
+        raise RuntimeError("TinyFish APIキーが未設定です(config.jsonのapi_keys.tinyfish)")
+    url = target["target_url"]
+    resp = requests.post(TINYFISH_FETCH_URL, headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+                         json={"urls": [url], "format": "html"}, proxies=proxies, verify=verify,
+                         timeout=TINYFISH_FETCH_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("results", [])
+    if not items:
+        errors = data.get("errors", [])
+        raise RuntimeError(f"TinyFish Fetch: 取得失敗({errors[0] if errors else '不明なエラー'})")
+    candidates = _parse_fetched_feed(items[0].get("text", "") or "", items[0].get("final_url", url))
+    if not candidates:
+        raise RuntimeError("TinyFish Fetch: フィードとして読めませんでした（記事が0件。RSSではないページの可能性）")
+    return candidates, 200
+
+
 # ── RSSの要約での代用保存（2026-10-23追加）────────────────────────────────────────
 # FT・McKinsey・Reuters・Council of the EU・ICG等は、記事ページがBot対策で、Fetch・Agentでも取得できない。
 # しかし、RSSには、題名と要約(150〜300字)がある。ニューラルは、この程度の情報から、記事を選んでいる。
@@ -2206,10 +2301,22 @@ def _list_candidates_with_tier(target: dict, proxies: dict, verify: bool, tier: 
         if method == "JSON API":
             candidates, http_status = list_json_api_candidates(target, proxies, verify, tier=tier)
         elif _is_feed_target(target):
-            # フィード(XML)は、Fetch/Agentでは構造が壊れて読めない。通常のHTTPで読み、Agentでは試さない（無駄な課金を避ける）
+            # フィード(XML)は、Agentでは構造が保てない（試さない。無駄な課金を避ける）。通常のHTTPで読み、
+            # 失敗したときだけTinyFish Fetchで読む（Fetchは<link>が消えて返るため、専用の読み方を使う）
             if tier == "tinyfish_agent":
                 raise ValueError("RSSフィードはAgentでは取得しません（XMLの構造が保てないため）")
-            candidates, http_status = list_rss_candidates(target, proxies, verify, allow_escalation=False)
+            if tier == "tinyfish_fetch":
+                # 通常のHTTPを先に試し(速く無料)、404以外で失敗したら、TinyFish Fetch経由で読む(2026-10-27)
+                try:
+                    candidates, http_status = list_rss_candidates(target, proxies, verify, allow_escalation=False)
+                except requests.exceptions.HTTPError as e:
+                    if e.response is not None and e.response.status_code == 404:
+                        raise                                   # 存在しないURLは、他の手段でも取れない
+                    candidates, http_status = list_rss_candidates_via_fetch(target, proxies, verify)
+                except requests.exceptions.RequestException:
+                    candidates, http_status = list_rss_candidates_via_fetch(target, proxies, verify)
+            else:
+                candidates, http_status = list_rss_candidates(target, proxies, verify, allow_escalation=False)
         elif endpoint_type == "サイトマップ":
             candidates, http_status = list_sitemap_candidates(target, proxies, verify)
         elif endpoint_type in LISTING_ENDPOINT_TYPES:
@@ -2233,16 +2340,20 @@ def _listing_fallback_without_zyte(target: dict, client: SupabaseClient, proxies
     従来は「更新なし」の暫定行を書いてPass2へ回していたが、Pass2はチャンクの時間切れとバックログの
     予算切れで届かず、10/19〜20は20対象(HTML 13・RSS 7)が再試行すらされず、失敗理由も記録されなかった。
     - HTML: その場でTinyFish Fetchで一覧取得を再試行し、取れたら記事もTinyFish Fetchで取得する
-    - RSS: フィードはXMLで、TinyFishは読みやすいテキストへ変換するため使えない（Zyteが無いと
-      フォールバックできない）。Pass2へ回しても必ず失敗するので、理由つきの「失敗」として記録する
+    - RSS: TinyFish Fetchで読む(2026-10-27〜。XMLの<link>が消えて返るため、専用の読み方を使う。
+      以前は「Zyteが無いとフォールバックできない」として、理由つきの失敗で終えていた)
     どちらも失敗理由をcrawl_logsのerror_messageに残す（「更新なし」に隠さない）"""
     method = target["crawl_method"]
     if method == "RSS":
-        message = f"{first_error}（RSSはZyte停止中のためフォールバックできません）"
-        return _process_target_articles(target, client, proxies, verify, [], first_http_status, False, message,
-                                         False, False, lookback, crawl_log_id, started_at)
-    candidates, http_status, single_page_mode, error_message, is_404 = \
-        _list_candidates_with_tier(target, proxies, verify, "tinyfish_fetch")
+        try:
+            candidates, http_status = list_rss_candidates_via_fetch(target, proxies, verify)
+            single_page_mode, error_message = False, None
+        except Exception as e:  # noqa: BLE001
+            candidates, http_status, single_page_mode = [], None, False
+            error_message = f"{type(e).__name__}: {e}"
+    else:
+        candidates, http_status, single_page_mode, error_message, is_404 = \
+            _list_candidates_with_tier(target, proxies, verify, "tinyfish_fetch")
     if error_message is not None:
         message = f"{first_error} / TinyFish Fetchでも失敗: {error_message}"
         return _process_target_articles(target, client, proxies, verify, [], http_status, single_page_mode, message,
