@@ -1675,6 +1675,16 @@ def _target_max_links(target: dict) -> int:
     return MAX_HTML_LINKS_PER_TARGET
 
 
+def _target_allow_external(target: dict) -> bool:
+    """search_conditions列に"allow_external:true"の指定があれば、一覧ページの外部ドメインのリンクも
+    記事候補にする（2026-10-27、G20(g20.org)で確認: トップのニュース欄が、米国政府の各機関
+    (ustr.gov・state.gov・whitehouse.gov等)の記事へのリンクだけで構成されており、
+    「同じドメインのリンクのみ」の既定の条件では、1件も拾えなかった）。
+    外部リンクがすべて入ってしまうのを防ぐため、include_pathsの指定がある場合だけ有効にする
+    （呼び出し側で判定）。指定のないターゲットの動きは、従来どおり"""
+    return (_search_setting(target, "allow_external") or "").strip().lower() in ("true", "1", "yes")
+
+
 def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser: bool = False,
                           use_zyte: bool = False, allow_escalation: bool = True, tier: str = None) -> list:
     """HTML一覧ページから候補記事リンクを抽出する（<a>を汎用的に収集し、
@@ -1703,6 +1713,7 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
                                                     force_zyte_browser=force_zyte_browser, want_links=True,
                                                     allow_escalation=allow_escalation)
     max_links = _target_max_links(target)
+    allow_external = _target_allow_external(target) and bool(include_paths)
 
     tree = _safe_lxml_parse(html)
     # <base href="..."> がある場合、相対リンクはfinal_urlではなくこちらを基準に解決する
@@ -1726,7 +1737,7 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
         parsed = urlparse(full)
         if not parsed.scheme.startswith("http"):
             continue
-        if domain not in parsed.netloc:
+        if not allow_external and domain not in parsed.netloc:
             continue
         path = _strip_aem_content_prefix(parsed.path)
         # WWF(panda.org)のような旧CMSは記事識別子自体をクエリに埋め込む
