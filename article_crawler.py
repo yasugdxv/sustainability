@@ -919,6 +919,35 @@ def _call_tinyfish_fetch(url: str, proxies: dict, verify: bool, want_links: bool
     return html, final_url, 200
 
 
+def _call_tinyfish_fetch_raw(url: str, proxies: dict, verify: bool) -> str:
+    """TinyFish Fetchで、URLの中身をそのまま(整形せずに)文字列で返す。JSON APIのレスポンス用
+    (markdownだと"_"の前に逆スラッシュが付いてJSONが壊れるため、format=htmlで取る。2026-10-28、
+    mcdonalds.com・kubota.co.jpのJSONが、この形式で壊れずに取れることを確認)"""
+    api_key = _get_tinyfish_api_key()
+    if not api_key:
+        raise RuntimeError("TinyFish APIキーが未設定です(config.jsonのapi_keys.tinyfish)")
+    resp = requests.post(TINYFISH_FETCH_URL, headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+                         json={"urls": [url], "format": "html"}, proxies=proxies, verify=verify,
+                         timeout=TINYFISH_FETCH_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("results", [])
+    if not items:
+        errors = data.get("errors", [])
+        raise RuntimeError(f"TinyFish Fetch: 取得失敗({errors[0] if errors else '不明なエラー'})")
+    return items[0].get("text", "") or ""
+
+
+def _extract_json_text(text: str) -> str:
+    """Fetchの返す文字列(<html><body>で包まれることがある)から、JSON本体の部分だけを取り出す"""
+    starts = [i for i in (text.find("{"), text.find("[")) if i >= 0]
+    if not starts:
+        return text
+    start = min(starts)
+    end = max(text.rfind("}"), text.rfind("]"))
+    return text[start:end + 1] if end > start else text
+
+
 # Agentが「取得できなかった」ことを自然文で説明してくる場合の目印（先頭付近に現れたら失敗として扱う）。
 # 2026-10-20に、consilium.europa.euの記事2件で、この種の説明文が記事本文として保存されていたのを確認した
 _AGENT_FAILURE_PHRASES = (
@@ -1804,15 +1833,16 @@ def list_json_api_candidates(target: dict, proxies: dict, verify: bool, use_zyte
     クライアント側で取得・描画される構造だった。レスポンス形式はサイトごとに異なる
     ため、よくあるキー名を順に試す簡易実装（完全な汎用パーサではない）。
 
-    tierを指定する場合、"tinyfish_fetch"は非対応(TinyFish Fetchはページをリンク構造を
-    保持しない読みやすいmarkdownへ変換するため、JSON構造を壊してしまい使えない。
-    2026-10-15、_ZYTE_METHOD_TIERSでJSON API方式のtier順から意図的に除外済み)"""
+    tierを指定する場合、"tinyfish_fetch"はformat=htmlで中身をそのまま取る(2026-10-28対応。
+    markdown形式だと"_"の前に逆スラッシュが付いてJSONが壊れるため使わない)。Zyte停止中の唯一の取得手段"""
     url = target["target_url"]
     domain = target.get("domain") or urlparse(url).netloc
 
     if tier is not None:
         if tier == "zyte":
             text, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify)
+        elif tier == "tinyfish_fetch":
+            text, final_url, status_code = _extract_json_text(_call_tinyfish_fetch_raw(url, proxies, verify)), url, 200
         elif tier == "tinyfish_agent":
             text, final_url, status_code = _call_tinyfish_agent(url, proxies, verify)
         else:
@@ -2268,24 +2298,23 @@ def _list_candidates_for_target(target: dict, proxies: dict, verify: bool, allow
 # 記事数の多いtarget(例: McKinsey)で一覧取得+全記事のZyte呼び出しが合計85分に達し、
 # Pass1全体の進行を圧迫していた(本番実測、2026-10-09以降にZyte APIキーが実際に有効化され
 # てから顕在化)。
-# JSON API方式は"tinyfish_fetch"を含めない: TinyFish FetchはページをJSON構造を保持しない
-# 読みやすいmarkdownへ変換してしまうため、JSON APIのレスポンスには使えない
+# JSON API方式のFetchは、markdownではなくformat=htmlで中身をそのまま取る(2026-10-28)
 _ZYTE_METHOD_TIERS_ALL = {
     "Zyte": ("tinyfish_fetch", "zyte", "tinyfish_agent"),
-    "JSON API": ("zyte", "tinyfish_agent"),
+    "JSON API": ("zyte", "tinyfish_fetch", "tinyfish_agent"),
 }
-_REQUIRES_ZYTE_METHODS = ("JSON API",)  # Zyte無しでは取得できない方式（Agentは構造を保持できず代替にならない）
+_FETCH_ONLY_WHEN_NO_ZYTE = ("JSON API",)  # Zyte停止中はFetchだけを使う（Agentは構造を保持できず代替にならない）
 
 
 def _build_zyte_method_tiers(zyte_enabled: bool) -> dict:
-    """Zyte停止中は、各方式の段階から'zyte'を外す。JSON API方式はZyte無しでは取得できないため
-    段階を空にする（process_target()が「Zyte停止中のため取得できない」失敗として記録する）"""
+    """Zyte停止中は、各方式の段階から'zyte'を外す。JSON API方式は、Agentでは構造を保てないため
+    Fetchだけにする"""
     out = {}
     for method, tiers in _ZYTE_METHOD_TIERS_ALL.items():
         if zyte_enabled:
             out[method] = tiers
-        elif method in _REQUIRES_ZYTE_METHODS:
-            out[method] = ()
+        elif method in _FETCH_ONLY_WHEN_NO_ZYTE:
+            out[method] = ("tinyfish_fetch",)
         else:
             out[method] = tuple(t for t in tiers if t != "zyte")
     return out

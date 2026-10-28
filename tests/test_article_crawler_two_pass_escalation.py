@@ -556,9 +556,7 @@ def test_process_target_defers_zyte_method_without_any_fetch_attempt(monkeypatch
 
 
 def test_process_target_defers_json_api_method_with_zyte_first_tiers(monkeypatch):
-    """crawl_method='JSON API'も同様にPass1で回送されるが、tier順は
-    tinyfish_fetchを含まない("zyte", "tinyfish_agent")であること
-    (TinyFish FetchはJSON構造を保持できないため)"""
+    """crawl_method='JSON API'も同様にPass1で回送される(Zyte有効時のtier順は zyte→Fetch→Agent)"""
     client = FakeSupabaseClient({})
     monkeypatch.setattr(ac, "list_json_api_candidates",
                          MagicMock(side_effect=AssertionError("Pass1で一覧取得が呼ばれないはず")))
@@ -566,7 +564,7 @@ def test_process_target_defers_json_api_method_with_zyte_first_tiers(monkeypatch
     target = _zyte_method_target(crawl_method="JSON API", endpoint_type="")
     summary = ac.process_target(target, client, {}, True)
 
-    assert summary["pending_listing_escalation"]["tiers"] == ("zyte", "tinyfish_agent")
+    assert summary["pending_listing_escalation"]["tiers"] == ("zyte", "tinyfish_fetch", "tinyfish_agent")
 
 
 # ─── _resolve_tiered_listing(): tier順に試して最初の成功を返す ──────────────
@@ -655,11 +653,11 @@ def test_escalate_pending_listings_with_tiers_all_fail_marks_log_failed(monkeypa
     assert updated_log["run_result"] == "失敗"
 
 
-# ─── list_json_api_candidates(tier=...): tinyfish_fetchは非対応 ───────────────
-def test_list_json_api_candidates_rejects_tinyfish_fetch_tier():
+# ─── list_json_api_candidates(tier=...): 未知のtierは非対応 ───────────────
+def test_list_json_api_candidates_rejects_unknown_tier():
     with pytest.raises(ValueError):
         ac.list_json_api_candidates(_zyte_method_target(crawl_method="JSON API"), {}, True,
-                                     tier="tinyfish_fetch")
+                                     tier="unknown")
 
 
 def test_pass1_preroute_to_pass2_is_marked_as_routed_not_failed():
