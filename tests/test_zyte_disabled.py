@@ -49,12 +49,12 @@ def test_article_tiers_drop_zyte_when_disabled_and_keep_order():
     assert ac._active_tiers(("zyte", "tinyfish_fetch", "tinyfish_agent"), False) == ("tinyfish_fetch", "tinyfish_agent")
 
 
-def test_method_tiers_when_disabled_json_api_is_empty_and_zyte_method_uses_tinyfish_only():
+def test_method_tiers_when_disabled_json_api_uses_fetch_only_and_zyte_method_uses_tinyfish_only():
     off = ac._build_zyte_method_tiers(False)
     assert off["Zyte"] == ("tinyfish_fetch", "tinyfish_agent")
-    assert off["JSON API"] == ()            # Zyte無しでは取得できない（Agentでは構造を保てない）
+    assert off["JSON API"] == ("tinyfish_fetch",)   # Fetchだけ（Agentでは構造を保てない）
     on = ac._build_zyte_method_tiers(True)
-    assert on["Zyte"] == ("tinyfish_fetch", "zyte", "tinyfish_agent") and on["JSON API"] == ("zyte", "tinyfish_agent")
+    assert on["Zyte"] == ("tinyfish_fetch", "zyte", "tinyfish_agent") and on["JSON API"] == ("zyte", "tinyfish_fetch", "tinyfish_agent")
 
 
 # ─── Zyteを呼ばない（ネットワークにも出ない） ───
@@ -91,16 +91,17 @@ def test_escalate_pending_goes_tinyfish_fetch_then_agent_only(monkeypatch):
     assert calls == ["tinyfish_fetch", "tinyfish_agent"] and result["final_failed"] == 1
 
 
-# ─── JSON API方式: Zyte停止中は取得できないことを、失敗として見える形で記録する ───
-def test_json_api_target_is_recorded_as_failure_not_silently_skipped_while_zyte_is_off():
-    client = FakeSupabaseClient({"crawl_logs": []})
+# ─── JSON API方式: Zyte停止中は、Pass1でTinyFish Fetchを直接使う(2026-10-28) ───
+def test_json_api_target_is_crawled_in_pass1_with_tinyfish_fetch_while_zyte_is_off(monkeypatch):
+    client = FakeSupabaseClient({"crawl_logs": [], "articles": []})
+    list_tiers = []
+    monkeypatch.setattr(ac, "_list_candidates_with_tier",
+                        lambda target, proxies, verify, tier: list_tiers.append(tier) or ([], 200, False, None, False))
 
     result = ac.process_target(_target("JSON API"), client, {}, True)
 
-    assert result["run_result"] == "失敗" and "Zyte停止中" in result["error_message"]
-    assert not result.get("pending_listing_escalation") and result["pending_escalations"] == []
-    row = client.inserted["crawl_logs"][0]
-    assert row["run_result"] == "失敗" and "CRAWL_ZYTE_ENABLED" in row["error_message"]
+    assert list_tiers == ["tinyfish_fetch"]
+    assert not result.get("pending_listing_escalation")
 
 
 def test_zyte_method_target_is_crawled_in_pass1_with_tinyfish_fetch_not_deferred_to_pass2(monkeypatch):
