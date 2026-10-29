@@ -33,8 +33,11 @@ def _compile(kw: str) -> re.Pattern:
     """英数字キーワードは単語境界つき、日本語キーワードは単純部分一致にする。
     2〜4文字の全角大文字略語（ETS, WHO, GRI等）は誤爆しやすいため大小文字を区別する。"""
     if _ASCII_WORD.match(kw):
-        pattern = r"(?<![A-Za-z0-9])" + re.escape(kw) + r"(?![A-Za-z0-9])"
         is_short_acronym = len(kw) <= 4 and kw.isupper()
+        # 英語の複数形("ESG rating"→"ESG ratings")も拾う。語尾が小文字の英字の語だけが対象
+        # （略称・数字終わり・大文字終わりは対象外。2026-10-29: 複数形で除外される取りこぼしの対応）
+        plural = r"(?:s|es)?" if (kw[-1].islower() and not is_short_acronym) else ""
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(kw) + plural + r"(?![A-Za-z0-9])"
         flags = 0 if is_short_acronym else re.IGNORECASE
         return re.compile(pattern, flags)
     return re.compile(re.escape(kw))

@@ -156,3 +156,27 @@ def test_prefilter_no_media_articles_writes_no_log():
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_prefilter_skips_filter_for_target_with_skip_keyword_filter():
+    """search_conditionsに skip_keyword_filter:true があるターゲット(Sustainable Japan等)は、
+    メディア区分でも語彙が不一致のまま通過し、除外ログの対象(チェック件数)にも入らない。
+    指定のないターゲットの動きは従来どおり。"""
+    _client_with_keywords(["サステナビリティ"])
+    client = FakeSupabaseClient({
+        "articles": [], "article_tags": [], "article_analysis": [], "article_files": [],
+    })
+    articles = [
+        {"article_id": "a1", "title": "ESG評価機関ランキング", "extracted_text": "",
+         "_target": {"publisher_tag_id": "SJ-11-01", "search_conditions": "skip_keyword_filter:true"}},
+        {"article_id": "a2", "title": "ESG評価機関ランキング", "extracted_text": "",
+         "_target": {"publisher_tag_id": "SJ-11-01", "search_conditions": "max_links:60"}},
+        {"article_id": "a3", "title": "ESG評価機関ランキング", "extracted_text": "",
+         "_target": {"publisher_tag_id": "SJ-11-01", "search_conditions": "max_links:60;skip_keyword_filter:true"}},
+    ]
+
+    remaining = article_analyzer._prefilter_articles(client, {"SJ-11-01"}, articles)
+
+    assert [a["article_id"] for a in remaining] == ["a1", "a3"]
+    log_rows = client.inserted.get("filter_exclusion_log", [])
+    assert log_rows[0]["total_checked_count"] == 1  # a2だけが判定対象
