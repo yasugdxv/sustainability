@@ -32,7 +32,7 @@ import uuid
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from html import escape as html_escape
+from html import escape as html_escape, unescape as html_unescape
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
@@ -839,6 +839,16 @@ TINYFISH_AGENT_GOAL = (
     '{"status": "failure", "reason": "<short reason>"}. '
     "Never put an explanation of a failure into the body field."
 )
+# 一覧ページから、最新の記事の一覧(日付|タイトル|URL)を返させる指示（2026-10-29追加）。
+# search_conditionsにlist_via_agent:trueを指定した対象だけが使う（_target_list_via_agent参照）
+TINYFISH_AGENT_LIST_GOAL = (
+    "This is a press release / news LISTING page. List the 10 most recent items. Reply with ONLY a JSON object, no other text. "
+    'If you could read the list: {"status": "success", "title": "listing", "body": "<one line per item in the form: '
+    'DATE | TITLE | FULL ARTICLE URL (absolute https URL of the item link)>"}. '
+    "If the page is blocked, shows a bot-check / CAPTCHA, requires login, or you could not read the list: "
+    '{"status": "failure", "reason": "<short reason>"}. Never put an explanation of a failure into the body field. '
+    "Each line MUST include the real link URL of the item, not just the title."
+)
 # ── Agentの上限（2026-10-21変更）──────────────────────────────────────────────
 # 従来は「1プロセスあたり10件(バックログは30件)」の先着順で、記事が多い1サイトが上限を使い切り、
 # 後ろのサイトにAgentが回らなかった（2026-10-21: 最終失敗40サイトのうち25サイトが未実施）。
@@ -1012,7 +1022,7 @@ def _cancel_tinyfish_run(run_id, api_key: str, proxies: dict, verify: bool) -> N
         pass
 
 
-def _call_tinyfish_agent(url: str, proxies: dict, verify: bool):
+def _call_tinyfish_agent(url: str, proxies: dict, verify: bool, goal: str = None):
     """TinyFish Agent APIを1回呼び出す（最後の手段。従量課金のため呼び出し回数はTINYFISH_AGENT_RUN_CAPで抑える）。
     (html, final_url, status_code)を返す。
 
@@ -1033,7 +1043,7 @@ def _call_tinyfish_agent(url: str, proxies: dict, verify: bool):
     agent_config = {"max_duration_seconds": TINYFISH_AGENT_MAX_DURATION_SEC}
     if TINYFISH_AGENT_MAX_STEPS > 0:
         agent_config["max_steps"] = TINYFISH_AGENT_MAX_STEPS
-    payload = {"url": url, "goal": TINYFISH_AGENT_GOAL, "agent_config": agent_config}
+    payload = {"url": url, "goal": goal or TINYFISH_AGENT_GOAL, "agent_config": agent_config}
     try:
         with requests.post(TINYFISH_AGENT_URL, headers={"X-API-Key": api_key, "Content-Type": "application/json"},
                            json=payload, proxies=proxies, verify=verify,
@@ -1712,6 +1722,48 @@ def _target_allow_external(target: dict) -> bool:
     外部リンクがすべて入ってしまうのを防ぐため、include_pathsの指定がある場合だけ有効にする
     （呼び出し側で判定）。指定のないターゲットの動きは、従来どおり"""
     return (_search_setting(target, "allow_external") or "").strip().lower() in ("true", "1", "yes")
+
+
+def _target_list_via_agent(target: dict) -> bool:
+    """search_conditions列に"list_via_agent:true"の指定があれば、一覧の取得にTinyFish Agentを使う
+    （2026-10-29、CDP・AB InBevで確認: 一覧がJS描画で、Fetchには記事リンクが出ず、Zyte停止後は取れなかった。
+    一覧用の指示(TINYFISH_AGENT_LIST_GOAL)を使うと、日付・タイトル・URLを取れた。有料で1〜2分かかるため、
+    指定した対象だけが使う）。記事の本文は、従来どおりTinyFish Fetchで取る"""
+    return (_search_setting(target, "list_via_agent") or "").strip().lower() in ("true", "1", "yes")
+
+
+_AGENT_LIST_LINE_RE = re.compile(r"^\s*(?:(?P<date>[^|]*?)\s*\|\s*)?(?P<title>[^|]*?)\s*\|\s*(?P<url>https?://\S+)\s*$")
+
+
+def list_candidates_via_agent(target: dict, proxies: dict, verify: bool) -> tuple:
+    """TinyFish Agentで、一覧ページの最新記事(日付|タイトル|URL)を取り、候補のリストを返す。(候補, 200)。
+    include_paths(前方一致)・同じドメインの条件は、HTML一覧と同じ。Agentの上限(サイト数・回数)を超えた場合は例外"""
+    target_id = target.get("crawl_target_id")
+    if not _tinyfish_agent_budget_available(target_id):
+        raise RuntimeError("TinyFish Agent: 呼び出しの上限に達したため、一覧を取得できません")
+    html, _, status_code = _call_tinyfish_agent(target["target_url"], proxies, verify, goal=TINYFISH_AGENT_LIST_GOAL)
+    _record_tinyfish_agent_call(target_id)
+    text = html_unescape(re.sub(r"<[^>]+>", "", html))
+    domain = target.get("domain") or urlparse(target["target_url"]).netloc
+    include_paths = [p.strip() for p in (target.get("include_paths") or "").split(",") if p.strip()]
+    candidates, seen = [], set()
+    for line in text.splitlines():
+        m = _AGENT_LIST_LINE_RE.match(line)
+        if not m:
+            continue
+        url = normalize_url(m.group("url"))
+        parsed = urlparse(url)
+        if domain not in parsed.netloc or url in seen:
+            continue
+        if include_paths and not any(_path_matches(_strip_aem_content_prefix(parsed.path), p) for p in include_paths):
+            continue
+        seen.add(url)
+        candidates.append({"url": url, "title": html_unescape(m.group("title")) or None, "published_at": _parse_datetime(m.group("date"))})
+        if len(candidates) >= MAX_HTML_LINKS_PER_TARGET:
+            break
+    if not candidates:
+        raise RuntimeError("TinyFish Agent: 一覧から記事のURLを読み取れませんでした")
+    return candidates, status_code
 
 
 def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser: bool = False,
@@ -2437,6 +2489,19 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
             "extraction_failures": 0, "error_message": message, "bot_block_detections": 0,
             "crawl_log_id": crawl_log_id, "pending_escalations": [],
         }
+
+    # 2026-10-29: search_conditionsにlist_via_agent:trueの対象は、一覧をAgentで取る(記事本文はFetch)
+    if _target_list_via_agent(target):
+        try:
+            candidates, http_status = list_candidates_via_agent(target, proxies, verify)
+            error_message = None
+        except Exception as e:  # noqa: BLE001
+            candidates, http_status, error_message = [], None, f"{type(e).__name__}: {e}"
+        return _process_target_articles(
+            target, client, proxies, verify, candidates, http_status, False,
+            error_message, False, False, lookback, crawl_log_id, started_at,
+            article_tier="tinyfish_fetch", extra_funnel={"p1_agent_list": 1},
+        )
 
     # 2026-10-20: Zyte停止中のcrawl_method='Zyte'は、Pass1でTinyFish Fetchを直接使う。
     # 従来はPass1で一切試さずPass2(チャンク末尾・バックログ)へ回していたが、Pass2はチャンクの時間切れで
