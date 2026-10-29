@@ -223,3 +223,91 @@ def test_crawl_completeness_is_the_daily_share_of_targets_processed():
 
     r = nw.crawl_completeness(C(), "2026-10-16", expected_targets=10, days=4)
     assert r["per_day"] == {"10-14": 5, "10-15": 10} and r["avg"] == round((0.5 + 1.0) / 4, 3)       # 10/16 以前の2日は、ログなし=0
+
+
+# ─── 事象一致(言語に依存しない突合) 2026-10-29追加 ───
+# 背景: 第2段が、出典タイトルの英単語だけで探していたため、日本語タイトルの同名記事(Sustainable Japan)を、
+# 1件も拾えず、事象一致が、96件中3件になっていた。日本語⇔英語でも、固有名詞・略称・数字でつながるようにした。
+def test_lang_free_tokens_join_japanese_and_english_by_names_acronyms_and_numbers():
+    jp = nw.lang_free_tokens("【国際】ISO、カーボンニュートラル規格ISO14068発行。オフセットより削減・除去優先")
+    en = nw.lang_free_tokens("ISO 14068:2026 Climate change management — Carbon neutrality")
+    assert {"iso", "iso14068"} & jp and "iso" in en
+    assert "#2026" in en and "~カー" in jp and "the" not in en
+
+
+class WindowClient:
+    """articles / article_analysis(収集日時の窓で絞る)を、最小限に模す"""
+
+    def __init__(self, docs):
+        self.docs = docs      # [(title, url, fetched_at, summary, level)]
+
+    def select(self, table, params=None):
+        if int((params or {}).get("offset", 0)) > 0:
+            return []
+        if table == "articles":
+            return [{"article_id": f"a{i}", "title": t, "fetched_url": u, "fetched_at": f} for i, (t, u, f, _s, _l) in enumerate(self.docs)]
+        if table == "article_analysis":
+            return [{"article_id": f"a{i}", "summary_short": s, "importance_level": lv} for i, (_t, _u, _f, s, lv) in enumerate(self.docs)]
+        return []
+
+
+def _neural(**kw):
+    base = {"mail": "2026-10-02", "no": 1, "theme": "気候", "date": "2026-09-30", "title": "【国際】ISO、カーボンニュートラル規格ISO14068発行。オフセットより削減・除去優先",
+            "summary": "国際標準化機構(ISO)は9月11日、カーボンニュートラルの達成・実証に関する国際規格ISO14068を発行した。", "src_title": "ISO 14068:2026 Climate change management — Carbon neutrality",
+            "urls": ["https://www.iso.org/standard/14068"], "url": "https://www.iso.org/standard/14068"}
+    return {**base, **kw}
+
+
+DOCS = [
+    ("【国際】ISO、カーボンニュートラル規格ISO14068発行。オフセットより削減・除去優先 | Sustainable Japan", "https://sustainablejapan.jp/2026/09/30/iso14068/", "2026-09-30T01:00:00+00:00", "ISOは9月11日、ISO14068を発行した", "A"),
+    ("ISO publishes ISO 14068 carbon neutrality standard", "https://example-media.com/iso-14068-carbon-neutrality", "2026-10-01T01:00:00+00:00", "ISOがカーボンニュートラル規格を発行", "B"),
+    ("Starbucks reports quarterly earnings", "https://example-media.com/starbucks-earnings", "2026-09-30T02:00:00+00:00", "スターバックスの決算", "C"),
+    ("Old article about ISO", "https://example-media.com/old-iso", "2026-08-01T00:00:00+00:00", "古い記事", "B"),
+]
+
+
+def test_find_event_candidates_matches_across_languages_and_ignores_unrelated_and_old_articles():
+    nw._WINDOW_CACHE.clear()
+    cands = nw.find_event_candidates(WindowClient(DOCS), _neural(), date(2026, 9, 30))
+    urls = [c["url"] for c in cands]
+    assert urls[0] == "https://sustainablejapan.jp/2026/09/30/iso14068/" and cands[0]["score"] >= nw.EVENT_MIN_SCORE
+    assert "https://example-media.com/iso-14068-carbon-neutrality" in urls                     # 英語の記事も、略称・数字でつながる
+    assert not any("starbucks" in u or "old-iso" in u for u in urls)                              # 無関係・古い記事は、入らない
+
+
+def test_find_event_candidates_excludes_the_neural_source_url_itself():
+    nw._WINDOW_CACHE.clear()
+    docs = DOCS + [("ISO 14068", "https://www.iso.org/standard/14068", "2026-09-30T03:00:00+00:00", "規格", "A")]
+    assert all(c["url"] != "https://www.iso.org/standard/14068" for c in nw.find_event_candidates(WindowClient(docs), _neural(), date(2026, 9, 30)))
+
+
+def _cand(media, level, score=0.5):
+    return {"media": media, "url": f"https://{media}/x", "title": "t", "level": level, "score": score, "first_detected_at": "2026-09-30T01:00:00+00:00"}
+
+
+def test_independent_media_takes_priority_and_own_media_is_counted_separately(monkeypatch):
+    monkeypatch.setattr(nw, "live_fetch_ok", lambda *a, **k: (True, None))
+    rules = {**nw.DEFAULT_RULES}
+    monkeypatch.setattr(nw, "find_event_candidates", lambda *a, **k: [_cand("sustainablejapan.jp", "B"), _cand("example-media.com", "A")])
+    r1 = nw.check_mail(FakeClient({}, {}), [_art("https://z.com/x")], [], rules, None, True, live=True)[0]
+    assert r1["judgement"] == nw.J_EVENT and r1["reach_rank"] == "A" and r1["alt_own"]["level"] == "B"
+    monkeypatch.setattr(nw, "find_event_candidates", lambda *a, **k: [_cand("sustainablejapan.jp", "B")])
+    r2 = nw.check_mail(FakeClient({}, {}), [_art("https://z.com/x")], [], rules, None, True, live=True)[0]
+    assert r2["judgement"] == nw.J_EVENT_OWN and r2["reach_rank"] == "B" and r2["alt_indep"] is None
+    assert r2["reason_code"] == "target_missing"                       # URLでは未収集。クロール改善の手がかりとして、原因は残す
+
+
+def test_weak_or_low_rank_alternatives_do_not_count(monkeypatch):
+    monkeypatch.setattr(nw, "live_fetch_ok", lambda *a, **k: (True, None))
+    rules = {**nw.DEFAULT_RULES}
+    monkeypatch.setattr(nw, "find_event_candidates", lambda *a, **k: [_cand("example-media.com", "A", score=0.2), _cand("sustainablejapan.jp", "D")])
+    r = nw.check_mail(FakeClient({}, {}), [_art("https://z.com/x")], [], rules, None, True, live=True)[0]
+    assert r["judgement"] == nw.J_MISSED and "example-media.com" in r["stage2"]       # 類似度が低い・ランクDは、数えず、候補として表示だけ
+
+
+def test_compute_kpis_reports_coverage_with_own_media_separately():
+    rows = [_row(nw.J_CAPTURED), _row(nw.J_EVENT), _row(nw.J_EVENT_OWN, "target_missing"), _row(nw.J_MISSED, "blocked")]
+    k = nw.compute_kpis(rows, "2026-10-16")
+    assert (k["captured_strict"], k["captured_event_candidate"], k["captured_own_media"]) == (1, 1, 1)
+    assert k["coverage_strict"] == 0.25 and k["coverage_with_event"] == 0.5 and k["coverage_with_own_media"] == 0.75
+    assert k["reasons"] == {"blocked": 1} and k["reasons_url_miss"] == {"target_missing": 1, "blocked": 1}

@@ -19,6 +19,7 @@ DBは読み取りのみ（書き込みなし）。--no-live を付けなけれ�
 import argparse
 import csv
 import json
+import math
 import re
 import sys
 from collections import Counter
@@ -31,7 +32,8 @@ import article_crawler as ac
 
 RANK_REACHED = ("S", "A", "B", "C")
 RANK_ORDER = {"S": 5, "A": 4, "B": 3, "C": 2, "D": 1}
-DEFAULT_RULES = {"crawl_start": "2026-08-01", "out_of_scope_keywords": [], "out_of_scope_themes": []}
+DEFAULT_OWN_MEDIA = ["sustainablejapan.jp"]   # ニューラルの掲載記事と、同じ記事を載せる媒体(neural_check_rules.jsonで変更できる)
+DEFAULT_RULES = {"crawl_start": "2026-08-01", "out_of_scope_keywords": [], "out_of_scope_themes": [], "own_media_domains": DEFAULT_OWN_MEDIA}
 LISTING_METHODS = ("HTML", "ブラウザ操作", "Zyte")
 DISABLED_METHODS = ("廃止", "重複廃止", "手動")
 CRAWL_WINDOW_DAYS = (0, 3)           # 記事の公表日〜後3日。記事が、一覧・フィードに載っている間に、クロールが回っていたか
@@ -40,6 +42,10 @@ CRAWL_GAP_MIN_RUNS = 2               # この間のクロールが、これ未�
 # 判定の値
 J_CAPTURED = "捕捉(C以上)"
 J_EVENT = "別媒体で捕捉(候補・要目視)"
+J_EVENT_OWN = "ニューラル媒体で捕捉(Sustainable Japan等)"
+# 事象一致(言語に依存しない突合)の基準。類似度は、0〜1(2026-10-29、10月の28件で、同名記事は0.33〜0.69、無関係な記事は0.30未満)
+EVENT_MIN_SCORE = 0.30          # これ以上を、捕捉の候補(重要度C以上のとき、捕捉に数える)
+EVENT_SHOW_SCORE = 0.15         # これ以上を、突合シートに、候補として表示する(要目視)
 J_D = "収集したが選定落ち(D)"
 J_FILTERED = "収集したがフィルタ除外"
 J_UNANALYZED = "収集したが未分析"
@@ -92,7 +98,7 @@ def read_neural_xlsx(path, mail_date: str = None) -> list:
         d = dict(zip(header, r))
         urls = split_source_urls(d.get("出典URL"))
         rows.append({"mail": mail_date, "no": d.get("#"), "theme": str(d.get("テーマ") or ""), "date": str(d.get("日付") or "")[:10],
-                     "title": str(d.get("タイトル") or ""), "src_title": str(d.get("出典タイトル") or ""), "urls": urls,
+                     "title": str(d.get("タイトル") or ""), "summary": str(d.get("内容") or ""), "src_title": str(d.get("出典タイトル") or ""), "urls": urls,
                      "url": urls[0] if urls else ""})
     return rows
 
@@ -246,24 +252,27 @@ def compute_kpis(rows: list, mail_date: str, crawl: dict = None) -> dict:
     den = [r for r in rows if r["judgement"] not in (J_EXCL_PRE, J_EXCL_SCOPE)]
     strict = [r for r in den if r["judgement"] == J_CAPTURED]
     event = [r for r in den if r["judgement"] == J_EVENT]
+    own = [r for r in den if r["judgement"] == J_EVENT_OWN]
     ahead = [r["days_ahead"] for r in strict if r.get("days_ahead") is not None]
     d = len(den) or 1
     return {
         "mail_date": mail_date, "total": len(rows), "excluded_pre_crawl": sum(1 for r in excluded if r["judgement"] == J_EXCL_PRE),
         "excluded_out_of_scope": sum(1 for r in excluded if r["judgement"] == J_EXCL_SCOPE), "denominator": len(den),
-        "captured_strict": len(strict), "captured_event_candidate": len(event),
+        "captured_strict": len(strict), "captured_event_candidate": len(event), "captured_own_media": len(own),
         "coverage_strict": round(len(strict) / d, 4), "coverage_with_event": round((len(strict) + len(event)) / d, 4),
+        "coverage_with_own_media": round((len(strict) + len(event) + len(own)) / d, 4),
         "collected_but_D": sum(1 for r in den if r["judgement"] == J_D),
         "collected_but_filtered": sum(1 for r in den if r["judgement"] in (J_FILTERED, J_UNANALYZED)),
         "not_collected": sum(1 for r in den if r["judgement"] == J_MISSED),
         "avg_days_ahead": round(sum(ahead) / len(ahead), 2) if ahead else None, "freshness_n": len(ahead),
         "reasons": dict(Counter(r["reason_code"] for r in den if r["judgement"] == J_MISSED)),
+        "reasons_url_miss": dict(Counter(r["reason_code"] for r in den if r["judgement"] in (J_MISSED, J_EVENT_OWN) and r.get("reason_code"))),
         "crawl_completeness": (crawl or {}).get("avg"), "crawl_per_day": (crawl or {}).get("per_day", {}),
     }
 
 
 HISTORY_COLUMNS = ["run_at", "mail_date", "total", "excluded_pre_crawl", "excluded_out_of_scope", "denominator", "captured_strict",
-                   "captured_event_candidate", "coverage_strict", "coverage_with_event", "collected_but_D", "collected_but_filtered",
+                   "captured_event_candidate", "captured_own_media", "coverage_strict", "coverage_with_event", "coverage_with_own_media", "collected_but_D", "collected_but_filtered",
                    "not_collected", "avg_days_ahead", "freshness_n", "crawl_completeness", "reasons"]
 
 
@@ -314,24 +323,100 @@ def best_analysis(analyses: list) -> dict:
     return {"level": top.get("importance_level"), "status": top.get("analysis_status")}
 
 
+_STOP_FREE = set(_STOPWORDS) | {"the", "and", "for", "with", "from", "that", "this", "its", "are", "was", "has", "have", "new", "says", "https",
+                                "www", "com", "html", "htm", "news", "press", "release", "releases", "en", "ja", "jp"}
+_WINDOW_CACHE = {}
+
+
+def lang_free_tokens(text: str) -> set:
+    """言語に依存しない、照合用の特徴語。英字の語(固有名詞・略称。小文字)、数字(2桁以上)、日本語の2文字の並び。
+    日本語⇔英語の記事は、英字の固有名詞・略称・数字で、日本語⇔日本語の記事は、文字の並びで、つながる"""
+    text = text or ""
+    out = set()
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9\-]*", text):
+        w = w.lower().strip("-")
+        if len(w) >= 2 and w not in _STOP_FREE:
+            out.add(w)
+    for n in re.findall(r"\d[\d,\.]*\d|\d", text):
+        n = n.replace(",", "")
+        if len(n) >= 2:
+            out.add("#" + n)
+    for seq in re.findall(r"[ァ-ヶー]{2,}|[一-龥々]{2,}|[ぁ-ん]{3,}", text):
+        out.update("~" + seq[i:i + 2] for i in range(len(seq) - 1))
+    return out
+
+
+def _fetch_all(client, table: str, params: dict) -> list:
+    rows, off = [], 0
+    while True:
+        batch = client.select(table, {**params, "limit": "1000", "offset": str(off)})
+        rows += batch
+        if len(batch) < 1000:
+            return rows
+        off += 1000
+
+
+def _window_docs(client, lo: str, hi: str) -> tuple:
+    """収集日時が[lo, hi)の記事(タイトル・URL・要約・重要度)と、語の希少さ(IDF)。同じ窓は、キャッシュする"""
+    key = (lo, hi)
+    if key not in _WINDOW_CACHE:
+        arts = _fetch_all(client, "articles", {"select": "article_id,title,fetched_url,fetched_at", "is_current": "eq.true",
+                                               "and": f"(fetched_at.gte.{lo},fetched_at.lt.{hi})", "order": "fetched_at"})
+        an_hi = (date.fromisoformat(hi) + timedelta(days=10)).isoformat()
+        an = {a["article_id"]: a for a in _fetch_all(client, "article_analysis", {"select": "article_id,summary_short,importance_level", "is_current": "eq.true",
+                                                                                   "and": f"(created_at.gte.{lo},created_at.lt.{an_hi})", "order": "created_at"})}
+        docs = []
+        for a in arts:
+            x = an.get(a["article_id"], {})
+            path = urlparse(a.get("fetched_url") or "").path.replace("-", " ").replace("/", " ")
+            docs.append({"art": a, "level": x.get("importance_level"), "tokens": lang_free_tokens(f"{a.get('title') or ''} {x.get('summary_short') or ''} {path}")})
+        df = Counter(t for d in docs for t in d["tokens"])
+        n = len(docs)
+        _WINDOW_CACHE[key] = (docs, {t: math.log(n / (1 + v)) for t, v in df.items()}, n)
+    return _WINDOW_CACHE[key]
+
+
 def find_event_candidates(client, article: dict, src_date) -> list:
-    """第2段(事象一致): 出典タイトルの主要語を、2語以上含む、別の収集記事を探す（候補。目視で確認する）"""
-    kws = keywords_from_title(article.get("src_title") or article.get("title"))
-    if len(kws) < 2:
-        return []
-    since = ((src_date or date.fromisoformat(article["date"])) - timedelta(days=3)).isoformat()
-    conds = ",".join([f"title.ilike.*{k}*" for k in kws[:2]] + [f"fetched_at.gte.{since}"])
+    """第2段(事象一致・言語に依存しない): ニューラルの記事(日本語タイトル・要約・出典タイトル・出典URL)と、同じ時期に収集した記事を、
+    語の希少さで重みづけした重なりで比べ、似ている順に返す(類似度EVENT_SHOW_SCORE以上、最大5件)。
+    日本語⇔英語でも、英字の固有名詞・略称・数字でつながる。同名記事(ニューラル媒体)は、日本語タイトルの重なりで拾う。
+    候補は、目視で確認する前提(類似度EVENT_MIN_SCORE以上で、重要度C以上のとき、捕捉に数える)"""
+    base = src_date or date.fromisoformat(article["date"])
+    lo_d = base - timedelta(days=3)
+    lo_week = (lo_d - timedelta(days=lo_d.weekday())).isoformat()          # 同じ週の記事は、同じ窓を使い回す
+    hi = (date.fromisoformat(article["mail"]) + timedelta(days=7)).isoformat()
     try:
-        arts = client.select("articles", {"select": "article_id,article_url_id,title", "and": f"({conds})", "is_current": "eq.true", "limit": "5"})
+        docs, idf, n = _window_docs(client, lo_week, hi)
     except Exception:  # noqa: BLE001
         return []
-    out = []
-    for a in arts:
-        u = client.select("article_urls", {"select": "article_url,domain", "article_url_id": f"eq.{a['article_url_id']}", "limit": "1"})
-        an = client.select("article_analysis", {"select": "importance_level", "article_id": f"eq.{a['article_id']}", "is_current": "eq.true", "limit": "1"})
-        out.append({"media": (u[0]["domain"] if u else ""), "url": (u[0]["article_url"] if u else ""), "title": (a.get("title") or "")[:60],
-                    "level": an[0]["importance_level"] if an else None})
-    return out
+    if not docs:
+        return []
+    path = urlparse(article.get("url") or "").path.replace("-", " ").replace("/", " ")
+    q = lang_free_tokens(f"{article.get('title') or ''} {(article.get('summary') or '')[:300]} {article.get('src_title') or ''} {path}")
+    q_score = sum(idf.get(t, math.log(max(n, 2))) for t in q)
+    if q_score <= 0:
+        return []
+    own_urls = {ac.normalize_url(u) for u in (article.get("urls") or [])}
+    scored = []
+    for d in docs:
+        a = d["art"]
+        if (a.get("fetched_at") or "")[:10] < lo_d.isoformat() or ac.normalize_url(a.get("fetched_url") or "") in own_urls:
+            continue
+        shared = q & d["tokens"]
+        if not shared:
+            continue
+        d_score = sum(idf[t] for t in d["tokens"])
+        score = sum(idf[t] for t in shared) / math.sqrt(q_score * d_score) if d_score > 0 else 0
+        if score >= EVENT_SHOW_SCORE:
+            scored.append((score, d))
+    scored.sort(key=lambda x: -x[0])
+    return [{"media": urlparse(d["art"].get("fetched_url") or "").netloc.lower().replace("www.", ""), "url": d["art"].get("fetched_url") or "",
+             "title": (d["art"].get("title") or "")[:60], "level": d["level"], "score": round(score, 3), "first_detected_at": d["art"].get("fetched_at") or ""}
+            for score, d in scored[:5]]
+
+
+def _is_own_media(media: str, rules: dict) -> bool:
+    return any(d and d in (media or "") for d in (rules.get("own_media_domains") or DEFAULT_OWN_MEDIA))
 
 
 def live_fetch_ok(url: str, proxies, verify) -> tuple:
@@ -351,6 +436,7 @@ def live_fetch_ok(url: str, proxies, verify) -> tuple:
 # ─── 実行 ───
 def check_mail(client, articles: list, targets: list, rules: dict, proxies, verify, live: bool = True) -> list:
     """1通分の記事を突合して、行(dict)のリストを返す"""
+    _WINDOW_CACHE.clear()
     by_host = {}
     for t in targets:
         d = (t.get("domain") or urlparse(t.get("target_url") or "").netloc).lower().replace("www.", "")
@@ -363,7 +449,7 @@ def check_mail(client, articles: list, targets: list, rules: dict, proxies, veri
         src_date = src_date or (date.fromisoformat(a["date"]) if a["date"] else None)
         row = {**a, "src_date": str(src_date or ""), "src_date_basis": src_date_basis, "scope": "枠内", "stage1": "", "stage2": "",
                "reach_rank": "", "judgement": "", "reason_code": "", "reason": "", "fix_owner": "", "days_ahead": None,
-               "first_detected_at": "", "live_ok": None, "live_error": ""}
+               "first_detected_at": "", "live_ok": None, "live_error": "", "alt_indep": None, "alt_own": None}
         exc = exclusion_reason(a, src_date, rules)
         if exc:
             row.update(judgement=exc[0], reason=exc[1], scope="枠外" if exc[0] == J_EXCL_SCOPE else "枠内")
@@ -383,13 +469,19 @@ def check_mail(client, articles: list, targets: list, rules: dict, proxies, veri
             row["stage1"] = "URL不一致"
             cands = find_event_candidates(client, a, src_date)
             if cands:
-                row["stage2"] = "; ".join(f"{c['media']}({c['level'] or '空'}): {c['title']}" for c in cands[:3])
-            hit_c = [c for c in cands if c["level"] in RANK_REACHED]
-            if hit_c:
-                row["judgement"], row["reach_rank"] = J_EVENT, max((c["level"] for c in hit_c), key=lambda x: RANK_ORDER[x])
+                row["stage2"] = "; ".join(f"{c['media']}({c['level'] or '空'},{c.get('score', '')}): {c['title']}" for c in cands[:3])
+            strong = [c for c in cands if c.get("score", 1.0) >= EVENT_MIN_SCORE and c["level"] in RANK_REACHED]
+            best = lambda cs: max(cs, key=lambda c: (RANK_ORDER[c["level"]], c.get("score", 1.0))) if cs else None
+            own = [c for c in strong if _is_own_media(c["media"], rules)]
+            indep = [c for c in strong if not _is_own_media(c["media"], rules)]
+            row["alt_indep"], row["alt_own"] = best(indep), best(own)
+            if indep:                                           # 独立した媒体で、同じ事象を収集している
+                row["judgement"], row["reach_rank"] = J_EVENT, row["alt_indep"]["level"]
+            elif own:                                           # ニューラル自身の媒体(同名記事)だけで、収集している
+                row["judgement"], row["reach_rank"] = J_EVENT_OWN, row["alt_own"]["level"]
             else:
                 row["judgement"] = J_MISSED
-        if row["judgement"] in (J_MISSED, J_EVENT):
+        if row["judgement"] in (J_MISSED, J_EVENT, J_EVENT_OWN):
             host = urlparse(a["url"]).netloc.lower().replace("www.", "")
             tgt = [t for d, ts in by_host.items() if d in host for t in ts]       # クローラーと同じく、domainがホストに含まれるか
             live_ok, live_err = (None, "")
@@ -397,14 +489,14 @@ def check_mail(client, articles: list, targets: list, rules: dict, proxies, veri
                 live_ok, live_err = live_fetch_ok(a["url"], proxies, verify)
             row["live_ok"], row["live_error"] = live_ok, live_err or ""
             runs = None
-            if tgt and src_date and row["judgement"] == J_MISSED:
+            if tgt and src_date and row["judgement"] in (J_MISSED, J_EVENT_OWN):
                 lo, hi = (src_date + timedelta(days=CRAWL_WINDOW_DAYS[0])), (src_date + timedelta(days=CRAWL_WINDOW_DAYS[1]))
                 try:
                     runs = len(client.select("crawl_logs", {"select": "crawl_log_id", "crawl_target_id": f"eq.{tgt[0]['crawl_target_id']}",
                                                             "and": f"(started_at.gte.{lo.isoformat()},started_at.lt.{hi.isoformat()})"}))
                 except Exception:  # noqa: BLE001
                     runs = None
-            if row["judgement"] == J_MISSED:
+            if row["judgement"] in (J_MISSED, J_EVENT_OWN):         # URLでは未収集の記事。クロール改善の手がかりとして、原因を残す
                 code = classify_miss(a, tgt, src_date, live_ok, runs)
                 row["reason_code"] = code
                 row["reason"], row["fix_owner"] = REASONS[code]
@@ -439,7 +531,9 @@ def write_excel(rows: list, kpi: dict, path: Path) -> None:
         ("分母除外: クロール開始前", kpi["excluded_pre_crawl"], "出典の公表日がクロール開始前"), ("分母除外: 枠外", kpi["excluded_out_of_scope"], "neural_check_rules.json の機械的な基準"),
         ("分母", kpi["denominator"], "掲載記事数 − 分母除外"), ("捕捉(URL一致・C以上)", kpi["captured_strict"], "到達点＝重要度C以上"),
         ("別媒体で捕捉(候補・要目視)", kpi["captured_event_candidate"], "第2段(事象一致)の候補。目視で確認する"),
-        ("カバレッジ(厳密)", pct(kpi["coverage_strict"]), "合格90%・目標95%（確定前の案）"), ("カバレッジ(事象候補を含む)", pct(kpi["coverage_with_event"]), ""),
+        ("ニューラル媒体で捕捉(Sustainable Japan等)", kpi["captured_own_media"], "ニューラルの掲載記事と同名の記事を、収集している(ニューラル自身の媒体。KPIに数えるかは、PMOと確認)"),
+        ("カバレッジ(厳密)", pct(kpi["coverage_strict"]), "合格90%・目標95%（確定前の案）"), ("カバレッジ(事象候補を含む)", pct(kpi["coverage_with_event"]), "URL一致＋独立媒体の事象一致"),
+        ("カバレッジ(ニューラル媒体を含む)", pct(kpi["coverage_with_own_media"]), "上に、ニューラル媒体の同名記事を加えた値"),
         ("収集したが選定落ち(D)", kpi["collected_but_D"], "重要度判定の見直し候補"), ("収集したがフィルタ除外・未分析", kpi["collected_but_filtered"], "フィルタの見直し候補"),
         ("未収集", kpi["not_collected"], "クロールの見直し候補（原因別は下表・原因別シート）"),
         ("鮮度: 平均の先行日数", kpi["avg_days_ahead"], f"目標＝平均3日以上先行。収集日時で代用(Notion掲載日時は未連携)。n={kpi['freshness_n']}"),
@@ -454,13 +548,16 @@ def write_excel(rows: list, kpi: dict, path: Path) -> None:
 
     ws2 = wb.create_sheet("突合シート")
     cols = ["メール日", "No", "テーマ", "ニューラルのタイトル", "出典URL(先頭)", "出典URL数", "出典公表日", "公表日の根拠", "枠内・枠外", "第1段(URL一致)",
-            "第2段(事象一致・媒体名)", "到達ランク", "判定", "未捕捉の理由コード", "未捕捉の理由", "修正先", "初回収集日時", "先行日数", "いま取得できるか", "取得できない理由", "クロール先"]
+            "第2段(事象一致・媒体名)", "到達ランク", "判定", "未捕捉の理由コード", "未捕捉の理由", "修正先", "初回収集日時", "先行日数", "いま取得できるか", "取得できない理由", "クロール先",
+            "代替(独立媒体)", "代替の重要度", "代替の類似度", "代替(ニューラル媒体)の重要度", "代替(ニューラル媒体)のURL", "代替(ニューラル媒体)の収集日時"]
     ws2.append(cols)
     for r in rows:
         ws2.append([r["mail"], r["no"], r["theme"], r["title"], r["url"], len(r["urls"]), r["src_date"], r["src_date_basis"], r["scope"], r["stage1"],
                     r["stage2"], r["reach_rank"], r["judgement"], r["reason_code"], r["reason"], r["fix_owner"], r["first_detected_at"],
-                    "" if r["days_ahead"] is None else r["days_ahead"], {True: "○", False: "×", None: ""}[r["live_ok"]], r["live_error"], r.get("target", "")])
-    style(ws2, [11, 5, 16, 50, 50, 8, 12, 14, 9, 12, 50, 10, 24, 16, 40, 34, 16, 8, 10, 40, 36])
+                    "" if r["days_ahead"] is None else r["days_ahead"], {True: "○", False: "×", None: ""}[r["live_ok"]], r["live_error"], r.get("target", ""),
+                    (r["alt_indep"] or {}).get("url", ""), (r["alt_indep"] or {}).get("level", ""), (r["alt_indep"] or {}).get("score", ""),
+                    (r["alt_own"] or {}).get("level", ""), (r["alt_own"] or {}).get("url", ""), (r["alt_own"] or {}).get("first_detected_at", "")])
+    style(ws2, [11, 5, 16, 50, 50, 8, 12, 14, 9, 12, 50, 10, 24, 16, 40, 34, 16, 8, 10, 40, 36, 40, 9, 9, 12, 40, 18])
     ws2.auto_filter.ref = ws2.dimensions
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
@@ -492,7 +589,7 @@ def main(argv=None):
                                                                   "rows": [{**r, "urls": r["urls"]} for r in rows]}, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
         append_history(out / "history.csv", kpi)
         print(f"  分母{kpi['denominator']}件(除外: クロール開始前{kpi['excluded_pre_crawl']}・枠外{kpi['excluded_out_of_scope']}) / 捕捉{kpi['captured_strict']}件 "
-              f"= カバレッジ{kpi['coverage_strict']:.1%}(事象候補を含む{kpi['coverage_with_event']:.1%}) / 先行日数の平均 {kpi['avg_days_ahead']} / クロール完走率 {kpi['crawl_completeness']}", flush=True)
+              f"= カバレッジ{kpi['coverage_strict']:.1%}(事象候補を含む{kpi['coverage_with_event']:.1%}・ニューラル媒体も含む{kpi['coverage_with_own_media']:.1%}) / 先行日数の平均 {kpi['avg_days_ahead']} / クロール完走率 {kpi['crawl_completeness']}", flush=True)
         print(f"  収集したがD {kpi['collected_but_D']} / フィルタ除外・未分析 {kpi['collected_but_filtered']} / 未収集 {kpi['not_collected']}: {kpi['reasons']}", flush=True)
     print(f"出力: {out.resolve()}")
 
