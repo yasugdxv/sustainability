@@ -7,7 +7,7 @@
 
 仕組み（Gitの内部機能を使う）:
     ・対象は、今のブランチの「コミット済み」の内容（HEAD）。未コミットの変更や作業フォルダには触れない。
-    ・Azure（DevOps）で使わないもの（aws/、.github/）はスナップショットから外す。
+    ・Azure（DevOps）で使わないもの（aws/、.github/、.claude/、.vscode/）はスナップショットから外す。
     ・履歴は、スナップショット同士の連なり（ローカルの参照 refs/sus-deploy/main に記録）。
       今までの開発履歴は、DevOps には出ない。
     ・秘密情報らしき文字列・config.json/.env・50MB超のファイルが見つかれば、作成せずに止まる。
@@ -25,7 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_REF = "refs/sus-deploy/main"
-EXCLUDE_PATHS = ["aws", ".github"]
+EXCLUDE_PATHS = ["aws", ".github", ".claude", ".vscode"]
 FORBIDDEN_NAMES = {"config.json", ".env"}
 MAX_BYTES = 50 * 1024 * 1024
 SECRET_PATTERN = re.compile(
