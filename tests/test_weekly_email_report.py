@@ -191,6 +191,60 @@ def test_build_email_handles_empty_results():
     assert "該当する記事はありませんでした" in html
 
 
+def _graph_config():
+    return {"email": {"enabled": True, "method": "graph", "from_address": "sender@example.com"},
+            "proxy": {"enabled": False}}
+
+
+def _set_ms_env(monkeypatch):
+    monkeypatch.setenv("MS_TENANT_ID", "tenant-x")
+    monkeypatch.setenv("MS_CLIENT_ID", "client-x")
+    monkeypatch.setenv("MS_CLIENT_SECRET", "secret-x")
+
+
+def test_send_email_graph_success(monkeypatch):
+    """graph方式: トークン取得→sendMail(202)で成功し、実ネットワークには出ないこと"""
+    _set_ms_env(monkeypatch)
+    calls = []
+
+    def fake_post(url, **kw):
+        calls.append(url)
+        if "oauth2/v2.0/token" in url:
+            return MagicMock(status_code=200, json=lambda: {"access_token": "tok"})
+        return MagicMock(status_code=202)
+
+    monkeypatch.setattr(wer.requests, "post", fake_post)
+    result = wer.send_email("件名", "<p>本文</p>", _graph_config(), ["a@example.com"])
+    assert result == {"ok": True, "mode": "graph", "to": ["a@example.com"]}
+    assert calls[1].endswith("/users/sender@example.com/sendMail")
+
+
+def test_send_email_graph_error_does_not_leak_secret(monkeypatch):
+    """graph方式: 403でも失敗として返り、エラー文にSecretが含まれないこと"""
+    _set_ms_env(monkeypatch)
+
+    def fake_post(url, **kw):
+        if "oauth2/v2.0/token" in url:
+            return MagicMock(status_code=200, json=lambda: {"access_token": "tok"})
+        return MagicMock(status_code=403)
+
+    monkeypatch.setattr(wer.requests, "post", fake_post)
+    result = wer.send_email("件名", "<p>本文</p>", _graph_config(), ["a@example.com"])
+    assert result["ok"] is False
+    assert "403" in result["error"]
+    assert "secret-x" not in result["error"]
+
+
+def test_send_email_graph_missing_credentials(monkeypatch):
+    """graph方式: 認証情報が無ければ送信せず設定不足を返すこと"""
+    for k in ("MS_TENANT_ID", "MS_CLIENT_ID", "MS_CLIENT_SECRET"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(wer.requests, "post", lambda *a, **k: (_ for _ in ()).throw(AssertionError("呼ばれてはいけない")))
+    result = wer.send_email("件名", "<p>本文</p>", _graph_config(), ["a@example.com"])
+    assert result["ok"] is False
+    assert "設定不足" in result["error"]
+
+
 def test_send_email_falls_back_to_preview_when_not_configured(tmp_path, monkeypatch):
     """email.enabledがfalse、またはsmtp_host未設定なら、SMTP送信せずプレビュー保存すること"""
     monkeypatch.setattr(wer, "CACHE_DIR", tmp_path)

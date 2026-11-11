@@ -1057,10 +1057,22 @@ class WeeklyReviewBody(BaseModel):
     testMode: bool = False  # True: 承認時、テスト受信者(is_test)だけへ送る。省略時は本番の受信者
 
 
+@app.middleware("http")
+async def _capture_bearer_token(request, call_next):
+    """SSO: リクエストの Authorization: Bearer を、このリクエストの間だけ、identityへ渡す（2026-10-23追加）。
+    トークンの検証は、承認系の_review_principal()(identity.resolve_principal)で行う"""
+    reset = identity.set_request_bearer_token(identity.bearer_token_from_header(request.headers.get("authorization")))
+    try:
+        return await call_next(request)
+    finally:
+        identity.reset_request_bearer_token(reset)
+
+
 def _review_principal():
     """(principal, error)を返す。解決できない場合principalはNone"""
     try:
-        return identity.resolve_principal(dev_principal=identity.dev_principal_from_env()), None
+        return identity.resolve_principal(dev_principal=identity.dev_principal_from_env(),
+                                          bearer_token=identity.current_bearer_token()), None
     except identity.AuthenticationError as e:
         return None, str(e)
 

@@ -40,6 +40,7 @@ summary_detail）も生成し、article_analysisへ保存する（save_detail_su
 """
 import argparse
 import json
+import os
 import re
 import smtplib
 import sys
@@ -761,14 +762,84 @@ def list_recipients(client: SupabaseClient, test_mode: bool = False) -> list:
     return common.list_recipients(client, "notify_weekly_digest", test_mode=test_mode)
 
 
+# ─── Microsoft Graph 経由の送信（Entra IDアプリのクライアント認証） ──────
+def _load_ms_credentials(email_cfg: dict) -> dict:
+    """Entra IDアプリの認証情報を取得する。config.jsonのemailブロックを優先し、
+    無ければ環境変数（config.jsonが無いDocker等の実行環境向け）から読む"""
+    keys = {"tenant_id": "MS_TENANT_ID", "client_id": "MS_CLIENT_ID", "client_secret": "MS_CLIENT_SECRET"}
+    return {name: email_cfg.get(name) or os.environ.get(env_key, "") for name, env_key in keys.items()}
+
+
+def _send_via_graph(subject: str, html_body: str, config: dict, to_addresses: list) -> dict:
+    """Microsoft Graphのsendmailで送信する（アプリケーション許可 Mail.Send が必要）。
+    エラー内容にSecretが混ざらないよう、例外メッセージは種類とHTTPステータス中心にする"""
+    email_cfg = config.get("email", {})
+    sender = email_cfg.get("from_address", "")
+    cred = _load_ms_credentials(email_cfg)
+    missing = [k for k, v in cred.items() if not v]
+    if missing or not sender:
+        return {"ok": False, "mode": "graph",
+                "error": f"設定不足: {', '.join(missing + ([] if sender else ['from_address']))}"}
+
+    proxy_cfg = config.get("proxy", {})
+    proxy_url = proxy_cfg.get("http_proxy", "") if proxy_cfg.get("enabled") else ""
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+    verify = config.get("ssl", {}).get("verify", True)
+
+    try:
+        token_resp = requests.post(
+            f"https://login.microsoftonline.com/{cred['tenant_id']}/oauth2/v2.0/token",
+            data={"grant_type": "client_credentials", "client_id": cred["client_id"],
+                  "client_secret": cred["client_secret"],
+                  "scope": "https://graph.microsoft.com/.default"},
+            proxies=proxies, verify=verify, timeout=30,
+        )
+        if token_resp.status_code != 200:
+            # Entraのエラーコード（invalid_client / AADSTS7000215 等）だけ添える。Secretは含まれない
+            try:
+                body = token_resp.json()
+                m = re.search(r"AADSTS\d+", body.get("error_description", ""))
+                code = f" {body.get('error', '')} {m.group(0) if m else ''}".rstrip()
+            except Exception:
+                code = ""
+            return {"ok": False, "mode": "graph",
+                    "error": f"トークン取得失敗 HTTP {token_resp.status_code}{code}（テナントID/クライアントID/Secretを確認）"}
+        token = token_resp.json()["access_token"]
+
+        payload = {
+            "message": {
+                "subject": subject,
+                "body": {"contentType": "HTML", "content": html_body},
+                "toRecipients": [{"emailAddress": {"address": a}} for a in to_addresses],
+            },
+            "saveToSentItems": True,
+        }
+        resp = requests.post(
+            f"https://graph.microsoft.com/v1.0/users/{sender}/sendMail",
+            json=payload, headers={"Authorization": f"Bearer {token}"},
+            proxies=proxies, verify=verify, timeout=30,
+        )
+        if resp.status_code != 202:
+            hint = "（Mail.Send権限と管理者同意、送信元メールボックスを確認）" if resp.status_code in (401, 403, 404) else ""
+            return {"ok": False, "mode": "graph", "error": f"sendMail失敗 HTTP {resp.status_code}{hint}"}
+        return {"ok": True, "mode": "graph", "to": to_addresses}
+    except Exception as e:
+        return {"ok": False, "mode": "graph", "error": f"{type(e).__name__}"}
+
+
 # ─── 送信（またはプレビュー保存） ───────────────────────────────────
 def send_email(subject: str, html_body: str, config: dict, to_addresses: list) -> dict:
-    """email.smtp_host が設定されていればto_addressesへSMTP送信し、無ければ
-    プレビューHTMLをcache/ に保存する（送信方式未確定の間の暫定動作）。
+    """email.method が "graph" ならMicrosoft Graph、それ以外は email.smtp_host が設定されていれば
+    to_addressesへSMTP送信し、どちらも無ければプレビューHTMLをcache/ に保存する。
     宛先はDB（email_recipients）から呼び出し側が解決して渡す
     （list_recipients / competitor_alert.list_recipients参照）"""
     email_cfg = config.get("email", {})
     smtp_host = email_cfg.get("smtp_host", "")
+
+    if email_cfg.get("enabled") and email_cfg.get("method") == "graph":
+        if not to_addresses:
+            return {"ok": False, "mode": "graph", "error": "配信先が0件です（email_recipients未登録）"}
+        return _send_via_graph(subject, html_body, config, to_addresses)
 
     if not email_cfg.get("enabled") or not smtp_host:
         CACHE_DIR.mkdir(exist_ok=True)

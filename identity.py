@@ -20,6 +20,7 @@ resolve_principal() で得たAuthenticatedPrincipal.user_idを、既存のreview
 書き込む値としてそのまま使う（DBスキーマは変更しない。reviewer_id列自体は残し、
 その「値の出どころ」だけを自由記述からprincipal.user_idへ切り替える）。
 """
+import contextvars
 import os
 from dataclasses import dataclass, field
 
@@ -36,6 +37,34 @@ ROLE_REVIEWER = "reviewer"
 # authentication_sourceに使う既知の値（監査可能性のため、常にこのどちらかを使う。
 # 本物のEntra ID接続は本フェーズでは未実装）
 AUTH_SOURCE_DEV_FAKE = "dev_fake"
+AUTH_SOURCE_ENTRA = "entra_id"      # SSO(Entra ID)。entra_auth.validate_access_token が付与する
+
+# ─── リクエストのBearerトークン（SSO。2026-10-23追加）─────────────────────────────
+# api_serverのミドルウェアが、リクエストごとに Authorization ヘッダーのトークンをここへ入れ、
+# _review_principal() が resolve_principal(bearer_token=...) へ渡す。承認系の各エンドポイントの
+# 引数を変えずに済むようにするための橋渡し（コンテキスト変数なので、リクエスト間では混ざらない）
+_request_bearer_token = contextvars.ContextVar("sustainability_request_bearer_token", default=None)
+
+
+def bearer_token_from_header(authorization) -> str:
+    """'Authorization: Bearer xxx' からトークンを取り出す（形式が違う・無ければ None）"""
+    parts = (authorization or "").split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
+        return parts[1].strip()
+    return None
+
+
+def set_request_bearer_token(token):
+    """このリクエストのトークンを設定する。戻り値は、reset_request_bearer_token へ渡す"""
+    return _request_bearer_token.set(token)
+
+
+def reset_request_bearer_token(reset_token) -> None:
+    _request_bearer_token.reset(reset_token)
+
+
+def current_bearer_token():
+    return _request_bearer_token.get()
 
 
 def is_dev_auth_mode_enabled() -> bool:
@@ -111,7 +140,7 @@ def dev_principal_from_env() -> AuthenticatedPrincipal:
     return make_dev_principal(user_id=user_id, display_name=display_name)
 
 
-def resolve_principal(dev_principal: AuthenticatedPrincipal = None) -> AuthenticatedPrincipal:
+def resolve_principal(dev_principal: AuthenticatedPrincipal = None, bearer_token: str = None) -> AuthenticatedPrincipal:
     """承認/却下操作の唯一の入口。呼び出し元は必ずこの関数を通してprincipalを
     取得すること（Streamlitのレビュー担当者ID自由入力や、APIリクエストボディの
     reviewer_idを直接使ってはならない）。
@@ -119,9 +148,11 @@ def resolve_principal(dev_principal: AuthenticatedPrincipal = None) -> Authentic
     - DEV AUTHモードが明示的に有効な場合のみ、渡されたdev_principalを検証のうえ
       そのまま返す（dev_principalがNone、またはauthentication_source!="dev_fake"
       なら拒否する）。
-    - それ以外（本番相当。DEV AUTHモードが無効）の場合は、Entra ID接続が本フェーズ
-      では未実装のため、認証済みprincipalを得る手段が存在せず、常に
-      AuthenticationErrorでfail-closedする。「解決に失敗したらFakePrincipalへ
+    - DEV AUTHモードが無効で、Entra ID(SSO)が設定済み(entra_auth.entra_config_from_env)の
+      場合は、bearer_token(Authorization: Bearer)を検証して、本人を解決する。トークンが無い・
+      不正・期限切れなら、AuthenticationErrorでfail-closedする（2026-10-23追加）。
+    - それ以外（DEV AUTHもSSOも未設定）の場合は、認証済みprincipalを得る手段が存在せず、
+      常にAuthenticationErrorでfail-closedする。「解決に失敗したらFakePrincipalへ
       自動フォールバックする」という挙動は絶対に行わない。
     """
     if is_dev_auth_mode_enabled():
@@ -135,12 +166,20 @@ def resolve_principal(dev_principal: AuthenticatedPrincipal = None) -> Authentic
                 f'principalのみ使用できます（渡された値: {dev_principal.authentication_source!r}）')
         return dev_principal
 
-    # 本番相当: Entra ID未接続のため認証コンテキストが存在しない → 必ずfail-closed。
+    # 本番相当: Entra ID(SSO)が設定済みなら、Bearerトークンを検証する。
+    # （entra_authは、循環importを避けるため、使う時に読み込む）
+    from entra_auth import entra_config_from_env, validate_access_token
+    entra_config = entra_config_from_env()
+    if entra_config is not None:
+        return validate_access_token(bearer_token, entra_config)
+
+    # DEV AUTHもSSOも未設定 → 認証コンテキストが存在しないので、必ずfail-closed。
     # dev_principalが渡されていても、DEV AUTHモードが無効な限り絶対に使わない
     # （本番がDEVモードへフォールバックすることを防ぐ）。
     raise AuthenticationError(
-        "認証済みprincipalを解決できません（本番モードかつEntra ID未接続のため"
-        f"fail-closedしました。開発時のみ、環境変数 {DEV_AUTH_MODE_ENV}=true と "
+        "認証済みprincipalを解決できません（Entra ID(SSO)が未設定のため"
+        f"fail-closedしました。SSOは、環境変数 SUSTAINABILITY_ENTRA_TENANT_ID / SUSTAINABILITY_ENTRA_CLIENT_ID "
+        f"で有効化します。開発時のみ、環境変数 {DEV_AUTH_MODE_ENV}=true と "
         f"{DEV_USER_ID_ENV}=<開発者ID> を明示的に設定してDEV AUTHモードを有効化して"
         "ください）")
 

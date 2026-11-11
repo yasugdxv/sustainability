@@ -85,6 +85,10 @@
   },
   "email": {
     "enabled": false,
+    "method": "graph（Microsoft Graph経由で送信する場合。SMTP方式なら省略）",
+    "tenant_id": "（graph方式のみ: Entra IDのTenant ID）",
+    "client_id": "（graph方式のみ: Application (client) ID）",
+    "client_secret": "（graph方式のみ: Secret value。絶対に外部出力・コミットしないこと）",
     "smtp_host": "（例: 社内SMTPリレーのホスト名、またはsmtp.office365.com）",
     "smtp_port": 587,
     "use_starttls": true,

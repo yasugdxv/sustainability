@@ -88,6 +88,14 @@ def build_config_from_env() -> dict:
         config.setdefault("geo_intelligence", {})["chat"] = {
             "enabled": os.environ.get("SUSTAINABILITY_CHAT_GEO_ENABLED", "").strip().lower() in ("1", "true", "yes"),
         }
+    if os.environ.get("EMAIL_METHOD"):
+        # メール送信（Microsoft Graph）。Secret(MS_CLIENT_SECRET等)はここに載せず、
+        # weekly_email_report側が環境変数から直接読む
+        config["email"] = {
+            "enabled": os.environ.get("EMAIL_ENABLED", "").strip().lower() in ("1", "true", "yes"),
+            "method": os.environ.get("EMAIL_METHOD", ""),
+            "from_address": os.environ.get("EMAIL_FROM_ADDRESS", ""),
+        }
     return config
 
 
