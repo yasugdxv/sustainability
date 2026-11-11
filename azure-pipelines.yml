@@ -22,6 +22,17 @@ parameters:
     displayName: 画面（静的ビルド）もバックに含める（1サーバー構成）
     type: boolean
     default: true
+  # SSO（Entra ID）ログイン。画面のビルドに埋め込む値で、秘密ではない（クライアントシークレットは、ここに書かない）。
+  # どちらかが空なら、画面のSSOは無効（トークンを付けずにAPIを呼ぶ）。APIの検証側は、Web Appの環境変数
+  # SUSTAINABILITY_ENTRA_TENANT_ID / SUSTAINABILITY_ENTRA_CLIENT_ID で有効にする（両方そろえること）。
+  - name: entraTenantId
+    displayName: SSO テナントID（空ならSSO無効）
+    type: string
+    default: ''
+  - name: entraClientId
+    displayName: SSO アプリ(クライアント)ID（空ならSSO無効）
+    type: string
+    default: ''
   - name: runTests
     displayName: デプロイ前にテストを実行する（Linux上での初回実行は未検証。通ることを確認できたらオンにする）
     type: boolean
@@ -60,6 +71,8 @@ stages:
                 workingDirectory: eco-digest-spark
                 env:
                   WMD_STATIC_BUILD: '1'
+                  VITE_ENTRA_TENANT_ID: ${{ parameters.entraTenantId }}
+                  VITE_ENTRA_CLIENT_ID: ${{ parameters.entraClientId }}
 
           - task: UsePythonVersion@0
             displayName: Python を用意する

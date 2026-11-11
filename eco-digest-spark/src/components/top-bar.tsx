@@ -3,10 +3,7 @@ import { Bell, ClipboardCheck, Settings } from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useLanguage } from "@/lib/i18n";
 import { useCompetitorUnreadCount, type Lang } from "@/lib/api";
-
-// 週次メール承認画面(sustainability_expert_dashboard.py、Streamlit)へのリンク。
-// 別アプリ(別ポート)のため通常の<a>タグで新規タブに開く
-const WEEKLY_REVIEW_URL = "http://localhost:8501";
+import { AuthStatus } from "@/components/auth-status";
 
 function LanguageSwitcher() {
   const { lang, setLang, t } = useLanguage();
@@ -54,16 +51,17 @@ export function TopBar({
         ))}
       </div>
 
-      <a
-        href={WEEKLY_REVIEW_URL}
-        target="_blank"
-        rel="noreferrer"
+      {/* 週次メールの承認画面（旧Streamlit版は廃止。Reactの画面へ移行済み） */}
+      <Link
+        to="/review/weekly"
         title={t("nav.weeklyApproval")}
         className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full border border-border text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
       >
         <ClipboardCheck className="h-3.5 w-3.5" />
         <span className="hidden sm:inline">{t("nav.weeklyApproval")}</span>
-      </a>
+      </Link>
+
+      <AuthStatus />
 
       <LanguageSwitcher />
 

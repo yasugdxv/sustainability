@@ -2,7 +2,8 @@ import { useEffect, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 // 週次メールレビュー（旧Streamlitレビュー画面の移行先）用のAPIフック
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8010";
+import { API_BASE } from "@/lib/apiBase";
+import { authFetch } from "@/lib/auth";
 
 export type ReviewStatus = "review_required" | "approved" | "rejected" | "sent";
 
@@ -41,7 +42,7 @@ export const REVIEW_STATUS_LABELS: Record<ReviewStatus, string> = {
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, init);
+  const res = await authFetch(`${API_BASE}${path}`, init); // SSOが有効なら、アクセストークンを付ける
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.detail || `API error ${res.status}`);

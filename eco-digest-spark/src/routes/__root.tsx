@@ -8,6 +8,7 @@ import {
   Scripts,
 } from "@tanstack/react-router";
 import { useEffect, type ReactNode } from "react";
+import { getAccount } from "@/lib/auth";
 
 import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
@@ -130,6 +131,11 @@ function RootShell({ children }: { children: ReactNode }) {
 
 function RootComponent() {
   const { queryClient } = Route.useRouteContext();
+
+  // SSOでログインから戻ってきた場合の結果を、どの画面でも、最初に取り込む（SSO無効なら何もしない）
+  useEffect(() => {
+    void getAccount().catch(() => undefined);
+  }, []);
 
   return (
     <QueryClientProvider client={queryClient}>

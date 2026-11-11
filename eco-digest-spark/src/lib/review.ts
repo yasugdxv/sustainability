@@ -1,7 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 // 競合の日次ダイジェスト／月次レポートのレビュー（旧Streamlitレビュー画面の移行先）
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8010";
+import { API_BASE } from "@/lib/apiBase";
+import { authFetch } from "@/lib/auth";
 
 export type ReviewKind = "daily" | "monthly";
 export type ReviewFilter = "pending" | "approved" | "rejected" | "sent";
@@ -28,7 +29,7 @@ export interface ReviewItem {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, init);
+  const res = await authFetch(`${API_BASE}${path}`, init); // SSOが有効なら、アクセストークンを付ける
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.detail || `API error ${res.status}`);
