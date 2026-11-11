@@ -41,7 +41,8 @@ function ArticleDetail() {
   const [saved, setSaved] = useState(false);
   const { liked, read, toggleLike, toggleRead } = useArticleLikeRead(article.id);
 
-  const { data: relatedResult } = useArticles({ themes: [article.category], lang });
+  // 関連記事は3件だけ使うので、自分自身を除く分を含めて4件だけ取る（カテゴリの全件は取らない）
+  const { data: relatedResult } = useArticles({ themes: [article.category], lang, sort: "latest", limit: 4 });
   const related = (relatedResult?.articles ?? []).filter((a) => a.id !== article.id).slice(0, 3);
 
   return (

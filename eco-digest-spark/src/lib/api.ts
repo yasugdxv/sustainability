@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 // APIの接続先。開発(npm run dev)は従来どおり 8010、本番ビルドは "" （同じサイトから配信される）。
 // ビルド時に VITE_API_BASE を指定すれば上書きできる（別ホストのAPIへ向けたいとき）。
@@ -182,6 +182,17 @@ export function useImportanceRubric() {
   return useQuery(importanceRubricQueryOptions);
 }
 
+export type ArticleSort = "importance" | "latest" | "likes" | "reads" | "trending";
+
+// 絞り込み後の「全件」に対する集計（ページに依存しない。サイドバー・カテゴリ画面の件数表示用）
+export interface ArticleStats {
+  count: number;
+  importantCount: number;
+  trendingCount: number;
+  regulatoryCount: number;
+  avgImportance: number;
+}
+
 export interface ArticlesResult {
   total: number;
   filteredTotal: number;
@@ -189,36 +200,94 @@ export interface ArticlesResult {
   matchedThemes: string[];
   articles: Article[];
   crossDomainIntelligence: CrossDomainIntelligenceItem[];
+  // ページ分割（limit指定）のときだけ付く
+  hasMore?: boolean;
+  nextCursor?: string | null;
+  stats?: ArticleStats;
 }
 
-export function articlesQueryOptions(
-  params: { themes?: string[]; q?: string; lang?: Lang; sinceDays?: number } = {},
-) {
+export interface ArticlesParams {
+  themes?: string[];
+  q?: string;
+  lang?: Lang;
+  sinceDays?: number;
+  sort?: ArticleSort; // 並べ替え（サーバー側で行う）
+  minImportance?: number; // 重要度の下限（サーバー側で絞る）
+  limit?: number; // 1回に取る件数。指定しないと従来どおり全件
+}
+
+// 1ページ分を取得する。cursor は「続き」の位置（最初のページは省略）
+async function fetchArticlesPage(params: ArticlesParams, cursor?: string): Promise<ArticlesResult> {
+  const usp = new URLSearchParams();
   const themes = (params.themes ?? []).join(",");
-  const q = params.q ?? "";
-  const lang = params.lang ?? "ja";
-  const sinceDays = params.sinceDays;
+  if (themes) usp.set("themes", themes);
+  if (params.q) usp.set("q", params.q);
+  usp.set("lang", params.lang ?? "ja");
+  if (params.sinceDays) usp.set("since_days", String(params.sinceDays));
+  if (params.limit) usp.set("limit", String(params.limit));
+  if (params.sort) usp.set("sort", params.sort);
+  if (params.minImportance) usp.set("min_importance", String(params.minImportance));
+  if (cursor) usp.set("cursor", cursor);
+  const data = await fetchJson<Omit<ArticlesResult, "articles"> & { articles: Omit<Article, "cover">[] }>(
+    `/api/articles?${usp.toString()}`,
+  );
+  return { ...data, articles: data.articles.map(withCover) };
+}
+
+function articlesKey(params: ArticlesParams) {
+  return [
+    "articles", (params.themes ?? []).join(","), params.q ?? "", params.lang ?? "ja",
+    params.sinceDays, params.sort, params.minImportance, params.limit,
+  ] as const;
+}
+
+export function articlesQueryOptions(params: ArticlesParams = {}) {
   return {
-    queryKey: ["articles", themes, q, lang, sinceDays] as const,
-    queryFn: async (): Promise<ArticlesResult> => {
-      const usp = new URLSearchParams();
-      if (themes) usp.set("themes", themes);
-      if (q) usp.set("q", q);
-      usp.set("lang", lang);
-      if (sinceDays) usp.set("since_days", String(sinceDays));
-      const data = await fetchJson<Omit<ArticlesResult, "articles"> & { articles: Omit<Article, "cover">[] }>(
-        `/api/articles?${usp.toString()}`,
-      );
-      return { ...data, articles: data.articles.map(withCover) };
-    },
+    queryKey: articlesKey(params),
+    queryFn: (): Promise<ArticlesResult> => fetchArticlesPage(params),
     staleTime: 60_000,
   };
 }
 
-export function useArticles(
-  params: { themes?: string[]; q?: string; lang?: Lang; sinceDays?: number } = {},
-) {
+export function useArticles(params: ArticlesParams = {}) {
   return useQuery(articlesQueryOptions(params));
+}
+
+// 無限スクロール用。画面の下に近づいたら fetchNextPage() で続きを取る。
+// limit は1回の件数（未指定は30件）。items は全ページを連結した記事一覧、先頭ページの集計は stats。
+export function useArticlesInfinite(params: ArticlesParams = {}) {
+  const limit = params.limit ?? 30;
+  const query = useInfiniteQuery({
+    queryKey: ["articles-infinite", ...articlesKey({ ...params, limit })] as const,
+    queryFn: ({ pageParam }) => fetchArticlesPage({ ...params, limit }, pageParam || undefined),
+    initialPageParam: "" as string,
+    getNextPageParam: (last) => (last.hasMore && last.nextCursor ? last.nextCursor : undefined),
+    staleTime: 60_000,
+  });
+  const pages = query.data?.pages ?? [];
+  return {
+    ...query,
+    items: pages.flatMap((p) => p.articles),
+    first: pages[0], // 総件数・集計・検索結果の付随情報は先頭ページから読む
+  };
+}
+
+// 条件に合う記事を、最後のページまで全部取る（CSV出力用。画面に読み込んだ分ではなく全件を出すため）
+export async function fetchAllArticles(params: ArticlesParams = {}): Promise<Article[]> {
+  const all: Article[] = [];
+  let cursor: string | undefined;
+  for (let i = 0; i < 200; i++) {
+    const page = await fetchArticlesPage({ ...params, limit: 100 }, cursor);
+    all.push(...page.articles);
+    if (!page.hasMore || !page.nextCursor) break;
+    cursor = page.nextCursor;
+  }
+  return all;
+}
+
+// サイドバーなど、集計(件数)だけが欲しい画面用。記事は1件だけ取って、statsを使う
+export function useArticleStats() {
+  return useArticles({ limit: 1 });
 }
 
 export function articleQueryOptions(id: string, lang: Lang = "ja") {

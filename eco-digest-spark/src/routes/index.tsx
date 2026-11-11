@@ -11,12 +11,11 @@ export const Route = createFileRoute("/")({
 
 function Dashboard() {
   const { lang, t } = useLanguage();
-  const { data: result, isLoading } = useArticles({ lang });
+  // カルーセルに使う重要度の上位20件だけをサーバーに並べ替えてもらう（全件は取らない）
+  const { data: result, isLoading } = useArticles({ lang, sort: "importance", limit: 20 });
   const { data: categories = [] } = useCategories();
-  const articles = result?.articles ?? [];
-
-  const top = [...articles].sort((a, b) => b.importance - a.importance);
-  const carousel = top.slice(0, 20);
+  const carousel = result?.articles ?? [];
+  const totalCount = result?.filteredTotal ?? 0; // 直近の記事の全件数
 
   const today = new Date().toLocaleDateString(lang === "en" ? "en-US" : "ja-JP", {
     weekday: "long", year: "numeric", month: "long", day: "numeric",
@@ -47,11 +46,11 @@ function Dashboard() {
             {t("home.title")}
           </h1>
           <p className="text-sm text-muted-foreground mt-2 max-w-2xl">
-            {t("home.subtitle", { count: articles.length })}
+            {t("home.subtitle", { count: totalCount })}
           </p>
         </section>
 
-        {articles.length === 0 && (
+        {totalCount === 0 && (
           <p className="text-muted-foreground">{t("home.empty")}</p>
         )}
 

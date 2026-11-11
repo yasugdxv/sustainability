@@ -27,6 +27,7 @@ from ai_client import make_openai_client  # noqa: E402
 import sustainability_expert_common as common  # noqa: E402
 from sustainability_knowledge_store import get_knowledge_store  # noqa: E402
 import sustainability_dashboard_core as core  # noqa: E402
+import articles_paging  # noqa: E402
 import sustainability_chat_geo_service  # noqa: E402
 import cross_domain_intelligence_service  # noqa: E402
 import strategic_question_responses as sqr  # noqa: E402
@@ -315,11 +316,32 @@ def get_importance_rubric():
 _articles_response_cache: dict = {}
 
 
+# 検索語ごとの意図抽出(LLM)の結果。無限スクロールで2ページ目以降も同じ検索語で呼ばれるため、
+# ページごとにLLMを呼び直さないよう使い回す（件数が増えすぎないよう上限つき）。
+_search_intent_cache: dict = {}
+
+
+def _search_intent(q: str) -> dict:
+    cached = _search_intent_cache.get(q)
+    if cached is not None:
+        return cached
+    intent = core.extract_search_intent(_azure_client, _model, q, core.theme_options(_config))
+    if len(_search_intent_cache) >= 200:
+        _search_intent_cache.clear()
+    _search_intent_cache[q] = intent
+    return intent
+
+
 @app.get("/api/articles")
-def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: str = "", lang: str = "ja"):
+def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: str = "", lang: str = "ja",
+                  limit: int = 0, cursor: str = "", sort: str = "latest", min_importance: int = 0):
+    """記事一覧。limit を付けると無限スクロール用のページ分割（articles_paging.py）になり、
+    sort(importance/latest/likes/reads/trending)・min_importance・cursor で絞り・並べ替え・続きを指定する。
+    limit を付けない呼び出しは従来どおり全件を返す（フロントとバックを別々にデプロイしても壊れない）。"""
+    paged = limit > 0
     cache_key = (since_days, themes, lang)
     shared_key = f"articles_response:{since_days}:{themes}:{lang}"
-    if not q.strip():
+    if not q.strip() and not paged:
         now = time.time()
         cached = _articles_response_cache.get(cache_key)
         if cached is not None and now - cached["fetched_at"] <= ARTICLES_CACHE_TTL:
@@ -337,23 +359,47 @@ def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: 
     cross_domain_intelligence = []
     if q.strip():
         if _azure_client:
-            intent = core.extract_search_intent(_azure_client, _model, q, core.theme_options(_config))
+            intent = _search_intent(q)
             keywords, nl_themes = intent.get("keywords", []), intent.get("themes", [])
         else:
             keywords = core.tokenize(q)
         filtered = core.apply_nl_search(filtered, keywords, nl_themes)
 
         try:
+            # 2ページ目以降(cursorあり)は他部門の既存知見を取り直さない（1ページ目だけに付ける）。
             # Phase B: Searchは人間が既存Cross-domain Intelligenceを直接見て判断するため、
             # 十分性判定LLMは呼ばずGatewayの候補をそのまま返す（capability="search"の
             # Kill SwitchはGateway自身が確認する。Failure Isolation: 失敗しても記事検索
             # 本体には一切影響しない）。
-            sources = cross_domain_intelligence_service.retrieve_existing_intelligence(
-                _competitor_client, _config, domains=["geopolitics"], keywords=keywords,
-                themes=nl_themes, limit=10, capability="search")
-            cross_domain_intelligence = [core._to_cross_domain_item(s) for s in sources]
+            if not cursor:
+                sources = cross_domain_intelligence_service.retrieve_existing_intelligence(
+                    _competitor_client, _config, domains=["geopolitics"], keywords=keywords,
+                    themes=nl_themes, limit=10, capability="search")
+                cross_domain_intelligence = [core._to_cross_domain_item(s) for s in sources]
         except Exception:
             cross_domain_intelligence = []
+
+    if paged:
+        # 重要度の絞り込み → 集計(絞り込み後の全件分) → 並べ替え+続きの切り出し → 返す分だけ変換・翻訳
+        importance_fn = lambda level: IMPORTANCE_SCORE.get(level, 50)  # noqa: E731
+        stats = articles_paging.build_stats(filtered, importance_fn)
+        if min_importance > 0:
+            filtered = [a for a in filtered if importance_fn(a.get("importance_level")) >= min_importance]
+        # いいね・読んだ件数はサーバー内にキャッシュ済み（_all_engagement）。並べ替えキーに使うので全件分を引く
+        engagement = core.fetch_engagement_map(_config, [a["article_id"] for a in filtered])
+        page = articles_paging.paginate(filtered, sort, limit, cursor, importance_fn, engagement)
+        _warm_translation_cache(page["items"], lang)  # 翻訳も返す分だけ
+        return {
+            "total": len(articles),
+            "filteredTotal": len(filtered),
+            "keywords": keywords,
+            "matchedThemes": nl_themes,
+            "articles": [_to_ui_article(a, engagement, lang, blocking=False) for a in page["items"]],
+            "crossDomainIntelligence": cross_domain_intelligence,
+            "hasMore": page["hasMore"],
+            "nextCursor": page["nextCursor"],
+            "stats": stats,
+        }
 
     _warm_translation_cache(filtered, lang)
     engagement = core.fetch_engagement_map(_config, [a["article_id"] for a in filtered])

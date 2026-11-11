@@ -10,7 +10,7 @@ import {
   ChevronRight,
   ChevronDown,
 } from "lucide-react";
-import { categoryLabel, useArticles, useCategories } from "@/lib/api";
+import { categoryLabel, useArticleStats, useCategories } from "@/lib/api";
 import { useLanguage } from "@/lib/i18n";
 import {
   Sidebar,
@@ -69,12 +69,10 @@ export function AppSidebar() {
     }
   }, [manuallyExpanded]);
   // 件数計算にのみ使うため、表示言語に関わらず常に日本語タグ名で取得する
-  const { data: articlesResult } = useArticles();
-  const articles = articlesResult?.articles ?? [];
-  const importantCount = articles.filter((a) => a.importanceLevel === "S" || a.importanceLevel === "A").length;
-  const regulatoryCount = articles.filter((a) =>
-    a.tags.some((t) => ["情報開示", "地政学・マクロ規制環境", "エンフォースメント・訴訟"].includes(t)),
-  ).length;
+  // 全件を取らず、サーバーが数えた件数(stats)だけを使う
+  const { data: articlesResult } = useArticleStats();
+  const importantCount = articlesResult?.stats?.importantCount ?? 0;
+  const regulatoryCount = articlesResult?.stats?.regulatoryCount ?? 0;
 
   return (
     <Sidebar collapsible="icon">

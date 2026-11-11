@@ -3,7 +3,8 @@ import { useMemo, useState } from "react";
 import { ChevronDown, ChevronUp, Download, Search as SearchIcon, SlidersHorizontal } from "lucide-react";
 import { TopBar } from "@/components/top-bar";
 import { ArticleCard } from "@/components/article-card";
-import { categoryLabel, categoryMeta, useArticles, useCategories, useSubcategories } from "@/lib/api";
+import { categoryLabel, categoryMeta, fetchAllArticles, useArticlesInfinite, useCategories, useSubcategories } from "@/lib/api";
+import { LoadMoreSentinel } from "@/components/load-more-sentinel";
 import { searchSuggestions, useLanguage } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 import { downloadCsv } from "@/lib/csv";
@@ -32,8 +33,11 @@ function SearchPage() {
 
   const { data: categories = [] } = useCategories();
   const { data: subcategories = [] } = useSubcategories();
-  const { data: result, isFetching } = useArticles({ themes: selectedCats, q: submittedQ, lang, sinceDays });
-  const articles = result?.articles ?? [];
+  // 並べ替え・重要度の絞り込みはサーバー側で行い、続きはスクロールで読み込む（無限スクロール）
+  const {
+    items: filtered, first: result, isFetching, isFetchingNextPage, hasNextPage, fetchNextPage,
+  } = useArticlesInfinite({ themes: selectedCats, q: submittedQ, lang, sinceDays, sort, minImportance });
+  const totalCount = result?.filteredTotal ?? 0; // 条件に合う全件数（読み込み済みの件数ではない）
 
   const subtagsByParent = useMemo(() => {
     const groups = new Map<string, typeof subcategories>();
@@ -50,16 +54,6 @@ function SearchPage() {
     ? subtagParents
     : subtagParents.slice(0, SUBTAGS_COLLAPSED_GROUPS);
 
-  const filtered = articles
-    .filter((a) => a.importance >= minImportance)
-    .sort((a, b) => {
-      if (sort === "importance") return b.importance - a.importance;
-      if (sort === "trending") return Number(b.trending) - Number(a.trending);
-      if (sort === "likes") return b.likesCount - a.likesCount;
-      if (sort === "reads") return b.readsCount - a.readsCount;
-      return +new Date(b.publishedAt) - +new Date(a.publishedAt);
-    });
-
   const toggleCat = (id: string) =>
     setSelectedCats((prev) =>
       prev.includes(id) ? prev.filter((c) => c !== id) : [...prev, id],
@@ -70,14 +64,25 @@ function SearchPage() {
     setSubmittedQ(q);
   };
 
-  const exportCsv = () => {
+  const [exporting, setExporting] = useState(false);
+  // CSVは、画面に読み込んだ分ではなく、条件に合う全件を出す（最後のページまで取ってから出力）
+  const exportCsv = async () => {
+    setExporting(true);
+    let all: typeof filtered;
+    try {
+      all = await fetchAllArticles({ themes: selectedCats, q: submittedQ, lang, sinceDays, sort, minImportance });
+    } catch {
+      setExporting(false);
+      return;
+    }
+    setExporting(false);
     downloadCsv(
       `articles_${new Date().toISOString().slice(0, 10)}.csv`,
       [
         t("csv.col.title"), t("csv.col.category"), t("csv.col.source"), t("csv.col.sector"),
         t("csv.col.publishedAt"), t("csv.col.importance"), t("csv.col.tags"), t("csv.col.url"),
       ],
-      filtered.map((a) => [
+      all.map((a) => [
         a.title,
         categoryLabel(categoryMeta(categories, a.category), lang),
         a.source,
@@ -251,8 +256,8 @@ function SearchPage() {
                 </div>
                 <h2 className="text-editorial text-2xl mt-0.5">
                   {submittedQ
-                    ? t("search.resultsWithQuery", { query: submittedQ, count: filtered.length })
-                    : t("search.resultsCount", { count: filtered.length })}
+                    ? t("search.resultsWithQuery", { query: submittedQ, count: totalCount })
+                    : t("search.resultsCount", { count: totalCount })}
                 </h2>
               </div>
               <div className="flex items-center gap-3">
@@ -276,7 +281,7 @@ function SearchPage() {
                   size="sm"
                   className="rounded-full gap-1.5"
                   onClick={exportCsv}
-                  disabled={filtered.length === 0}
+                  disabled={filtered.length === 0 || exporting}
                 >
                   <Download className="h-3.5 w-3.5" />
                   {t("csv.download")}
@@ -284,7 +289,7 @@ function SearchPage() {
               </div>
             </div>
 
-            {isFetching && (
+            {isFetching && !isFetchingNextPage && (
               <p className="text-sm text-muted-foreground mb-4">{t("search.loading")}</p>
             )}
 
@@ -351,6 +356,11 @@ function SearchPage() {
                 <p className="p-6 text-sm text-muted-foreground">{t("search.empty")}</p>
               )}
             </div>
+            <LoadMoreSentinel
+              hasMore={!!hasNextPage}
+              loading={isFetchingNextPage}
+              onVisible={() => void fetchNextPage()}
+            />
           </div>
         </div>
       </main>

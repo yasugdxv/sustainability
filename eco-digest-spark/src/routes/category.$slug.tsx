@@ -1,7 +1,8 @@
 import { createFileRoute, notFound } from "@tanstack/react-router";
 import { TopBar } from "@/components/top-bar";
 import { ArticleCard } from "@/components/article-card";
-import { categoriesQueryOptions, categoryLabel, useArticles } from "@/lib/api";
+import { categoriesQueryOptions, categoryLabel, useArticlesInfinite } from "@/lib/api";
+import { LoadMoreSentinel } from "@/components/load-more-sentinel";
 import { categoryDescription, useLanguage } from "@/lib/i18n";
 import { useState } from "react";
 
@@ -22,19 +23,16 @@ function CategoryPage() {
   const { cat } = Route.useLoaderData();
   const { lang, t } = useLanguage();
   const [sort, setSort] = useState<"importance" | "latest" | "likes" | "reads">("importance");
-  const { data: result } = useArticles({ themes: [cat.id], lang });
-  const articles = [...(result?.articles ?? [])].sort((a, b) => {
-    if (sort === "importance") return b.importance - a.importance;
-    if (sort === "likes") return b.likesCount - a.likesCount;
-    if (sort === "reads") return b.readsCount - a.readsCount;
-    return +new Date(b.publishedAt) - +new Date(a.publishedAt);
+  // 並べ替えはサーバー側で行い、続きはスクロールで読み込む（無限スクロール）
+  const { items: articles, first, isFetchingNextPage, hasNextPage, fetchNextPage } = useArticlesInfinite({
+    themes: [cat.id], lang, sort,
   });
   const featured = articles[0];
   const rest = articles.slice(1);
-  const trendingCount = articles.filter((a) => a.trending).length;
-  const avgImportance = Math.round(
-    articles.reduce((s, a) => s + a.importance, 0) / (articles.length || 1),
-  );
+  // 件数・話題・平均重要度は、読み込み済みの分ではなく、このカテゴリの全件に対する集計（サーバー計算）
+  const articleCount = first?.stats?.count ?? 0;
+  const trendingCount = first?.stats?.trendingCount ?? 0;
+  const avgImportance = first?.stats?.avgImportance ?? 0;
   const label = categoryLabel(cat, lang);
 
   return (
@@ -64,7 +62,7 @@ function CategoryPage() {
             <div className="flex items-center gap-6 mt-6 text-sm">
               <div>
                 <div className="text-[10px] uppercase tracking-wider text-white/60">{t("category.articleCount")}</div>
-                <div className="text-editorial text-2xl">{articles.length}</div>
+                <div className="text-editorial text-2xl">{articleCount}</div>
               </div>
               <div>
                 <div className="text-[10px] uppercase tracking-wider text-white/60">{t("category.trendingCount")}</div>
@@ -113,6 +111,11 @@ function CategoryPage() {
             <ArticleCard key={a.id} article={a} />
           ))}
         </div>
+        <LoadMoreSentinel
+          hasMore={!!hasNextPage}
+          loading={isFetchingNextPage}
+          onVisible={() => void fetchNextPage()}
+        />
       </main>
     </>
   );
