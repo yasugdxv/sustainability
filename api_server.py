@@ -1129,7 +1129,12 @@ def weekly_report_review(report_id: str, body: WeeklyReviewBody):
     payload = {"status": body.status, "reviewer_feedback": body.reviewerFeedback, "test_mode": body.testMode}
     if body.draftContent is not None:
         payload["draft_content"] = body.draftContent
-    result = expert_api.review_weekly_report(report_id, payload, _config, principal=principal)
+    try:
+        result = expert_api.review_weekly_report(report_id, payload, _config, principal=principal)
+    except Exception as e:  # 想定外の例外は、原因が画面とログに出るようにする（500の中身が分からないため）
+        import logging
+        logging.getLogger(__name__).exception("週次レビューの処理で例外が発生しました")
+        raise HTTPException(status_code=500, detail=f"サーバー内エラー: {type(e).__name__}: {str(e)[:300]}")
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=str(result.get("error") or "処理に失敗しました"))
     return result
