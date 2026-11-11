@@ -1,7 +1,10 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8010";
+// APIの接続先。開発(npm run dev)は従来どおり 8010、本番ビルドは "" （同じサイトから配信される）。
+// ビルド時に VITE_API_BASE を指定すれば上書きできる（別ホストのAPIへ向けたいとき）。
+const fromEnv = import.meta.env.VITE_API_BASE as string | undefined;
+const API_BASE: string = fromEnv ? fromEnv.replace(/\/$/, "") : import.meta.env.PROD ? "" : "http://127.0.0.1:8010";
 
 export type Lang = "ja" | "en";
 

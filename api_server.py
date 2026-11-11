@@ -996,6 +996,12 @@ def competitor_unread_count():
     return {"count": len(digests) + len(reports)}
 
 
+# 画面（eco-digest-spark の静的ビルド）を同じサイトから配信する。必ず全ルート登録の後に呼ぶ。
+# 配信元（_shell.html）が無ければ何もしない（API専用・ローカル開発は従来どおり）。
+import frontend_static  # noqa: E402
+frontend_static.mount_frontend(app)
+
+
 if __name__ == "__main__":
     import os
     import uvicorn
