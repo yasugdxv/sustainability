@@ -32,6 +32,7 @@ SECRET_PATTERN = re.compile(
     r"(?i)(api[_-]?key|secret|password|token|sas)[\"' ]*[:=][\"' ]*[A-Za-z0-9+/_\-]{24,}"
     r"|sk-[A-Za-z0-9]{20,}|eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{20,}|AccountKey=|-----BEGIN [A-Z ]*PRIVATE KEY"
 )
+SELF_PATH = "deploy/azure_devops/publish_snapshot.py"
 SKIP_SCAN_SUFFIXES = (".png", ".jpg", ".jpeg", ".ico", ".gif", ".gz", ".zip", ".lock")
 
 
@@ -63,7 +64,8 @@ def scan_tree(tree: str) -> list[str]:
             problems.append(f"秘密情報のファイル: {path}")
         if size > MAX_BYTES:
             problems.append(f"50MB超: {path}")
-        if path.startswith("tests/") or path.lower().endswith(SKIP_SCAN_SUFFIXES):
+        # このスクリプト自身は、検索用の文字列(AccountKey= 等)を含むため点検しない
+        if path.startswith("tests/") or path.lower().endswith(SKIP_SCAN_SUFFIXES) or path == SELF_PATH:
             continue
         text = subprocess.run(["git", "show", f"{tree}:{path}"], cwd=ROOT, capture_output=True).stdout.decode("utf-8", "ignore")
         if SECRET_PATTERN.search(text):
