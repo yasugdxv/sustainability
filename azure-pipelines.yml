@@ -1,0 +1,124 @@
+# サステナ（world_monitor_dashboard）アプリを、Azure DevOps から Azure App Service（Linux / Python 3.11）へデプロイする。
+#  - 実行は手動のみ（Pipelines → Run pipeline）。main への push では動かない（trigger: none）
+#  - 1サーバー構成: 画面（静的ビルド）もバック（API）の成果物に含め、1つのWeb Appで配信する
+#  - Azure 側（Oryx）から PyPI へ届かないため、ビルド側で pip install を済ませ、仮想環境（antenv）ごとデプロイする
+#    （Web App 側に SCM_DO_BUILD_DURING_DEPLOYMENT は設定しない。起動コマンドは python docker_entrypoint.py）
+#  - 日次の定期ジョブ（App_Data/jobs/triggered の WebJob）も、同じ成果物に入って同じWeb Appで動く
+#
+# 初回に確認すること:
+#  - serviceConnection の既定値が、Project settings → Service connections の名前と一致しているか
+#  - backendAppName が、デプロイ先のWeb Appの名前か
+#  - 同じWeb AppへのGitHub Actions（.github/workflows）が、二重にデプロイしないよう、切り替え時に止めてあるか
+
+trigger: none
+pr: none
+
+parameters:
+  - name: serviceConnection
+    displayName: Azure サービス接続の名前（Project settings → Service connections の名前と完全に一致させる）
+    type: string
+    default: 'sus-intelligence'
+  - name: withFrontend
+    displayName: 画面（静的ビルド）もバックに含める（1サーバー構成）
+    type: boolean
+    default: true
+  - name: runTests
+    displayName: デプロイ前にテストを実行する（Linux上での初回実行は未検証。通ることを確認できたらオンにする）
+    type: boolean
+    default: false
+
+variables:
+  azureServiceConnection: ${{ parameters.serviceConnection }}
+  backendAppName: 'app-jp1-sjp-bn-susiq-002'
+  pythonVersion: '3.11'
+  nodeVersion: '24.x'
+  packageDir: '$(Build.SourcesDirectory)/build/azure_package'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: Build
+    displayName: ビルド
+    jobs:
+      - job: Build
+        displayName: パッケージを組み立てる
+        steps:
+          - checkout: self
+
+          # 画面（静的ビルド）。1サーバー構成のときだけ行う
+          - ${{ if eq(parameters.withFrontend, true) }}:
+              - task: NodeTool@0
+                displayName: Node.js を用意する
+                inputs:
+                  versionSpec: $(nodeVersion)
+
+              - script: |
+                  npm ci
+                  npm run build
+                displayName: 画面をビルドする（静的 / SPA）
+                workingDirectory: eco-digest-spark
+                env:
+                  WMD_STATIC_BUILD: '1'
+
+          - task: UsePythonVersion@0
+            displayName: Python を用意する
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          # テストが通らないものはデプロイしない（Linux上での初回実行は未検証のため、既定はオフ）
+          - ${{ if eq(parameters.runTests, true) }}:
+              - script: |
+                  pip install -r requirements_azure.txt pytest
+                  python -m pytest tests -q
+                displayName: テストを実行する
+
+          - ${{ if eq(parameters.withFrontend, true) }}:
+              - script: python deploy/azure_devops/build_package.py
+                displayName: デプロイ用パッケージを組み立てる（画面あり）
+          - ${{ else }}:
+              - script: python deploy/azure_devops/build_package.py --no-frontend
+                displayName: デプロイ用パッケージを組み立てる（画面なし）
+
+          - script: |
+              python -m venv antenv
+              source antenv/bin/activate
+              pip install -r requirements.txt
+            displayName: 仮想環境を作り、依存ライブラリを入れる
+            workingDirectory: $(packageDir)
+
+          - task: ArchiveFiles@2
+            displayName: デプロイ用 ZIP を作る
+            inputs:
+              rootFolderOrFile: $(packageDir)
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/sus-app.zip
+              replaceExistingArchive: true
+
+          - publish: $(Build.ArtifactStagingDirectory)/sus-app.zip
+            displayName: 成果物を保存する
+            artifact: python-app
+
+  - stage: Deploy
+    displayName: デプロイ
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - deployment: DeployApp
+        displayName: Azure Web App へデプロイする
+        environment: sus-production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: python-app
+
+                - task: AzureWebApp@1
+                  displayName: Azure Web App へデプロイする
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    appType: webAppLinux
+                    appName: $(backendAppName)
+                    package: $(Pipeline.Workspace)/python-app/sus-app.zip

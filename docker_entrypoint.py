@@ -1,11 +1,11 @@
 """コンテナ起動時に環境変数からconfig.jsonを組み立てて、Gunicorn管理下の
 Uvicornワーカー（複数プロセス）としてAPIサーバー(api_server.py)を起動する。
 
-このコンテナが提供するのはAPIバックエンドのみ（FastAPI/uvicorn）。
-フロントエンド(eco-digest-spark、TanStack Start)とPMOレビュー用のStreamlitアプリ
-(sustainability_expert_dashboard.py)は別プロセス/別デプロイとして扱う
-（DEPLOY_GUIDE.md参照。フロントエンドの本番ビルド配信は未検証のため、
-現状はこのコンテナと同一ホストで`npm run dev`を動かす運用を想定）。
+提供するのはAPIバックエンド（FastAPI/uvicorn）。画面(eco-digest-spark)は、静的ビルド
+(WMD_STATIC_BUILD=1)したものが ./frontend または eco-digest-spark/dist/client にあれば、
+api_server.py が frontend_static.py 経由で同じサイトから配信する（1サーバー構成。
+Azure DevOps のパイプライン azure-pipelines.yml が、画面のビルドと成果物の組み立てを行う）。
+PMOレビュー用のStreamlitアプリ(sustainability_expert_dashboard.py)は別プロセス/別デプロイ。
 
 2026-09-29: 単一プロセス(uvicorn.run)だと、記事一覧のような重いリクエストの処理中に
 他のリクエスト（軽いエンドポイントを含む）がCPU(GIL)待ちで詰まる事象を本番で確認した
