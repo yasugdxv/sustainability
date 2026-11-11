@@ -118,5 +118,42 @@ def test_no_principal_api_request_fails_closed():
     assert fake_send.calls == []
 
 
+# ─── テスト送信: test_mode=True なら、テスト受信者だけへ送り、本番の受信者には送らない ──
+def _client_with_prod_and_test_recipients(report_id):
+    return FakeSupabaseClient({
+        "weekly_email_reports": [_report_row(report_id=report_id)],
+        "email_recipients": [
+            {"email": "prod@example.invalid", "active": True, "is_test": False, "notify_weekly_digest": True},
+            {"email": "me-test@example.invalid", "active": True, "is_test": True, "notify_weekly_digest": True},
+        ],
+    })
+
+
+def _approve(report_id, body_extra):
+    client = _client_with_prod_and_test_recipients(report_id)
+    fake_send = _FakeSendEmail()
+    principal = identity.make_dev_principal(user_id="dev.sato", display_name="佐藤")
+    with patch.dict(os.environ, {identity.DEV_AUTH_MODE_ENV: "true", identity.DEV_USER_ID_ENV: "dev.sato"}), \
+         patch("sustainability_expert_api.SupabaseClient", return_value=client), \
+         patch("weekly_email_report.send_email", fake_send):
+        result = expert_api.review_weekly_report(report_id, {
+            "status": "approved", "reviewer_feedback": {"free_text": None}, **body_extra,
+        }, _fake_config(), principal=principal)
+    return result, fake_send
+
+
+def test_approve_with_test_mode_sends_only_to_test_recipients():
+    result, fake_send = _approve("R20", {"test_mode": True})
+    assert result.get("ok") is True
+    assert [c["to_addresses"] for c in fake_send.calls] == [["me-test@example.invalid"]]  # 本番の宛先には届かない
+
+
+def test_approve_without_test_mode_still_sends_to_production_recipients():
+    # 既定(test_mode省略)は従来どおり本番。互換を壊していないことの確認
+    result, fake_send = _approve("R21", {})
+    assert result.get("ok") is True
+    assert [c["to_addresses"] for c in fake_send.calls] == [["prod@example.invalid"]]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

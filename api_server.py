@@ -1054,6 +1054,7 @@ class WeeklyReviewBody(BaseModel):
     status: str  # approved | rejected | review_required
     reviewerFeedback: dict | None = None
     draftContent: dict | None = None
+    testMode: bool = False  # True: 承認時、テスト受信者(is_test)だけへ送る。省略時は本番の受信者
 
 
 def _review_principal():
@@ -1113,7 +1114,7 @@ def weekly_report_review(report_id: str, body: WeeklyReviewBody):
     principal, error = _review_principal()
     if principal is None:
         raise HTTPException(status_code=401, detail=f"認証済みレビュー担当者を解決できません（{error}）")
-    payload = {"status": body.status, "reviewer_feedback": body.reviewerFeedback}
+    payload = {"status": body.status, "reviewer_feedback": body.reviewerFeedback, "test_mode": body.testMode}
     if body.draftContent is not None:
         payload["draft_content"] = body.draftContent
     result = expert_api.review_weekly_report(report_id, payload, _config, principal=principal)

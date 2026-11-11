@@ -48,7 +48,8 @@ def review_weekly_report(report_id: str, body: dict, config: dict,
                           principal: identity.AuthenticatedPrincipal = None) -> dict:
     """POST /api/weekly-reports/{report_id}/review
     body: {"status": "approved"|"rejected"|"review_required", "reviewer_id":...,
-           "reviewer_feedback":..., "draft_content": {...編集後の内容、省略可}}
+           "reviewer_feedback":..., "draft_content": {...編集後の内容、省略可},
+           "test_mode": true なら、承認時にテスト受信者(is_test=true)だけへ送る（省略時は本番）}
     - status='review_required' + draft_content指定 → 修正のみ保存（save_draft_edits）
     - status='rejected'                            → 却下（reject_report）
     - status='approved'                             → 編集があれば先に保存し、承認して送信
@@ -103,9 +104,12 @@ def review_weekly_report(report_id: str, body: dict, config: dict,
     if status == "approved":
         if not identity.can_approve(resolved_principal):
             return {"ok": False, "error": "この操作を行う権限がありません（reviewerロールが必要です）"}
+        # test_mode=True なら、email_recipients の is_test=true の受信者だけへ送る（本番の受信者には届かない）。
+        # 指定が無ければ従来どおり本番（False）。
         result = wer.approve_and_send(client, config, report_id,
                                        reviewer_id=identity.audit_reviewer_id(resolved_principal),
-                                       reviewer_feedback=reviewer_feedback)
+                                       reviewer_feedback=reviewer_feedback,
+                                       test_mode=bool(body.get("test_mode", False)))
         return {"ok": result.get("ok", False), **result}
 
     return {"ok": True, "review_status": "review_required"}

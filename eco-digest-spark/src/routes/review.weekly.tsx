@@ -170,6 +170,8 @@ function ReportDetail({ id, canApprove }: { id: string | null; canApprove: boole
   const [freeText, setFreeText] = useState("");
   const [jsonText, setJsonText] = useState("");
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  // 既定はテスト送信(テスト受信者だけへ送る)。誤って本番の宛先へ送らないよう、本番に送るときだけ外す
+  const [testMode, setTestMode] = useState(true);
 
   // 別のドラフトを選んだ(または再読込された)ら、編集欄をその内容で初期化する
   useEffect(() => {
@@ -195,9 +197,15 @@ function ReportDetail({ id, canApprove }: { id: string | null; canApprove: boole
       setMessage({ kind: "error", text: "週次ドラフト本体のJSONが不正です。修正内容は保存されませんでした。" });
       return;
     }
-    if (action === "approved" && !window.confirm("承認すると、宛先へ実際にメールが送信されます。よろしいですか？")) return;
+    if (action === "approved") {
+      const ask = testMode
+        ? "テスト送信します。テスト受信者(is_test)だけへ送られ、本番の宛先には届きません。\n"
+          + "ただし承認済み(送信済み)になるため、このドラフトは本番へ再送できません(本番送信は、ドラフトを作り直して行います)。\nよろしいですか？"
+        : "本番の宛先へ、実際にメールが送信されます。取り消せません。よろしいですか？";
+      if (!window.confirm(ask)) return;
+    }
     review.mutate(
-      { id: report.id, status: action, freeText, draftContent: edited },
+      { id: report.id, status: action, freeText, draftContent: edited, testMode },
       {
         onSuccess: () => setMessage({ kind: "ok", text: "保存しました" }),
         onError: (e) => setMessage({ kind: "error", text: `処理に失敗しました: ${(e as Error).message}` }),
@@ -246,8 +254,24 @@ function ReportDetail({ id, canApprove }: { id: string | null; canApprove: boole
             className="font-mono text-xs"
           />
         </div>
+        <label className="flex items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={testMode}
+            onChange={(e) => setTestMode(e.target.checked)}
+          />
+          <span>
+            テスト送信（テスト受信者だけへ送る）
+            <span className="block text-xs text-muted-foreground">
+              外すと本番の宛先へ送信されます。テスト送信でも承認済みになるため、同じドラフトは本番へ再送できません。
+            </span>
+          </span>
+        </label>
         <div className="flex gap-3 flex-wrap">
-          <Button disabled={disabled} onClick={() => submit("approved")}>承認して送信</Button>
+          <Button disabled={disabled} onClick={() => submit("approved")}>
+            {testMode ? "承認してテスト送信" : "承認して本番送信"}
+          </Button>
           <Button variant="outline" disabled={disabled} onClick={() => submit("rejected")}>却下</Button>
           <Button variant="outline" disabled={disabled} onClick={() => submit("review_required")}>
             修正のみ保存（レビュー待ちのまま）

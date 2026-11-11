@@ -78,6 +78,7 @@ export interface ReviewInput {
   status: "approved" | "rejected" | "review_required";
   freeText?: string;
   draftContent?: Record<string, unknown>;
+  testMode?: boolean; // true: 承認時、テスト受信者だけへ送る
 }
 
 export function useReviewWeeklyReport() {
@@ -91,6 +92,7 @@ export function useReviewWeeklyReport() {
           status: input.status,
           reviewerFeedback: { free_text: input.freeText || null },
           draftContent: input.draftContent,
+          testMode: input.testMode ?? false,
         }),
       }),
     onSuccess: () => {
