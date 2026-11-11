@@ -16,7 +16,9 @@ const tenantId = (import.meta.env.VITE_ENTRA_TENANT_ID as string | undefined)?.t
 const scope =
   (import.meta.env.VITE_ENTRA_SCOPE as string | undefined)?.trim() || (clientId ? `api://${clientId}/access_as_user` : "");
 
-export const ssoEnabled = Boolean(clientId && tenantId);
+// IDの形式(GUID)でなければ、SSOは無効にする（'off' や、未置換の「$(変数)」などが入っても、ログインを試みない）
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const ssoEnabled = GUID.test(clientId) && GUID.test(tenantId);
 
 let msalPromise: Promise<PublicClientApplication> | null = null;
 
