@@ -376,6 +376,10 @@ class SupabaseClient:
                     if e.response is not None and e.response.status_code < 500:
                         raise
                     time.sleep(0.5 * (attempt + 1))
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                    # Supabaseが一時的に30秒止まる事象への対策（読み取りなので、やり直しても安全）
+                    last_exc = e
+                    time.sleep(1.0 * (attempt + 1))
             raise last_exc
 
         remaining_offsets = list(range(page_size, total, page_size))
