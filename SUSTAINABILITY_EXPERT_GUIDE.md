@@ -44,8 +44,8 @@ sustainability_content_generator.py … [退役・_archive/へ移動] 旧コン�
                                        週次メールのテーマ別ダイジェストに統合された
 weekly_email_report.py              … 週次メール生成パイプライン（CLI、build/2フェーズ）
 sustainability_expert_api.py        … APIハンドラー用ラッパー（run.pyから呼ばれる）
-sustainability_expert_dashboard.py  … レビュー画面（Streamlit。週次メールレビュー／
-                                       個別記事レビュー[旧・参照専用]の2画面）
+eco-digest-spark/src/routes/review.*.tsx … レビュー画面（React。週次/日次/月次メール・クロール候補・戦略質問）。
+                                       旧Streamlit画面（sustainability_expert_dashboard.py）は廃止し、_removed_20261015/へ退避
 sql/2026-07-17_sustainability_expert_schema.sql … 新規テーブル定義
 sql/2026-07-22_weekly_email_review_gate_schema.sql … 週次メールのレビュー承認ゲート追加
 ```
@@ -67,7 +67,7 @@ articles(is_current=true, 未処理)
   → 週次メールドラフト生成（weekly_email_report.py build。記事ごとの見出し・要点書き換え＋
      テーマ別ダイジェスト＝テーマトピックスを生成。record_generator.pyの詳細生成はここに統合）
   → review_required として weekly_email_reports に保存（送信しない）
-  → sustainability_expert_dashboard.py の「週次メールレビュー」画面で承認/却下/修正
+  → フロントエンドの「メールレビュー > 週次メール」画面（/review/weekly）で承認/却下/修正
   → 承認 → 送信（weekly_email_report.py send、または承認ボタンから直接）
 ```
 
@@ -83,9 +83,8 @@ articles(is_current=true, 未処理)
 - DBアクセス: `article_crawler.SupabaseClient` を再利用（PostgREST経由、service_role key）
 - API層: `run.py` の `DashboardHandler`（既存の自前HTTPサーバー）に5エンドポイントを追加
 - レビュー画面: 既存の`run.py`＋`dashboard.html`（globe.gl採用の巨大な地政学リスク監視画面）
-  には組み込まず、独立した`sustainability_expert_dashboard.py`（Streamlit）として追加した。
-  理由: `run.py`のHTML生成部分は単一の巨大関数で改変リスクが高く、CLAUDE.mdの
-  「Streamlitでプロトタイプ作成」方針にも沿うため。既存ダッシュボードには一切変更を加えていない。
+  には組み込まず、当初は独立したStreamlit画面として追加した（理由: `run.py`のHTML生成部分は単一の巨大関数で
+  改変リスクが高いため）。2026-10-15にフロントエンド(eco-digest-spark)のメールレビュー画面へ統合し、Streamlit画面は廃止した。
 
 ## 3. セットアップ方法
 
@@ -176,19 +175,20 @@ python weekly_email_report.py send --report-id <id> [--reviewer-id <id>]  # 承�
 
 ## 9. レビュー方法
 
-```bash
-streamlit run projects/world_monitor_dashboard/sustainability_expert_dashboard.py
-```
+APIサーバー(api_server.py)とフロントエンド(eco-digest-spark)を起動し、サイドバー「メールレビュー」から操作する。
+承認・却下・ドラフト生成・候補の有効化には、DEV AUTH（環境変数 `SUSTAINABILITY_EXPERT_DEV_AUTH_MODE=true` と
+`SUSTAINABILITY_EXPERT_DEV_USER_ID=<開発者ID>`、APIサーバー起動前に設定）が必要。
 
-サイドバーで「週次メールレビュー」（週次ドラフトの概況・テーマ別ダイジェスト＝テーマトピックス・
-記事一覧・メールプレビューを確認し、承認して送信/却下/修正のみ保存ができる）と
-「個別記事レビュー（旧・参照専用、新規データは増えない）」を切り替えられる。
+- 週次メール（/review/weekly）: ドラフト生成（ボタン）・メールプレビュー・承認して送信/却下/修正のみ保存
+- 競合日次ダイジェスト（/review/daily）、競合月次レポート（/review/monthly）: プレビュー・承認して送信/却下
+- 競合クロール候補管理（/review/candidates）、戦略質問・組織判断（/review/questions・閲覧のみ）
 
-APIからも操作できる:
-- `GET /api/weekly-reports?status=review_required`
-- `GET /api/weekly-reports/{report_id}`
+主なAPI（api_server.py）:
+- `GET /api/weekly-reports?status=review_required` / `GET /api/weekly-reports/{report_id}`
 - `POST /api/weekly-reports/{report_id}/review`
-  （body例: `{"status": "approved", "reviewer_id": "...", "reviewer_feedback": {...}}`）
+  （body例: `{"status": "approved", "reviewerFeedback": {...}, "draftContent": {...}}`。担当者IDは認証済みprincipalから導出し、bodyでは受け取らない）
+- `POST /api/weekly-reports/build`（ドラフト生成ジョブ開始）/ `GET /api/weekly-reports/build/latest`
+- `GET /api/review/{daily|monthly}` / `POST /api/review/{daily|monthly}/{id}/action`
 - 旧: `GET /api/expert/contents?status=review_required` / `GET /api/expert/contents/{content_id}` /
   `POST /api/expert/contents/{content_id}/review`（過去データの参照・修正用に残置）
 

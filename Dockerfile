@@ -1,5 +1,5 @@
 # APIバックエンド(api_server.py)専用コンテナ。
-# フロントエンド(eco-digest-spark)・PMOレビュー用Streamlitアプリは別デプロイ（DEPLOY_GUIDE.md参照）。
+# フロントエンド(eco-digest-spark。メールレビュー画面を含む)は別デプロイ（DEPLOY_GUIDE.md参照）。
 FROM python:3.11-slim
 
 WORKDIR /app

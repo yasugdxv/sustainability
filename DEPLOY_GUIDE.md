@@ -8,13 +8,12 @@
 
 ## 1. アプリ概要
 
-競合サステナビリティモニタリング・記事収集/AI分析ダッシュボード。3つの独立したコンポーネントで構成される。
+競合サステナビリティモニタリング・記事収集/AI分析ダッシュボード。2つのコンポーネントで構成される（旧PMOレビュー用Streamlitツールは、フロントエンドのメールレビュー画面へ統合済み）。
 
 | コンポーネント | 実体 | 役割 |
 |---|---|---|
 | APIバックエンド | `api_server.py`（FastAPI） | 記事・競合データ・チャット等のREST API |
-| フロントエンド | `eco-digest-spark/`（React / TanStack Start） | エンドユーザー向けダッシュボードUI |
-| PMOレビューツール | `sustainability_expert_dashboard.py`（Streamlit） | 週次/月次レポートの承認・競合アラートの内部レビュー |
+| フロントエンド | `eco-digest-spark/`（React / TanStack Start） | エンドユーザー向けダッシュボードUI。サイドバー「メールレビュー」（`/review/*`）で週次/日次/月次メールの承認・ドラフト生成・競合クロール候補管理・戦略質問の閲覧を行う |
 
 データ収集（`article_crawler.py`・`competitor_crawler.py`等）とLLM分析（`article_analyzer.py`等）はこれらとは別に、
 バッチ処理として定期実行する（cron等。常駐サーバーではない）。
@@ -40,7 +39,7 @@ api_server.py（FastAPI / uvicorn、ポート8000）
     └── (バッチ処理群は別途、同じSupabaseに直接読み書き)
         article_crawler.py / article_analyzer.py / competitor_crawler.py 等
 
-PMO内部レビュー: sustainability_expert_dashboard.py（Streamlit、上記とは別ポートで起動）
+PMO内部レビュー: フロントエンドの「メールレビュー」画面（`/review/*`）。APIは api_server.py の /api/review/*・/api/weekly-reports/* 等
 ```
 
 > **注記**: 実際のホスティング先（Azure App Service for Containers / Container Apps / 他）は
@@ -70,18 +69,17 @@ npm run dev
 Vite dev serverが起動し、表示されたURL（例: `http://localhost:3000`）にブラウザでアクセスする。
 `src/lib/api.ts`の`API_BASE`が`http://127.0.0.1:8000`に固定されているため、3-1のAPIサーバーを先に起動しておくこと。
 
-### 3-3. PMOレビューツール（Streamlit）
+### 3-3. PMOレビュー（メールレビュー画面）
 
-```powershell
-cd projects\world_monitor_dashboard
-streamlit run sustainability_expert_dashboard.py
-```
+3-1・3-2の起動だけで、フロントエンドのサイドバー「メールレビュー」から利用できる（別アプリの起動は不要）。
+承認・却下・ドラフト生成・候補の有効化は、認証済みレビュー担当者が必要。Entra ID接続までは開発時のみ、
+APIサーバー起動前に環境変数 `SUSTAINABILITY_EXPERT_DEV_AUTH_MODE=true` と `SUSTAINABILITY_EXPERT_DEV_USER_ID=<開発者ID>` を設定する。
 
 ---
 
 ## 4. コンテナデプロイ（APIバックエンドのみ）
 
-`Dockerfile`は**APIバックエンド(`api_server.py`)専用**。フロントエンド・Streamlitツールは含まない。
+`Dockerfile`は**APIバックエンド(`api_server.py`)専用**。フロントエンドは含まない。
 
 ```dockerfile
 FROM python:3.11-slim

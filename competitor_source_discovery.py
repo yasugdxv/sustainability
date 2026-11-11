@@ -6,7 +6,7 @@ competitor_sources のうち source_type='SUSTAINABILITY_HOME'（サステナビ
 レポート(REPORTS)・ニュース(NEWS)・開示(DISCLOSURE)に該当しそうなページを候補として抽出する。
 
 自動抽出した候補は即座に本番監視対象(competitor_sources)へ昇格させず、
-competitor_source_candidates に保存し、レビュー画面（sustainability_expert_dashboard.py）から
+competitor_source_candidates に保存し、レビュー画面（フロントエンドの「競合クロール候補管理」）から
 人が確認・種別修正のうえで有効化(activate_candidate)して初めてクロール対象になる。
 
 種別推測(guess_url_type)はLLMを使わず、URL・タイトルのキーワードによる簡易判定とする

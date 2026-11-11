@@ -15,8 +15,8 @@ description: run, start, launch, screenshot, test the world_monitor_dashboard �
 旧版（`run.py`が静的HTML `dashboard.html` を配信する「世界地図UI版」）は2026-07に廃止済み、
 `_removed_20260723/`へ退避済み。**現在は使用しない**（このスキルの旧版が`run.py`を前提にしていたら誤り）。
 
-PMOレビュー用のStreamlitアプリ(`sustainability_expert_dashboard.py`)は別途 `streamlit run` で起動する
-（このスキルの対象外。ユーザーから明示的に依頼された場合のみ起動する）。
+PMOレビュー機能は、フロントエンドのサイドバー「メールレビュー」(`/review/*`)に統合済み（旧Streamlitアプリは廃止）。
+承認系の操作にはDEV AUTHの環境変数が必要（DEPLOY_GUIDE.md 3-3参照）。ユーザーから明示的に依頼された場合のみ承認操作を行う。
 
 ## 前提条件
 

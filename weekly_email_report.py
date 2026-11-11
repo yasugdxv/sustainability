@@ -25,7 +25,7 @@ summary_detail）も生成し、article_analysisへ保存する（save_detail_su
 記事全件に対する別呼び出しは行わず、既存の呼び出しに相乗りさせることでLLMコスト・
 時間の増加を避けている。選定外（B/C判定でメール非掲載）の記事はこの詳細サマリーを
 生成しない。
-サステナビリティ担当者がsustainability_expert_dashboard.pyでレビュー・承認して初めて
+サステナビリティ担当者がフロントエンドの「メールレビュー」画面（/review/weekly）でレビュー・承認して初めて
 実際の送信が行われる（build()とsend()の2フェーズに分離）。
 
 送信方式（社内SMTPリレー／M365／SendGridのいずれか）が未確定のため、送信処理は
@@ -804,7 +804,7 @@ def send_email(subject: str, html_body: str, config: dict, to_addresses: list) -
 def build_draft(since_days: int = None, force_geo_rerun: bool = False) -> str:
     """選定結果取得→記事組み立て→（Phase S2）Geo Intelligence連携→見出し要点書き換え→
     シンセシス→HTML組み立てまでを行い、review_requiredで1行保存してreport_idを返す。
-    送信は行わない（sustainability_expert_dashboard.py でレビュー・承認して初めて送信される）。
+    送信は行わない（フロントエンドの「メールレビュー」画面でレビュー・承認して初めて送信される）。
     force_geo_rerun: 手動でGeo Intelligence問い合わせ・Dedup・Selectionをすべて強制再実行したい
     場合のみTrue（通常は3層とも自動でキャッシュ再利用される）"""
     config = load_config()
@@ -955,7 +955,7 @@ def build_draft(since_days: int = None, force_geo_rerun: bool = False) -> str:
             except Exception as e:
                 print(f"[weekly] Strategic Questionのembedded状態更新に失敗: {type(e).__name__}: {e}")
         print(f"ドラフトを保存しました（report_id={report_id}, review_status=review_required）。"
-              f"送信は行いません。sustainability_expert_dashboard.py でレビュー・承認してください。")
+              f"送信は行いません。フロントエンドの「メールレビュー」画面でレビュー・承認してください。")
     return report_id
 
 
