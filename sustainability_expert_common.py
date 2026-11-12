@@ -343,7 +343,7 @@ def shared_cache_clear_all() -> None:
 
 # _select_in_chunks は収集基盤の共通部品として supabase_client.py へ移動した。
 # 既存の common._select_in_chunks が動くよう、ここから再公開する
-from supabase_client import _select_in_chunks  # noqa: E402,F401
+from collection.supabase_client import _select_in_chunks  # noqa: E402,F401
 
 
 def fetch_articles_with_tags(client, since_days: int, ranks: tuple = None) -> list:
