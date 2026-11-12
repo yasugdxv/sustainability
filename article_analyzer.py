@@ -45,7 +45,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 MAX_ARTICLE_CHARS = 8000
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"  # v2: display_title/summary_detail追加、summary_short拡充（2026-10-19）
 
 SCORE_CRITERIA_ORDER = [
     "business_relevance", "change_severity", "impact_scope",
@@ -141,10 +141,28 @@ SYSTEM_PROMPT_TEMPLATE = """あなたはサントリーグループのサステ�
    impact_scope, certainty_stage, urgency, novelty, decision_value）
 7. score_reasons: 7項目それぞれの採点理由（1文ずつ）
 8. correction_applied: 補正ルールに該当すればその条件文をそのまま、無ければnull
-9. summary_short: 記事の要約（180〜250文字程度）。「誰が」「何をした/何が起きたか」
-   「なぜサス推にとって重要か」の3点が、この要約だけを読んで分かるように書くこと。
-   一般論や記事タイトルの言い換えではなく、記事本文に書かれている具体的な数値・
-   固有名詞・時期を含めること
+9. summary_short: 一覧カード用の要約（日本語、120〜160文字程度）。「誰が」「何をした/
+   何が起きたか」「なぜサス推にとって重要か」の3点が、この要約だけを読んで分かるように
+   書くこと。一般論や記事タイトルの言い換えではなく、記事本文に書かれている具体的な
+   数値・固有名詞・時期を含めること
+9-2. display_title: 画面に表示するための日本語タイトル（30〜45文字程度）。原題をそのまま
+   訳すのではなく、「誰が・何を・どうした」が一読で分かり、サステナビリティ上の論点が
+   伝わるように付け直すこと。原題が固有名詞だけ・略語だけ・抽象的で意味が取りにくい場合は
+   本文から補うこと。ただし本文に書かれていない事実・評価を足してはいけない。
+   煽り表現・体言止めの羅列は避け、記事の内容に即した客観的な表現にすること
+9-3. summary_detail: 記事詳細画面用の詳細要約（日本語、400〜600文字）。分量は文数で
+   管理し、全体で最大4段落・合計8〜10文以内、1文は80文字以内とする（長い記事でも
+   これを超えない）。参加企業名・協賛名・登壇者名などの列挙は避け、要点に絞ること。
+   記事を読まなくても全体像が分かるよう、次の順で段落を分け（段落間は改行1つ）、
+   各段落は文章で書くこと:
+   (a) 何が起きたか（誰が・いつ・何を） (b) 具体的な数値・日付・固有名詞・対象範囲
+   (c) 背景・経緯（本文に書かれている場合のみ） (d) サステナビリティ上の意味と、
+   食品・飲料事業（サントリーグループ）への関連・示唆（関連が薄い場合は1文で簡潔に。
+   無理にこじつけない）。
+   本文に書かれている事実のみを使い、本文にない数値・経緯・評価を補ってはいけない。
+   本文が短い・断片的な場合（目安: 本文500文字未満）は、最大2段落・合計3〜4文
+   （150〜250文字）に収め、書けない段落は省くこと（文字数を満たすために推測や一般論で
+   水増ししない）
 10. importance_reason: 総合的な重要度判断の理由（2-3文）
 11. needs_review: 「人間による確認が必要な業務上の条件」に該当する場合にtrueとする（単に
     モデル自身の自信が低いというだけでは該当しない）。該当例:
@@ -563,6 +581,8 @@ def save_analysis(client: SupabaseClient, article: dict, result: dict, ranks: li
     client.insert("article_analysis", [{
         "article_id": article_id,
         "summary_short": result.get("summary_short"),
+        "display_title": (result.get("display_title") or "").strip() or None,
+        "summary_detail": (result.get("summary_detail") or "").strip() or None,
         "importance_level": rank,
         "importance_reason": "\n".join(p for p in reason_parts if p),
         "importance_total_score": total_score,

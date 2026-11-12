@@ -66,6 +66,9 @@ STEPS = [
     ("filter_coverage_check", ["check_filter_keyword_coverage.py"], 300),
     ("crawl_health_check", ["crawl_health_check.py"], 300),
     ("analyze", ["article_analyzer.py", "9999", "5"], 5400),
+    # 分析済み記事のタイトル・要約・本文を先回り翻訳(日↔英両方向)してtranslation_cacheへ保存。
+    # ユーザーの初回アクセスが翻訳待ち/原文表示にならないようにする(2026-10-19)
+    ("translate_prefetch", ["translate_prefetch.py", "--since-days", "7"], 3600),
     ("competitor_crawl", ["competitor_crawler.py"], 5400),
     ("selector", ["sustainability_article_selector.py", "--top-n-per-theme", "10"], 3600),
     # 記事一覧ダッシュボード(api_server.py)の共有キャッシュを先回りして温める。

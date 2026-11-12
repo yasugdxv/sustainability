@@ -72,6 +72,9 @@ export interface Article {
   materialityCodes: string[];
   cover: string;
   body?: string[];
+  detailSummary?: string[]; // AI詳細要約（段落ごと。v1分析の既存記事は空）
+  originalTitle?: string; // 表示タイトルがAI生成の場合の原題（翻訳済み）
+  bodyShort?: boolean; // 本文が短い（取得不十分の可能性、目安500字未満）
   likesCount: number;
   readsCount: number;
   provenance: Provenance;

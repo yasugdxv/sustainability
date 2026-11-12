@@ -44,6 +44,12 @@ def build_config_from_env() -> dict:
     config["api_keys"] = {
         "openai": os.environ.get("OPENAI_API_KEY", ""),
         "anthropic": os.environ.get("ANTHROPIC_API_KEY", ""),
+        # 2026-10-09発見: ZYTE_API_KEYと同じ抜けがTinyFishにもあった。
+        # TINYFISH_API_KEYがここに無かったため、本番ではconfig.jsonが
+        # 再生成されたとしてもTinyFish Fetch/Agentが常に
+        # RuntimeError「TinyFish APIキーが未設定です」で失敗する状態だった
+        # (article_crawler._get_tinyfish_api_key()がconfig["api_keys"]["tinyfish"]を読む)
+        "tinyfish": os.environ.get("TINYFISH_API_KEY", ""),
     }
     # 2026-10-02発見: ZYTE_API_KEY相当の環境変数がここに無かったため、Zyte方式の
     # クロール対象(本番で約25件)がRuntimeError「Zyte APIキーが未設定です」で
@@ -81,6 +87,14 @@ def build_config_from_env() -> dict:
         # （geo_intelligence.enabled＝Geo機能全体のKill Switch、weekly_monitoringとはそれぞれ別枠）
         config.setdefault("geo_intelligence", {})["chat"] = {
             "enabled": os.environ.get("SUSTAINABILITY_CHAT_GEO_ENABLED", "").strip().lower() in ("1", "true", "yes"),
+        }
+    if os.environ.get("EMAIL_METHOD"):
+        # メール送信（Microsoft Graph）。Secret(MS_CLIENT_SECRET等)はここに載せず、
+        # weekly_email_report側が環境変数から直接読む
+        config["email"] = {
+            "enabled": os.environ.get("EMAIL_ENABLED", "").strip().lower() in ("1", "true", "yes"),
+            "method": os.environ.get("EMAIL_METHOD", ""),
+            "from_address": os.environ.get("EMAIL_FROM_ADDRESS", ""),
         }
     return config
 

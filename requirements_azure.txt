@@ -30,3 +30,5 @@ jsonschema>=4.20.0
 # サスティナビリティ専門家MVP: Azure AI Search を本番利用する場合のみ追加インストール
 # （sustainability_expert.knowledge_search.mode を azure_ai_search にする場合）
 # azure-search-documents>=11.5.0
+# Entra ID(SSO)のアクセストークン検証（entra_auth.py）。署名検証にcryptographyを使う
+PyJWT>=2.8.0

@@ -144,7 +144,13 @@ def _warm_translation_cache(articles: list, lang: str) -> None:
     原文のまま返す」経路に変えたため、ここではfire-and-forgetで投げるだけでよい
     （このリクエストのレスポンスは原文のまま返り、次回以降のリクエストから翻訳済みで返る）。"""
     for a in articles:
-        if ("title", lang, a["article_id"]) not in core._short_cache:
+        # 表示用タイトル(display_title)がある記事は、それが一覧に出るため原題の翻訳は先回りしない
+        if a.get("display_title"):
+            if ("display_title", lang, a["article_id"]) not in core._short_cache:
+                _translate_pool.submit(
+                    core.translate_display_title, _azure_client, _model, a["article_id"],
+                    a["display_title"], lang)
+        elif ("title", lang, a["article_id"]) not in core._short_cache:
             _translate_pool.submit(
                 core.translate_title, _azure_client, _model, a["article_id"], a["title"], lang)
         if ("summary", lang, a["article_id"]) not in core._short_cache:
@@ -171,11 +177,20 @@ def _to_ui_article(a: dict, engagement: dict, lang: str = "ja", with_body: bool 
     else:
         sector = sector_ja
         tags = tags_ja
+    # 表示タイトルはAI生成のdisplay_title（サステナ文脈を踏まえた日本語）を優先し、
+    # 無い記事（v1分析の既存記事）は従来どおり原題を使う。原題は詳細画面で併記する
+    display_raw = a.get("display_title") or ""
     if blocking:
-        title = core.translate_title(_azure_client, _model, a["article_id"], a["title"], lang)
+        if display_raw:
+            title = core.translate_display_title(_azure_client, _model, a["article_id"], display_raw, lang)
+        else:
+            title = core.translate_title(_azure_client, _model, a["article_id"], a["title"], lang)
         summary = core.translate_summary(_azure_client, _model, a["article_id"], summary_raw, lang)
     else:
-        title = core.get_short_translation_nonblocking("title", a["article_id"], a["title"], lang)
+        if display_raw:
+            title = core.get_short_translation_nonblocking("display_title", a["article_id"], display_raw, lang)
+        else:
+            title = core.get_short_translation_nonblocking("title", a["article_id"], a["title"], lang)
         summary = core.get_short_translation_nonblocking("summary", a["article_id"], summary_raw, lang)
     scores = a.get("importance_scores") or {}
     out = {
@@ -216,6 +231,16 @@ def _to_ui_article(a: dict, engagement: dict, lang: str = "ja", with_body: bool 
         body = a.get("extracted_text") or ""
         body_translated = core.translate_body(_azure_client, _model, a["article_id"], body, lang) if body else ""
         out["body"] = [p for p in body_translated.split("\n") if p.strip()]
+        # 詳細要約（AI生成。v1分析の既存記事はNULLなので空配列＝画面側は表示しない）
+        detail_raw = a.get("summary_detail") or ""
+        detail = core.translate_summary_detail(
+            _azure_client, _model, a["article_id"], detail_raw, lang) if detail_raw else ""
+        out["detailSummary"] = [p for p in detail.split("\n") if p.strip()]
+        # 表示タイトルがAI生成のものである場合のみ、原題（翻訳済み）を併記用に返す
+        out["originalTitle"] = core.translate_title(
+            _azure_client, _model, a["article_id"], a["title"], lang) if display_raw else ""
+        # 本文が短い記事は、取得が不十分な可能性を画面で示すための目印（目安500字未満）
+        out["bodyShort"] = len(a.get("extracted_text") or "") < 500
     return out
 
 
@@ -307,6 +332,7 @@ _articles_response_cache: dict = {}
 
 @app.get("/api/articles")
 def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: str = "", lang: str = "ja"):
+    core.refresh_translation_cache()  # バッチが書いた翻訳を差分で取り込む（120秒間隔）
     cache_key = (since_days, themes, lang)
     shared_key = f"articles_response:{since_days}:{themes}:{lang}"
     if not q.strip():
@@ -364,6 +390,7 @@ def list_articles(since_days: int = DEFAULT_LOOKBACK_DAYS, themes: str = "", q: 
 
 @app.get("/api/articles/{article_id}")
 def get_article(article_id: str, lang: str = "ja"):
+    core.refresh_translation_cache()
     articles = _get_articles()
     article = next((a for a in articles if a["article_id"] == article_id), None)
     if not article:
@@ -1000,10 +1027,22 @@ class WeeklyReviewBody(BaseModel):
     draftContent: dict | None = None
 
 
+@app.middleware("http")
+async def _capture_bearer_token(request, call_next):
+    """SSO: リクエストの Authorization: Bearer を、このリクエストの間だけ、identityへ渡す（2026-10-23追加）。
+    トークンの検証は、承認系の_review_principal()(identity.resolve_principal)で行う"""
+    reset = identity.set_request_bearer_token(identity.bearer_token_from_header(request.headers.get("authorization")))
+    try:
+        return await call_next(request)
+    finally:
+        identity.reset_request_bearer_token(reset)
+
+
 def _review_principal():
     """(principal, error)を返す。解決できない場合principalはNone"""
     try:
-        return identity.resolve_principal(dev_principal=identity.dev_principal_from_env()), None
+        return identity.resolve_principal(dev_principal=identity.dev_principal_from_env(),
+                                          bearer_token=identity.current_bearer_token()), None
     except identity.AuthenticationError as e:
         return None, str(e)
 

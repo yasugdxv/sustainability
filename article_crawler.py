@@ -28,9 +28,11 @@ import re
 import sys
 import time
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import feedparser
@@ -691,6 +693,174 @@ def _fetch_with_zyte(url: str, proxies: dict, verify: bool, force_browser: bool 
     return html, final_url, status_code, raw_content
 
 
+# ─── TinyFish（Zyteが失敗した場合の追加フォールバック、2026-10-09） ──────────
+# PoC(scripts/tinyfish_poc/, scripts/zyte_poc/)での検証結果: Bot対策で失敗していた
+# 52件の実対象に対し、Zyte・TinyFishともに単独で98.1%(51/52)を解決できたが、
+# 「通常クロール→Zyte→TinyFish Fetch→TinyFish Agent」の順でチェーンさせると
+# 52/52(100%)を解決でき、かつ最もコストの高いAgentが必要だったのは1件のみだった。
+# Zyteは1リクエスト$0.0001〜0.016程度と極めて安価なため、TinyFishは「Zyteも
+# 失敗した場合の保険」という位置づけとする（コスト最適化目的ではなく冗長性目的）。
+TINYFISH_FETCH_URL = "https://api.fetch.tinyfish.ai"
+TINYFISH_AGENT_URL = "https://agent.tinyfish.ai/v1/automation/run-sse"
+TINYFISH_FETCH_TIMEOUT = 60
+TINYFISH_AGENT_TIMEOUT = 600  # Agentは自然言語タスク実行のため数分かかることがある
+TINYFISH_AGENT_GOAL = "Extract the main article title and the full body text of this page. Return as plain text."
+# 1回の実行(=1日分のバッチ)でAgentを呼び出せる上限。暴走防止の安全弁（適当値、
+# 実運用の呼び出し頻度を見ながら調整する）
+TINYFISH_AGENT_RUN_CAP = 10
+_tinyfish_api_key_cache = None
+_tinyfish_agent_call_count = 0
+
+
+def _get_tinyfish_api_key() -> str:
+    """config.jsonのapi_keys.tinyfishから読む（scripts/tinyfish_poc/tinyfish_test.pyと同じ規約）"""
+    global _tinyfish_api_key_cache
+    if _tinyfish_api_key_cache is None:
+        config = load_config()
+        _tinyfish_api_key_cache = config.get("api_keys", {}).get("tinyfish", "").strip()
+    return _tinyfish_api_key_cache
+
+
+def _tinyfish_agent_budget_available() -> bool:
+    return _tinyfish_agent_call_count < TINYFISH_AGENT_RUN_CAP
+
+
+def _record_tinyfish_agent_call() -> None:
+    global _tinyfish_agent_call_count
+    _tinyfish_agent_call_count += 1
+    if _tinyfish_agent_call_count == TINYFISH_AGENT_RUN_CAP:
+        print(f"[TinyFish Agent] 1回の実行あたりの上限({TINYFISH_AGENT_RUN_CAP}件)に達しました。"
+              f"以降はこの実行中エスカレーションしません。")
+
+
+def _call_tinyfish_fetch(url: str, proxies: dict, verify: bool, want_links: bool = False):
+    """TinyFish Fetch APIを1回呼び出す。(html, final_url, status_code)を返す。
+
+    Fetch自体はリンク構造を保持しない読みやすい形式のテキストしか返さないため
+    (2026-10-08、TinyFish社に確認済み。ただしlinks=Trueを指定すればページ内の
+    リンク一覧を別途取得できる)、タイトル・本文は最小限のHTMLへラップしてから返す。
+    want_links=Trueの場合は、取得したリンク一覧を<a href>として同じラップHTMLへ
+    追加し、一覧ページのリンク抽出(list_html_candidates)が既存のパース処理
+    (tree.xpath("//a/@href"))をそのまま使えるようにする。"""
+    api_key = _get_tinyfish_api_key()
+    if not api_key:
+        raise RuntimeError("TinyFish APIキーが未設定です(config.jsonのapi_keys.tinyfish)")
+    payload = {"urls": [url], "format": "markdown"}
+    if want_links:
+        payload["links"] = True
+    resp = requests.post(TINYFISH_FETCH_URL, headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+                         json=payload, proxies=proxies, verify=verify, timeout=TINYFISH_FETCH_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("results", [])
+    if not items:
+        errors = data.get("errors", [])
+        raise RuntimeError(f"TinyFish Fetch: 取得失敗({errors[0] if errors else '不明なエラー'})")
+    item = items[0]
+    final_url = item.get("final_url", url)
+    title = item.get("title", "") or ""
+    text = item.get("text", "") or ""
+    links_html = ""
+    if want_links:
+        links_html = "".join(f'<a href="{html_escape(link, quote=True)}"></a>' for link in (item.get("links") or []))
+    html = (f"<html><head><title>{html_escape(title)}</title></head>"
+            f"<body><article>{html_escape(text)}</article>{links_html}</body></html>")
+    return html, final_url, 200
+
+
+def _call_tinyfish_agent(url: str, proxies: dict, verify: bool):
+    """TinyFish Agent APIを1回呼び出す（最後の手段。1件6〜9分・従量課金のため
+    呼び出し回数はTINYFISH_AGENT_RUN_CAPで抑える）。(html, final_url, status_code)を返す。"""
+    api_key = _get_tinyfish_api_key()
+    if not api_key:
+        raise RuntimeError("TinyFish APIキーが未設定です(config.jsonのapi_keys.tinyfish)")
+    final_result = None
+    status = None
+    with requests.post(TINYFISH_AGENT_URL, headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+                       json={"url": url, "goal": TINYFISH_AGENT_GOAL}, proxies=proxies, verify=verify,
+                       timeout=TINYFISH_AGENT_TIMEOUT, stream=True) as resp:
+        resp.raise_for_status()
+        for raw_line in resp.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line[len("data:"):].strip() if raw_line.startswith("data:") else raw_line.strip()
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "COMPLETE":
+                status = event.get("status")
+                final_result = event.get("result")
+                break
+            if event.get("type") == "ERROR":
+                raise RuntimeError(f"TinyFish Agent error: {event.get('message') or event}")
+    if final_result is None:
+        raise RuntimeError(f"TinyFish Agent: 完了イベント未受信(最終status={status})")
+    text = final_result if isinstance(final_result, str) else json.dumps(final_result, ensure_ascii=False)
+    html = f"<html><body><article>{html_escape(text)}</article></body></html>"
+    return html, url, 200
+
+
+def _fetch_with_escalation(url: str, proxies: dict, verify: bool, *, start_with_zyte: bool = False,
+                            force_zyte_browser: bool = False, want_links: bool = False,
+                            allow_tinyfish_agent: bool = False, allow_escalation: bool = True):
+    """通常HTTP取得を軸に、失敗時は Zyte → TinyFish Fetch → (allow_tinyfish_agent時のみ)
+    TinyFish Agent の順に自動でエスカレーションする。(html, final_url, status_code, raw_content)を返す
+    （raw_contentはZyteのHTTPモードで取得できた場合のみ値が入る、それ以外はNone）。
+
+    明確な404(ページが存在しない)はエスカレーションしない。コストのかかる手段を
+    存在しないページに使っても無駄なため（通常取得のみで判定、Zyte/TinyFish側の
+    404はそのまま空に近い結果として返る想定で、そこから先はエスカレーションしない
+    設計にはしていない＝通常取得の時点での404だけを見る）。
+
+    start_with_zyte=Trueの場合は通常取得を省略しZyteから開始する
+    (crawl_method='Zyte'等、既に通常取得が機能しないと分かっている対象向け、
+    無駄な失敗リクエストを省く。以前からの挙動を維持)。
+
+    allow_escalation=Falseの場合、対象本来の手段(start_with_zyte=Falseなら通常HTTP、
+    Trueなら最初からZyte)を1回試すだけで、失敗時にそれ以上のフォールバックを行わず
+    例外をそのまま送出する(2026-10-14追加: 一覧ページ取得(list_html_candidates等)を
+    Pass1では軽量な1回試行に留め、必要な場合だけPass2でまとめてフルエスカレーションする
+    ため。以前は一覧取得だけがこの関数経由で常にフルエスカレーションしており、
+    bot対策サイトの一覧取得待ちがPass1内で同期的に発生し他targetの処理を圧迫していた)"""
+    last_exc = None
+    if not start_with_zyte:
+        try:
+            resp = _requests_get_with_retry(url, proxies, verify, REQUEST_TIMEOUT, _HEADERS)
+            resp.raise_for_status()
+            return _decoded_html(resp), resp.url, resp.status_code, resp.content
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                raise
+            last_exc = e
+        except Exception as e:
+            last_exc = e
+        if not allow_escalation:
+            raise last_exc
+    elif not allow_escalation:
+        return _fetch_with_zyte(url, proxies, verify, force_browser=force_zyte_browser)
+
+    try:
+        html, final_url, status_code, raw_content = _fetch_with_zyte(url, proxies, verify,
+                                                                      force_browser=force_zyte_browser)
+        return html, final_url, status_code, raw_content
+    except Exception as e:
+        last_exc = e
+
+    try:
+        html, final_url, status_code = _call_tinyfish_fetch(url, proxies, verify, want_links=want_links)
+        return html, final_url, status_code, None
+    except Exception as e:
+        last_exc = e
+
+    if allow_tinyfish_agent and _tinyfish_agent_budget_available():
+        html, final_url, status_code = _call_tinyfish_agent(url, proxies, verify)
+        _record_tinyfish_agent_call()
+        return html, final_url, status_code, None
+
+    raise last_exc
+
+
 def _decoded_html(resp: requests.Response) -> str:
     """Content-TypeヘッダーにcharsetがないHTML（<meta charset>頼みのページ）では、
     requestsがHTTP仕様のデフォルトであるISO-8859-1と誤判定し文字化けすることがあるため、
@@ -749,32 +919,33 @@ def _requests_get_with_retry(url: str, proxies: dict, verify: bool, timeout: int
 
 
 def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool, use_zyte: bool = False,
-                 force_zyte_browser: bool = False):
-    """通常HTTP・ブラウザ・Zyte APIのいずれかでページを取得する。(html, final_url, status_code)を返す。
-    meta refreshによる転送(短時間のもののみ)は自動で追従する"""
-    if use_zyte:
-        html, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify, force_browser=force_zyte_browser)
-    elif use_browser:
+                 force_zyte_browser: bool = False, want_links: bool = False, allow_escalation: bool = True):
+    """通常HTTP・ブラウザ・Zyte API・TinyFishのいずれかでページを取得する。
+    (html, final_url, status_code)を返す。meta refreshによる転送(短時間のもののみ)は自動で追従する。
+
+    use_browser=Falseの場合、取得失敗時は_fetch_with_escalation()によりZyte→TinyFish Fetchへ
+    自動でエスカレーションする(2026-10-09追加)。want_links=Trueを渡すと、TinyFish Fetch経由で
+    解決した場合にページ内のリンク一覧を<a href>として埋め込んだHTMLを返す
+    (一覧ページのリンク抽出=list_html_candidates向け)。allow_escalation=Falseは
+    _fetch_with_escalation()へそのまま伝播する(2026-10-14追加、list_html_candidates参照)。"""
+    if use_browser:
         html, final_url, status_code = _fetch_with_browser(url, proxies, verify)
     else:
-        resp = _requests_get_with_retry(url, proxies, verify, REQUEST_TIMEOUT, _HEADERS)
-        resp.raise_for_status()
-        html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
+        html, final_url, status_code, _ = _fetch_with_escalation(
+            url, proxies, verify, start_with_zyte=use_zyte, force_zyte_browser=force_zyte_browser,
+            want_links=want_links, allow_escalation=allow_escalation)
 
     for _ in range(META_REFRESH_MAX_HOPS):
         html, next_url, followed = _follow_meta_refresh(html, final_url)
         if not followed or next_url == final_url:
             break
         final_url = next_url
-        if use_zyte:
-            html, final_url, status_code, _ = _fetch_with_zyte(final_url, proxies, verify,
-                                                                force_browser=force_zyte_browser)
-        elif use_browser:
+        if use_browser:
             html, final_url, status_code = _fetch_with_browser(final_url, proxies, verify)
         else:
-            resp = _requests_get_with_retry(final_url, proxies, verify, REQUEST_TIMEOUT, _HEADERS)
-            resp.raise_for_status()
-            html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
+            html, final_url, status_code, _ = _fetch_with_escalation(
+                final_url, proxies, verify, start_with_zyte=use_zyte, force_zyte_browser=force_zyte_browser,
+                want_links=want_links, allow_escalation=allow_escalation)
     return html, final_url, status_code
 
 
@@ -794,13 +965,17 @@ def _looks_encoding_corrupted(text: str, threshold: float = 0.2) -> bool:
 
 # ─── 記事本文抽出（RSS・HTML共通） ────────────────────────────────
 def extract_article(url: str, proxies: dict, verify: bool, use_browser: bool = False,
-                     use_zyte: bool = False) -> dict:
+                     use_zyte: bool = False, tier: str = None) -> dict:
     """記事URLから本文・タイトル・公開日を抽出する。PDF/.docxは専用抽出、
     それ以外はtrafilaturaでHTMLから抽出する。取得結果のタイトル・本文が
     文字化けして見える場合、ENCODING_CORRUPTION_MAX_RETRIES回まで再取得を試みる
-    （プロキシ瞬断による破損を、リトライで正常な応答に置き換えるため）"""
+    （プロキシ瞬断による破損を、リトライで正常な応答に置き換えるため）。
+
+    tier: Noneなら従来通りuse_browser/use_zyteに従う。"zyte"/"tinyfish_fetch"/
+    "tinyfish_agent"を指定すると、その手段だけを1回試す(main()のPass2用、
+    _extract_article_once()参照)"""
     for attempt in range(ENCODING_CORRUPTION_MAX_RETRIES + 1):
-        result = _extract_article_once(url, proxies, verify, use_browser, use_zyte=use_zyte)
+        result = _extract_article_once(url, proxies, verify, use_browser, use_zyte=use_zyte, tier=tier)
         if not result.get("ok"):
             return result
         if not (_looks_encoding_corrupted(result.get("title", "")) or
@@ -813,14 +988,32 @@ def extract_article(url: str, proxies: dict, verify: bool, use_browser: bool = F
 
 
 def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bool = False,
-                           use_zyte: bool = False) -> dict:
+                           use_zyte: bool = False, tier: str = None) -> dict:
+    """tierを指定すると、use_browser/use_zyteによらずその手段を1回だけ試す
+    （tier: "zyte" / "tinyfish_fetch" / "tinyfish_agent"）。tier未指定(None)なら
+    従来通りuse_browser/use_zyteに従って1回だけ取得する。
+
+    2026-10-13変更: 以前はこの関数内でZyte→TinyFish Fetch→Agentの順に自動で
+    エスカレーションしていたが、1target内に失敗記事が複数あると、それぞれが
+    独立してこのチェーンを最後まで通してしまい、1targetの処理に1時間以上
+    かかって他targetの処理を圧迫する問題が見つかった(2026-10-09〜12の本番実測)。
+    そのため、エスカレーション(段階的な再試行)は呼び出し元(main()のPass2、
+    escalate_pending()参照)で、全target分の失敗をまとめてから行う方式に変更し、
+    この関数自体は「指定された1手段だけを試す」単純な形に戻した。"""
     doc_kind = _detect_document_kind(url)
     if doc_kind:
         use_browser = False  # 文書ファイルはブラウザ経由で扱わない（PDFビューア化を避ける）
         use_zyte = False     # 文書ファイルはZyte経由でも扱わない（httpResponseBodyで代用可能だが未検証のため通常取得を使う）
+        tier = None
 
     try:
-        if use_zyte:
+        if tier == "tinyfish_fetch":
+            html, final_url, status_code = _call_tinyfish_fetch(url, proxies, verify, want_links=False)
+            content_type, raw_content = "", None
+        elif tier == "tinyfish_agent":
+            html, final_url, status_code = _call_tinyfish_agent(url, proxies, verify)
+            content_type, raw_content = "", None
+        elif tier == "zyte" or use_zyte:
             html, final_url, status_code, raw_content = _fetch_with_zyte(url, proxies, verify)
             content_type = ""
         elif use_browser:
@@ -832,7 +1025,8 @@ def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bo
             html, final_url, status_code = _decoded_html(resp), resp.url, resp.status_code
             content_type, raw_content = resp.headers.get("Content-Type", ""), resp.content
     except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}", "http_status": None}
+        status_code = e.response.status_code if isinstance(e, requests.exceptions.HTTPError) and e.response is not None else None
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "http_status": status_code}
 
     if not doc_kind:
         doc_kind = _detect_document_kind(final_url, content_type)
@@ -886,7 +1080,7 @@ def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bo
 
 
 # ─── RSS ────────────────────────────────────────────────────────
-def list_rss_candidates(target: dict, proxies: dict, verify: bool) -> list:
+def list_rss_candidates(target: dict, proxies: dict, verify: bool, allow_escalation: bool = True) -> list:
     """RSSフィードから候補記事(URL・仮タイトル・公開日)を一覧する。
 
     2026-09-14: extract_article()側の文字化けリトライ（プロキシ瞬断対策）は
@@ -895,9 +1089,14 @@ def list_rss_candidates(target: dict, proxies: dict, verify: bool) -> list:
     `extracted["title"] or cand.get("title")`）では文字化けチェックが
     一切行われていなかった。実際に厚労省・防衛省RSS由来の記事で
     「repair_mojibakeでも復元不能な文字化けタイトル」が継続的に発生していたのは
-    これが原因だったため、同じ考え方でRSSフィード取得自体をリトライする"""
+    これが原因だったため、同じ考え方でRSSフィード取得自体をリトライする。
+
+    allow_escalation=Falseは_list_rss_candidates_once()へそのまま伝播し、
+    RSS取得失敗時のZyteへの自動フォールバックを行わない
+    (2026-10-14追加、process_target()のPass1から呼ぶ場合用)"""
     for attempt in range(ENCODING_CORRUPTION_MAX_RETRIES + 1):
-        candidates, status_code = _list_rss_candidates_once(target, proxies, verify)
+        candidates, status_code = _list_rss_candidates_once(target, proxies, verify,
+                                                              allow_escalation=allow_escalation)
         if not any(_looks_encoding_corrupted(c["title"]) for c in candidates):
             return candidates, status_code
         if attempt < ENCODING_CORRUPTION_MAX_RETRIES:
@@ -905,16 +1104,19 @@ def list_rss_candidates(target: dict, proxies: dict, verify: bool) -> list:
     return candidates, status_code  # 全リトライ後もダメならそのまま返す(呼び出し元でextracted["title"]優先により救済される場合がある)
 
 
-def _list_rss_candidates_once(target: dict, proxies: dict, verify: bool) -> list:
+def _list_rss_candidates_once(target: dict, proxies: dict, verify: bool, allow_escalation: bool = True) -> list:
     """RSS取得。素のHTTPがBot対策等で失敗した場合はZyte経由に自動フォールバックする
     (2026-09-17、unwater.org/stand.earth等で確認: 素のrequestsは403でも、Zyteの
-    HTTPモード経由なら普通に取得できるケースがあった)"""
+    HTTPモード経由なら普通に取得できるケースがあった)。
+    allow_escalation=Falseの場合はこのZyteフォールバックを行わず、例外をそのまま送出する"""
     try:
         resp = requests.get(target["target_url"], proxies=proxies, verify=verify,
                              timeout=REQUEST_TIMEOUT, headers=_HEADERS)
         resp.raise_for_status()
         content, final_url, status_code = resp.content, resp.url, resp.status_code
     except requests.exceptions.RequestException:
+        if not allow_escalation:
+            raise
         html, final_url, status_code, raw = _fetch_with_zyte(target["target_url"], proxies, verify)
         content = raw if raw else html.encode("utf-8", errors="ignore")
     feed = feedparser.parse(content)
@@ -1010,9 +1212,12 @@ def _target_max_links(target: dict) -> int:
 
 
 def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser: bool = False,
-                          use_zyte: bool = False) -> list:
+                          use_zyte: bool = False, allow_escalation: bool = True) -> list:
     """HTML一覧ページから候補記事リンクを抽出する（<a>を汎用的に収集し、
-    include_paths/exclude_paths・ドメイン一致で絞り込む）"""
+    include_paths/exclude_paths・ドメイン一致で絞り込む）。
+    allow_escalation=Falseは_fetch_page()経由で_fetch_with_escalation()へ伝播し、
+    一覧取得失敗時のZyte/TinyFishへの自動フォールバックを行わない
+    (2026-10-14追加、process_target()のPass1から呼ぶ場合用)"""
     url = target["target_url"]
     domain = target.get("domain") or urlparse(url).netloc
     include_paths = [p.strip() for p in (target.get("include_paths") or "").split(",") if p.strip()]
@@ -1024,7 +1229,8 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
     # 後から描画されるため長めの待機付きBrowser Renderingが必須なサイト向け)
     force_zyte_browser = (target.get("search_conditions") == "force_zyte_browser")
     html, final_url, status_code = _fetch_page(url, proxies, verify, use_browser, use_zyte=use_zyte,
-                                                force_zyte_browser=force_zyte_browser)
+                                                force_zyte_browser=force_zyte_browser, want_links=True,
+                                                allow_escalation=allow_escalation)
     max_links = _target_max_links(target)
 
     tree = _safe_lxml_parse(html)
@@ -1292,14 +1498,18 @@ def save_article(client: SupabaseClient, target: dict, article_url: str, fetched
 def save_crawl_log(client: SupabaseClient, target: dict, started_at, finished_at,
                     run_result: str, http_status, items_detected: int,
                     new_items: int, updated_items: int, extraction_failures: int, error_message,
-                    notes: str = None):
+                    notes: str = None, crawl_log_id: str = None) -> str:
+    """crawl_logsへ1行保存する。戻り値は保存した行のcrawl_log_id
+    (2026-10-13追加: Pass2(escalate_pending)が後からこの行を更新できるように、
+    呼び出し元へ返すようにした。crawl_log_id未指定ならここで新規採番する)"""
+    crawl_log_id = crawl_log_id or str(uuid.uuid4())
     # LinkedIn等、bot対策として非標準のHTTPステータス(例:999)を返すサイトがあり、
     # crawl_logs.http_statusのCHECK制約(100〜599)に違反してINSERT自体が失敗し
     # クロールログが1件も残らない不具合があったため、範囲外の値はNULLとして保存する
     if not (isinstance(http_status, int) and 100 <= http_status <= 599):
         http_status = None
     client.insert("crawl_logs", [{
-        "crawl_log_id": str(uuid.uuid4()),
+        "crawl_log_id": crawl_log_id,
         "crawl_target_id": target["crawl_target_id"],
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
@@ -1313,23 +1523,93 @@ def save_crawl_log(client: SupabaseClient, target: dict, started_at, finished_at
         "crawler_version": "article_crawler.py v1",
         "notes": notes,
     }], prefer="return=minimal")
+    return crawl_log_id
+
+
+def _compute_run_result(error_message, extraction_failures: int, new_items: int, updated_items: int) -> str:
+    """run_result判定ロジック(process_target()の既存ルールをそのまま関数化。
+    Pass2でのcrawl_logs再計算にも使い回す)"""
+    if error_message:
+        return "失敗"
+    if extraction_failures > 0 and (new_items or updated_items):
+        return "一部成功"
+    if new_items or updated_items:
+        return "成功"
+    if extraction_failures > 0:
+        return "抽出失敗"
+    return "更新なし"
+
+
+def update_crawl_log_after_escalation(client: SupabaseClient, crawl_log_id: str, *,
+                                       recovered_items_detected: int = 0, recovered_new_items: int = 0,
+                                       recovered_updated_items: int = 0, final_failures: int = 0,
+                                       bot_block_detections: int = 0) -> None:
+    """2026-10-13追加: Pass2(escalate_pending)でのエスカレーション結果を、
+    Pass1で既に保存済みのcrawl_logs行へ反映する。救済できた分は
+    items_detected/new_items/updated_itemsへ加算し、最後まで失敗した分は
+    extraction_failuresへ加算した上で、run_resultを再計算する。
+
+    bot_block_detectionsは「Pass2の全段階を経ても結局Bot対策で失敗したまま」
+    だった件数。notesへ反映し、既存のdowngrade_bot_blocked_targets()
+    (直近3回連続Bot対策検知でcrawl_methodを自動降格する仕組み)が
+    Pass1・Pass2のどちらで検知されたかによらず正しく動作するようにする"""
+    rows = client.select("crawl_logs", {"select": "*", "crawl_log_id": f"eq.{crawl_log_id}", "limit": "1"})
+    if not rows:
+        return
+    row = rows[0]
+    new_items = (row.get("new_items") or 0) + recovered_new_items
+    updated_items = (row.get("updated_items") or 0) + recovered_updated_items
+    items_detected = (row.get("items_detected") or 0) + recovered_items_detected
+    extraction_failures = (row.get("extraction_failures") or 0) + final_failures
+    run_result = _compute_run_result(row.get("error_message"), extraction_failures, new_items, updated_items)
+    patch = {
+        "items_detected": items_detected,
+        "new_items": new_items,
+        "updated_items": updated_items,
+        "extraction_failures": extraction_failures,
+        "run_result": run_result,
+    }
+    if bot_block_detections:
+        patch["notes"] = f"Bot対策検知{bot_block_detections}件"
+    client.update("crawl_logs", {"crawl_log_id": f"eq.{crawl_log_id}"}, patch)
+
+
+def _update_crawl_log_full(client: SupabaseClient, crawl_log_id: str, finished_at, run_result: str,
+                            http_status, items_detected: int, new_items: int, updated_items: int,
+                            extraction_failures: int, error_message, notes: str = None) -> None:
+    """2026-10-14追加: Pass1で一覧取得自体の失敗により暫定行(件数0)として保存したcrawl_logsを、
+    Pass2での一覧取得リトライ(escalate_pending_listings()、フルエスカレーション許可)の結果で
+    まるごと上書きする。update_crawl_log_after_escalation()は記事単位の加算更新用で、
+    こちらは一覧取得からやり直した場合の全置換用"""
+    if not (isinstance(http_status, int) and 100 <= http_status <= 599):
+        http_status = None
+    client.update("crawl_logs", {"crawl_log_id": f"eq.{crawl_log_id}"}, {
+        "finished_at": finished_at.isoformat(),
+        "run_result": run_result,
+        "http_status": http_status,
+        "items_detected": items_detected,
+        "new_items": new_items,
+        "updated_items": updated_items,
+        "extraction_failures": extraction_failures,
+        "error_message": error_message,
+        "notes": notes,
+    })
 
 
 # ─── 1クロール先の処理 ───────────────────────────────────────────
-def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: bool) -> dict:
+def _list_candidates_for_target(target: dict, proxies: dict, verify: bool, allow_escalation: bool = True):
+    """process_target()から一覧取得部分だけを切り出したもの。
+    (candidates, http_status, single_page_mode, error_message, is_404, use_browser, use_zyte)を返す。
+
+    allow_escalation=Falseの場合、一覧取得自体が失敗した時にZyte/TinyFishへ
+    エスカレーションせず、その場で諦める(Pass1用。2026-10-14追加: 以前はこの一覧取得が
+    list_html_candidates/list_rss_candidates経由で常にフルエスカレーションしており、
+    bot対策サイトの一覧取得待ちがPass1内で同期的に発生し他targetの処理を圧迫していた。
+    HTML方式で+32%、RSS方式で+13%の1targetあたり処理時間増加として実測された)。
+    明確な404はエスカレーション不要のためis_404=Trueで区別して返す
+    （process_target()側で「即座に失敗確定」と「Pass2での一覧取得リトライへ回送」を分けるため）"""
     method = target["crawl_method"]
     endpoint_type = target.get("endpoint_type") or ""
-    lookback = target.get("lookback_days") or DEFAULT_LOOKBACK_DAYS
-    started_at = datetime.now(timezone.utc)
-
-    error_message = None
-    http_status = None
-    candidates = []
-    # 単一ページ監視型（サイトトップ等）はリンク収集をせず、URL自体を1件として扱う。
-    # 他の記事と同じくlookback_daysでフィルタする
-    # （日付が抽出できない場合はNoneとして扱われ、_within_lookbackにより除外される）。
-    single_page_mode = False
-
     # 'ブラウザ操作'はHTMLと同じ収集ロジックをPlaywright経由で行う（bot対策サイト向け）
     # 'Zyte'も同様にHTMLと同じ収集ロジックをZyte API経由で行う（Playwright不採用のBot対策サイト向け、2026-09-16）
     use_browser = (method == "ブラウザ操作")
@@ -1338,9 +1618,19 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
     # Zyte経由で行う（use_zyteをZyteと同様にTrueにする）
     use_zyte = method in ("Zyte", "JSON API")
 
+    error_message = None
+    is_404 = False
+    http_status = None
+    candidates = []
+    # 単一ページ監視型（サイトトップ等）はリンク収集をせず、URL自体を1件として扱う。
+    # 他の記事と同じくlookback_daysでフィルタする
+    # （日付が抽出できない場合はNoneとして扱われ、_within_lookbackにより除外される）。
+    single_page_mode = False
+
     try:
         if method == "RSS":
-            candidates, http_status = list_rss_candidates(target, proxies, verify)
+            candidates, http_status = list_rss_candidates(target, proxies, verify,
+                                                            allow_escalation=allow_escalation)
         elif method == "JSON API":
             candidates, http_status = list_json_api_candidates(target, proxies, verify, use_zyte=True)
         elif method in ("HTML", "ブラウザ操作", "Zyte"):
@@ -1348,21 +1638,79 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
                 candidates, http_status = list_sitemap_candidates(target, proxies, verify)
             elif endpoint_type in LISTING_ENDPOINT_TYPES:
                 candidates, http_status = list_html_candidates(target, proxies, verify, use_browser=use_browser,
-                                                                 use_zyte=use_zyte)
+                                                                 use_zyte=use_zyte,
+                                                                 allow_escalation=allow_escalation)
             else:
                 # SINGLE_PAGE_ENDPOINT_TYPES、および未知のendpoint_typeは安全側で単一ページ扱い
                 single_page_mode = True
                 candidates = [{"url": target["target_url"], "title": None, "published_at": None}]
         else:
             raise ValueError(f"未対応のcrawl_method: {method}")
+    except requests.exceptions.HTTPError as e:
+        error_message = f"{type(e).__name__}: {e}"
+        if e.response is not None and e.response.status_code == 404:
+            is_404 = True
     except Exception as e:
         error_message = f"{type(e).__name__}: {e}"
 
+    return candidates, http_status, single_page_mode, error_message, is_404, use_browser, use_zyte
+
+
+def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: bool) -> dict:
+    """2026-10-13変更: 記事本文取得(extract_article)は「対象targetの通常の手段を
+    1回だけ試す」(tier未指定)形に変更し、失敗した候補(明確な404を除く)は
+    即座に抽出失敗扱いにせずpending_escalationsへ積んで呼び出し元(main())へ返す。
+    main()は全target分のpending_escalationsをまとめた上でescalate_pending()を呼び、
+    Zyte→TinyFish Fetch→TinyFish Agentの順で段階的に再試行する(1targetに失敗記事が
+    集中して他targetの処理を圧迫する問題への対応、2026-10-09〜12の本番実測で発見)。
+
+    2026-10-14変更: 一覧取得(list_html_candidates/list_rss_candidates)もPass1では
+    エスカレーションなしの1回だけに留め、(明確な404を除き)失敗した場合はtarget全体を
+    pending_listing_escalationとして返す。main()はPass2でescalate_pending_listings()を
+    呼び、一覧取得からフルエスカレーション許可でやり直す(一覧取得だけが従来通り
+    Pass1内で同期的にフルエスカレーションしてしまっていた問題への対応)"""
+    lookback = target.get("lookback_days") or DEFAULT_LOOKBACK_DAYS
+    started_at = datetime.now(timezone.utc)
+    crawl_log_id = str(uuid.uuid4())
+
+    candidates, http_status, single_page_mode, error_message, is_404, use_browser, use_zyte = \
+        _list_candidates_for_target(target, proxies, verify, allow_escalation=False)
+
+    if error_message is not None and not is_404:
+        finished_at = datetime.now(timezone.utc)
+        save_crawl_log(client, target, started_at, finished_at, "更新なし", None,
+                        0, 0, 0, 0, None, crawl_log_id=crawl_log_id)
+        return {
+            "run_result": "更新なし",
+            "items_detected": 0, "new_items": 0, "updated_items": 0,
+            "extraction_failures": 0, "error_message": None, "bot_block_detections": 0,
+            "crawl_log_id": crawl_log_id, "pending_escalations": [],
+            "pending_listing_escalation": {
+                "target": target, "crawl_log_id": crawl_log_id, "lookback": lookback,
+                "started_at": started_at,
+            },
+        }
+
+    return _process_target_articles(
+        target, client, proxies, verify, candidates, http_status, single_page_mode,
+        error_message, use_browser, use_zyte, lookback, crawl_log_id, started_at,
+    )
+
+
+def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict, verify: bool,
+                              candidates: list, http_status, single_page_mode: bool, error_message,
+                              use_browser: bool, use_zyte: bool, lookback: int, crawl_log_id: str,
+                              started_at, *, is_recovery: bool = False) -> dict:
+    """process_target()から一覧取得より後ろ(記事単位の抽出・保存・crawl_logs書き込み)を
+    切り出したもの。is_recovery=Trueの場合、Pass1で既にcrawl_logsへ暫定行(件数0)を
+    INSERT済みであることを前提に、その行をUPDATEで上書きする
+    (escalate_pending_listings()から一覧取得リトライ成功後に呼ばれる場合用、2026-10-14追加)"""
     items_detected = 0
     new_items = 0
     updated_items = 0
     extraction_failures = 0
     bot_block_detections = 0
+    pending_escalations = []
 
     if error_message is None:
         extracted_pairs = []
@@ -1374,9 +1722,17 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
                 http_status = extracted.get("http_status")
 
             if not extracted["ok"]:
-                extraction_failures += 1
-                if (extracted.get("error") or "").startswith("Bot対策"):
-                    bot_block_detections += 1
+                # 明確な404(ページが存在しない)だけはこの場で抽出失敗として確定する。
+                # それ以外(Bot対策・タイムアウト・接続エラー等)はPass2(escalate_pending)で
+                # まとめて再試行するため、ここではまだ失敗として数えない
+                if extracted.get("http_status") == 404:
+                    extraction_failures += 1
+                    continue
+                is_bot_block = (extracted.get("error") or "").startswith("Bot対策")
+                pending_escalations.append({
+                    "target": target, "cand": cand, "crawl_log_id": crawl_log_id,
+                    "lookback": lookback, "is_bot_block": is_bot_block,
+                })
                 continue
 
             # 2026-09-02にextract_article()側へ追加されたリトライ機構が、全リトライ後も
@@ -1450,24 +1806,17 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
                 updated_items += 0 if is_new_url else 1
 
     finished_at = datetime.now(timezone.utc)
-
-    if error_message:
-        run_result = "失敗"
-    elif extraction_failures > 0 and (new_items or updated_items):
-        run_result = "一部成功"
-    elif new_items or updated_items:
-        run_result = "成功"
-    elif extraction_failures > 0:
-        # 候補は見つかったが全件で本文抽出に失敗した状態。「純粋に新着が無かった」
-        # (更新なし)とは区別する（サイレントな抽出失敗を見逃さないため）
-        run_result = "抽出失敗"
-    else:
-        run_result = "更新なし"
+    run_result = _compute_run_result(error_message, extraction_failures, new_items, updated_items)
 
     crawl_notes = f"Bot対策検知{bot_block_detections}件" if bot_block_detections else None
-    save_crawl_log(client, target, started_at, finished_at, run_result, http_status,
-                    items_detected, new_items, updated_items, extraction_failures, error_message,
-                    notes=crawl_notes)
+    if is_recovery:
+        _update_crawl_log_full(client, crawl_log_id, finished_at, run_result, http_status,
+                                items_detected, new_items, updated_items, extraction_failures,
+                                error_message, notes=crawl_notes)
+    else:
+        save_crawl_log(client, target, started_at, finished_at, run_result, http_status,
+                        items_detected, new_items, updated_items, extraction_failures, error_message,
+                        notes=crawl_notes, crawl_log_id=crawl_log_id)
 
     return {
         "run_result": run_result,
@@ -1477,7 +1826,196 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
         "extraction_failures": extraction_failures,
         "error_message": error_message,
         "bot_block_detections": bot_block_detections,
+        "crawl_log_id": crawl_log_id,
+        "pending_escalations": pending_escalations,
     }
+
+
+def _apply_recovered_candidate(client: SupabaseClient, target: dict, cand: dict, extracted: dict,
+                                lookback: int):
+    """Pass2(escalate_pending)で再取得に成功した候補へ、process_target()後半と同じ
+    lookbackフィルタ・サイト名誤抽出除外・保存(save_article)を適用する。
+    戻り値: 保存した場合は(is_new_url, is_new_version)、対象外として破棄した場合はNone。
+
+    process_target()の該当ロジックと異なり、同一target内の複数候補にまたがる
+    テンプレート日付誤抽出の検知(suspect_dates)は行わない(Pass2は候補を
+    targetをまたいで1件ずつ独立に処理するため、兄弟候補の情報を参照できない。
+    発生頻度の低いエッジケースのため、この簡略化は許容する)"""
+    pub_dt = cand.get("published_at") or extracted.get("published_at")
+    if not _within_lookback(pub_dt, lookback):
+        return None
+
+    title = extracted.get("title") or cand.get("title") or ""
+    site_name_variants = {
+        (target.get("publisher_name") or "").strip().lower(),
+        (target.get("target_name") or "").strip().lower(),
+    }
+    site_name_variants.discard("")
+    if title.strip().lower() in site_name_variants:
+        return None
+
+    final_url = extracted.get("final_url") or cand["url"]
+    canonical_url = extracted.get("canonical_url") or normalize_url(final_url)
+    document_info = extracted if extracted.get("is_document") else None
+    return save_article(
+        client, target, canonical_url, cand["url"], final_url,
+        title, pub_dt, extracted.get("updated_at"), extracted["text"],
+        document_info=document_info,
+    )
+
+
+# ─── Pass2: 全target分の失敗候補をまとめて段階的に再試行する ─────────────
+# 2026-10-13追加。通常クロール(Pass1)で失敗した候補(明確な404を除く)を全target分
+# まとめてから、TinyFish Fetch→Zyte→TinyFish Agentの順に段階的に再試行する。
+# 1target内に失敗記事が集中していても、Pass1は全targetについて「通常クロールを
+# 1回試す」だけで完了するため、他targetの処理が遅延・圧迫されない
+# (2026-10-09〜12の本番実測で、1記事ずつ最後までチェーンさせる旧方式は
+# 1targetの処理に最大87分かかり、1日の処理件数が507件→233件まで減っていた)。
+ESCALATION_TIERS = ("tinyfish_fetch", "zyte", "tinyfish_agent")
+
+
+CACHE_DIR = Path(__file__).parent / "cache"
+ESCALATION_FUNNEL_LOG_DIR = CACHE_DIR / "crawl_escalation_funnel"
+
+
+def _write_escalation_funnel_log(started_at: datetime, total_pending: int, stage_stats: list,
+                                  recovered_count: int, final_failed: int, bot_block_final: int) -> str:
+    """2026-10-14追加: 各段階(TinyFish Fetch/Zyte/Agent)で何件投入し、何件が抽出成功
+    (extraction_ok)・何件を次段へ持ち越したか(carried_over)をファイルへ残す。
+    DBスキーマ変更はせず、cache/配下にJSON1ファイル/実行として書き出すだけ
+    (run_daily.py等の既存キャッシュファイルと同じ置き場所の慣習に合わせる)。
+    戻り値は書き出したファイルパス(文字列)"""
+    ESCALATION_FUNNEL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = ESCALATION_FUNNEL_LOG_DIR / f"{started_at.strftime('%Y%m%dT%H%M%S')}.json"
+    payload = {
+        "started_at": started_at.isoformat(),
+        "total_pending": total_pending,
+        "stages": stage_stats,
+        "recovered": recovered_count,
+        "final_failed": final_failed,
+        "bot_block_final_failed": bot_block_final,
+        "tinyfish_agent_calls_this_run": _tinyfish_agent_call_count,
+        "tinyfish_agent_run_cap": TINYFISH_AGENT_RUN_CAP,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
+def escalate_pending(pending: list, client: SupabaseClient, proxies: dict, verify: bool) -> dict:
+    """pendingは process_target() が返した pending_escalations を全target分まとめたもの。
+    各段階(TinyFish Fetch/Zyte/Agent)の投入数・抽出成功数・次段への持ち越し数を
+    cache/crawl_escalation_funnel/配下へJSONログとして残す(2026-10-14追加。
+    本番実行時のファネル内訳がprint()の標準出力しか残らず、後から追えなかったため)。
+
+    戻り値: {"recovered": 件数, "final_failed": 件数, "funnel_log_path": 書き出したファイルパス}"""
+    started_at = datetime.now(timezone.utc)
+    total_pending = len(pending)
+    remaining = pending
+    recovered_count = 0
+    stage_stats = []
+    for tier in ESCALATION_TIERS:
+        if not remaining:
+            break
+        attempted = len(remaining)
+        print(f"\n[Pass2: {tier}] 対象{attempted}件を再試行します")
+        still_failed = []
+        extraction_ok = 0
+        recovered_by_log = defaultdict(lambda: {"items_detected": 0, "new_items": 0, "updated_items": 0})
+        for item in remaining:
+            if tier == "tinyfish_agent" and not _tinyfish_agent_budget_available():
+                still_failed.append(item)
+                continue
+            extracted = extract_article(item["cand"]["url"], proxies, verify, tier=tier)
+            if tier == "tinyfish_agent":
+                _record_tinyfish_agent_call()
+            time.sleep(ARTICLE_FETCH_SLEEP)
+            if not extracted.get("ok") or extracted.get("encoding_suspect"):
+                still_failed.append(item)
+                continue
+            extraction_ok += 1
+            applied = _apply_recovered_candidate(client, item["target"], item["cand"], extracted,
+                                                  item["lookback"])
+            if applied is None:
+                continue  # lookback対象外・サイト名誤抽出のため対象外(失敗としては数えない)
+            is_new_url, is_new_version = applied
+            agg = recovered_by_log[item["crawl_log_id"]]
+            agg["items_detected"] += 1
+            if is_new_version:
+                if is_new_url:
+                    agg["new_items"] += 1
+                else:
+                    agg["updated_items"] += 1
+            recovered_count += 1
+        for crawl_log_id, agg in recovered_by_log.items():
+            update_crawl_log_after_escalation(
+                client, crawl_log_id, recovered_items_detected=agg["items_detected"],
+                recovered_new_items=agg["new_items"], recovered_updated_items=agg["updated_items"])
+        stage_stats.append({
+            "tier": tier, "attempted": attempted, "extraction_ok": extraction_ok,
+            "carried_over": len(still_failed),
+        })
+        remaining = still_failed
+
+    # 全段階を経ても失敗したままの候補は、ここで初めて抽出失敗として確定する
+    final_failed_by_log = defaultdict(int)
+    bot_block_by_log = defaultdict(int)
+    for item in remaining:
+        final_failed_by_log[item["crawl_log_id"]] += 1
+        if item.get("is_bot_block"):
+            bot_block_by_log[item["crawl_log_id"]] += 1
+    for crawl_log_id, fail_count in final_failed_by_log.items():
+        update_crawl_log_after_escalation(client, crawl_log_id, final_failures=fail_count,
+                                           bot_block_detections=bot_block_by_log.get(crawl_log_id, 0))
+
+    bot_block_final = sum(bot_block_by_log.values())
+    funnel_log_path = _write_escalation_funnel_log(
+        started_at, total_pending, stage_stats, recovered_count, len(remaining), bot_block_final)
+
+    print(f"\nPass2完了: 救済{recovered_count}件 / 最終的に失敗{len(remaining)}件"
+          f"(うちBot対策検知{bot_block_final}件)")
+    print(f"ファネルログ: {funnel_log_path}")
+    return {"recovered": recovered_count, "final_failed": len(remaining), "funnel_log_path": funnel_log_path}
+
+
+def escalate_pending_listings(pending_listings: list, client: SupabaseClient, proxies: dict, verify: bool) -> list:
+    """2026-10-14追加: Pass1で一覧取得自体が(明確な404を除き)失敗したtargetについて、
+    一覧取得をフルエスカレーション許可(allow_escalation=True)で再試行する。
+    取得できた候補はそのまま通常の記事抽出パス(_process_target_articles、tier未指定の
+    1回試行)に流し、そこで新たに判明した記事単位の失敗は呼び出し元(main())が
+    既存のescalate_pending()(TinyFish Fetch→Zyte→TinyFish Agent)へまとめて渡せるよう、
+    pending_escalationsのリストとして返す（一覧取得の救済と記事取得の救済を
+    同じ3段エスカレーションの土俵に合流させる）。
+
+    一覧取得がこの再試行でも失敗した場合は、Pass1で保存した暫定crawl_logs行を
+    「失敗」で確定させる"""
+    if not pending_listings:
+        return []
+    print(f"\n[Pass2: 一覧取得リトライ] 対象{len(pending_listings)}件を再試行します")
+    merged_pending_escalations = []
+    recovered = 0
+    still_failed = 0
+    for item in pending_listings:
+        target = item["target"]
+        crawl_log_id = item["crawl_log_id"]
+        lookback = item["lookback"]
+        started_at = item["started_at"]
+        candidates, http_status, single_page_mode, error_message, is_404, use_browser, use_zyte = \
+            _list_candidates_for_target(target, proxies, verify, allow_escalation=True)
+        if error_message is not None and not is_404:
+            _update_crawl_log_full(client, crawl_log_id, datetime.now(timezone.utc), "失敗", None,
+                                    0, 0, 0, 0, error_message)
+            still_failed += 1
+            continue
+        result = _process_target_articles(
+            target, client, proxies, verify, candidates, http_status, single_page_mode,
+            error_message, use_browser, use_zyte, lookback, crawl_log_id, started_at,
+            is_recovery=True,
+        )
+        merged_pending_escalations.extend(result.get("pending_escalations") or [])
+        recovered += 1
+    print(f"[Pass2: 一覧取得リトライ] 完了: 一覧取得成功{recovered}件 / 一覧取得も失敗{still_failed}件"
+          f"（記事単位の再試行要求{len(merged_pending_escalations)}件は通常のPass2へ合流）")
+    return merged_pending_escalations
 
 
 # ─── Bot対策検知によるクロール先の自動降格 ───────────────────────────
@@ -1531,6 +2069,8 @@ def main(limit: int = None, methods=SUPPORTED_METHODS):
 
     print(f"クロール対象: {len(targets)}件（{'/'.join(methods)}）")
     totals = {"成功": 0, "一部成功": 0, "失敗": 0, "更新なし": 0, "抽出失敗": 0}
+    pending_escalations = []
+    pending_listing_escalations = []
     try:
         for i, target in enumerate(targets, 1):
             name = (target.get("target_name") or "")[:30]
@@ -1541,15 +2081,29 @@ def main(limit: int = None, methods=SUPPORTED_METHODS):
                 print(f"予期しないエラー: {type(e).__name__}: {e}")
                 continue
             totals[summary["run_result"]] = totals.get(summary["run_result"], 0) + 1
+            pending_escalations.extend(summary.get("pending_escalations") or [])
+            if summary.get("pending_listing_escalation"):
+                pending_listing_escalations.append(summary["pending_listing_escalation"])
             print(f"{summary['run_result']}"
                   f"（検出{summary['items_detected']}件 新規{summary['new_items']}件"
-                  f" 更新{summary['updated_items']}件 抽出失敗{summary['extraction_failures']}件）")
+                  f" 更新{summary['updated_items']}件 抽出失敗{summary['extraction_failures']}件"
+                  f" 要再試行{len(summary.get('pending_escalations') or [])}件"
+                  f"{'・一覧取得は再試行へ回送' if summary.get('pending_listing_escalation') else ''}）")
     finally:
         close_browser()
 
     print("─" * 40)
-    print("集計:", totals)
+    print("Pass1(通常クロール)集計:", totals, "※Pass2での救済分は未反映の暫定値")
 
+    if pending_listing_escalations:
+        pending_escalations.extend(
+            escalate_pending_listings(pending_listing_escalations, client, proxies, verify))
+
+    if pending_escalations:
+        print(f"\nPass2開始: 全target分の要再試行{len(pending_escalations)}件をまとめて処理します")
+        escalate_pending(pending_escalations, client, proxies, verify)
+
+    print("─" * 40)
     downgrade_bot_blocked_targets(client, targets)
 
 

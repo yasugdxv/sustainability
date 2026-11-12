@@ -21,6 +21,13 @@
                                                                       # 減らす（バッチのJSON検証が最終的に
                                                                       # 失敗した場合のみ、そのバッチだけ
                                                                       # 1件ずつの呼び出しにフォールバックする）
+    python sustainability_article_selector.py --dry-run --include-backlog
+                                                                      # 未評価Backlogの件数・今回のバッチ・見積りだけ
+                                                                      # 表示（DB書き込み・LLM呼び出しなし）
+    python sustainability_article_selector.py --status               # selectorの状態を表示（読み取りのみ）
+    python sustainability_article_selector.py --include-backlog --backlog-limit 10 --confirm-backlog
+                                                                      # Recent＋Backlog最大10件を実際に評価
+詳細は docs/selector_operational_recovery.md を参照。
 """
 import argparse
 import sys
@@ -610,11 +617,55 @@ def main():
                          help="1回のLLM呼び出しにまとめて評価させるクラスタ数（既定1=1件ずつ、従来通り）。"
                               "バッチのJSON検証が最終的に失敗した場合は、そのバッチだけ1件ずつの呼び出しに"
                               "フォールバックする")
+    # ─── Selector Operational Recovery（selector_recovery.py参照）。指定しない限り従来の動作のまま ───
+    parser.add_argument("--include-backlog", action="store_true",
+                         help="Recent（既存のTier0選定）に加えて、成功評価を一度も持たないTier0適格クラスタ（Backlog）を"
+                              "上限付きで処理する。実行にはBacklogの見積り確認後に--confirm-backlogが必要")
+    parser.add_argument("--recent-limit", type=int, default=None, help="Recentの1回あたり上限（既定はselector_recovery.DEFAULTS）")
+    parser.add_argument("--backlog-limit", type=int, default=None, help="Backlogの1回あたり上限（既定はselector_recovery.DEFAULTS）")
+    parser.add_argument("--dry-run", action="store_true",
+                         help="対象クラスタ・Backlog件数・見積りだけを表示して終了する（DB書き込み・LLM呼び出しなし）")
+    parser.add_argument("--status", action="store_true",
+                         help="selectorの状態（最終成功日時・Backlog・失敗）を表示して終了する（読み取りのみ）")
+    parser.add_argument("--confirm-backlog", action="store_true",
+                         help="--include-backlogの実LLM実行を許可する（件数・見積りを確認した上で指定する）")
     args = parser.parse_args()
     if args.top_n_per_theme and (args.since_days or args.article_ids):
         parser.error("--top-n-per-theme は --since-days / --article-ids と併用できません")
+    recovery_mode = args.include_backlog or args.dry_run or args.status
+    if recovery_mode and (args.since_days or args.article_ids):
+        parser.error("--include-backlog / --dry-run / --status は --since-days / --article-ids と併用できません")
 
     config = load_config()
+    recovery = None
+    if recovery_mode:
+        import selector_recovery as recovery
+        recovery_cfg = recovery.get_config(config)
+        if args.recent_limit is not None:
+            recovery_cfg["recent_limit"] = args.recent_limit
+        if args.backlog_limit is not None:
+            recovery_cfg["backlog_limit"] = args.backlog_limit
+        if args.top_n_per_theme:
+            recovery_cfg["recent_top_n_per_theme"] = args.top_n_per_theme
+        recovery_cfg["recent_since_days"] = args.top_n_since_days
+
+        if args.dry_run or args.status:
+            # 読み取り専用クライアントで実行する（書き込みメソッドを持たないため、DB書き込みは構造的に起きない）。
+            # Azure OpenAIクライアントも作らない（LLM呼び出しなし）
+            ro_client = recovery.ReadOnlyClient(SupabaseClient(config))
+            urls = common.fetch_all_article_urls(ro_client)
+            plan = recovery.plan_run(ro_client, urls, recovery_cfg, include_backlog=args.include_backlog,
+                                     limit=args.limit)
+            if args.status:
+                import json
+                print(json.dumps(recovery.get_selector_status(ro_client, recovery_cfg, plan=plan),
+                                 ensure_ascii=False, indent=1))
+            if args.dry_run:
+                print(recovery.format_plan(plan, recovery.estimate(plan, args.batch_size)))
+                for label, ids in (("Recentバッチ", plan["recent_batch"]), ("Backlogバッチ", plan["backlog_batch"])):
+                    print(f"{label}（先頭20件）: {ids[:20]}")
+            return
+
     if not common.is_enabled(config):
         print("SUSTAINABILITY_EXPERT_ENABLED が無効です（config.jsonのsustainability_expert.enabled、"
               "または環境変数で有効化してください）。処理を行わず終了します。")
@@ -631,7 +682,22 @@ def main():
     knowledge_store = get_knowledge_store(config)
 
     all_urls = common.fetch_all_article_urls(client)
-    if args.top_n_per_theme:
+    plan = None
+    if args.include_backlog:
+        plan = recovery.plan_run(client, all_urls, recovery_cfg, include_backlog=True, limit=args.limit)
+        est = recovery.estimate(plan, args.batch_size)
+        print(recovery.format_plan(plan, est))
+        if plan["funnel"]["submitted_backlog"] and not args.confirm_backlog:
+            print("Backlogを実際にLLMで評価するには、上記の件数・見積りを確認した上で --confirm-backlog を付けて再実行してください。"
+                  "（確認前のため、何も実行せずに終了します）")
+            return
+        if not recovery.acquire_lock(recovery_cfg["lock_max_age_hours"]):
+            print("selector_recovery.lock が存在します（別の実行中、または異常終了の疑い）。多重実行防止のため終了します。")
+            return
+        import atexit
+        atexit.register(recovery.release_lock)
+        cluster_ids = plan["queue"]
+    elif args.top_n_per_theme:
         top_n_since_days = args.top_n_since_days if args.top_n_since_days else None
         cluster_ids = list_theme_prioritized_cluster_ids(client, all_urls, top_n=args.top_n_per_theme,
                                                            since_days=top_n_since_days)
@@ -675,6 +741,8 @@ def main():
 
     print("─" * 40)
     print("集計:", counts)
+    if plan is not None:
+        print("Funnel記録:", recovery.write_run_log(plan, counts))
 
 
 if __name__ == "__main__":

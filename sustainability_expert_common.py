@@ -389,7 +389,8 @@ def fetch_articles_with_tags(client, since_days: int, ranks: tuple = None) -> li
     cutoff_iso = cutoff.isoformat()
 
     params = {
-        "select": "analysis_id,article_id,summary_short,importance_level,importance_reason,"
+        "select": "analysis_id,article_id,summary_short,display_title,summary_detail,"
+                  "importance_level,importance_reason,"
                   "importance_total_score,importance_scores,needs_review,"
                   "publication_category,analysis_status",
         "is_current": "eq.true",

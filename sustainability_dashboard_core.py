@@ -7,8 +7,10 @@ _removed_20260827/ へ退避済み。
 """
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 from article_crawler import SupabaseClient, _detect_nav_menu_only
 import sustainability_chat_geo_service as chat_geo
@@ -93,7 +95,8 @@ def fetch_dashboard_articles(config: dict, since_days: int) -> list:
     client = get_client(config)
     articles = common.fetch_articles_with_tags(client, since_days, ranks=None)
     for a in articles:
-        for field in ("title", "extracted_text", "summary_short", "importance_reason"):
+        for field in ("title", "extracted_text", "summary_short", "importance_reason",
+                      "display_title", "summary_detail"):
             if a.get(field):
                 a[field] = repair_mojibake(a[field])
         if a.get("title") and _looks_garbled(a["title"]):
@@ -109,8 +112,13 @@ def fetch_dashboard_articles(config: dict, since_days: int) -> list:
             # そのナビメニューを元にLLMが生成した誤った内容のため表示しない
             a["summary_short"] = ""
             a["importance_reason"] = ""
+            a["display_title"] = ""
+            a["summary_detail"] = ""
         if a.get("summary_short") and _looks_garbled(a["summary_short"]):
             a["summary_short"] = ""
+        for f in ("display_title", "summary_detail"):
+            if a.get(f) and _looks_garbled(a[f]):
+                a[f] = ""
         if a.get("importance_reason") and _looks_garbled(a["importance_reason"]):
             a["importance_reason"] = ""
     return articles
@@ -350,16 +358,56 @@ def init_translation_cache(config: dict) -> int:
     （_short_cache/_body_cache）を温める。api_server.py起動時に1回呼ぶ想定。
     以後の書き込み（_translate_short/translate_body）もこのテーブルへ反映する。
     戻り値は読み込んだ件数（起動ログ確認用）"""
-    global _translation_db_client
+    global _translation_db_client, _translation_refreshed_at
     client = get_client(config)
     _translation_db_client = client
+    started = time.time()
     rows = client.select("translation_cache", {"select": "namespace,target_lang,article_id,text"})
+    _load_translation_rows(rows)
+    _translation_refreshed_at = started
+    return len(rows)
+
+
+def _load_translation_rows(rows: list) -> None:
     for r in rows:
         key = (r["target_lang"], r["article_id"]) if r["namespace"] == "body" else \
             (r["namespace"], r["target_lang"], r["article_id"])
         cache = _body_cache if r["namespace"] == "body" else _short_cache
         cache[key] = r["text"]
-    return len(rows)
+
+
+_translation_refreshed_at: float = 0.0
+_TRANSLATION_REFRESH_INTERVAL_SEC = 120
+_translation_refresh_lock = threading.Lock()
+
+
+def refresh_translation_cache() -> int:
+    """translation_cacheの更新分だけを差分で読み込み、プロセスメモリキャッシュへ反映する。
+    日次バッチ(translate_prefetch.py)は別プロセスでDBへ書き込むため、起動済みの
+    api_server.pyのメモリには反映されない（起動時1回しか読まないため）。それを補うために
+    API呼び出しの合間にここを呼ぶ。間隔(120秒)内の再呼び出しや、他スレッドが更新中の
+    場合は何もしない（リクエストを待たせない）。戻り値は反映した件数"""
+    global _translation_refreshed_at
+    if _translation_db_client is None:
+        return 0
+    if time.time() - _translation_refreshed_at < _TRANSLATION_REFRESH_INTERVAL_SEC:
+        return 0
+    if not _translation_refresh_lock.acquire(blocking=False):
+        return 0
+    try:
+        started = time.time()
+        # 時計ずれ・書き込み途中の取りこぼし防止のため、前回開始時刻の60秒前から読み直す
+        since = datetime.fromtimestamp(_translation_refreshed_at - 60, tz=timezone.utc).isoformat()
+        rows = _translation_db_client.select("translation_cache", {
+            "select": "namespace,target_lang,article_id,text", "updated_at": f"gte.{since}",
+        })
+        _load_translation_rows(rows)
+        _translation_refreshed_at = started
+        return len(rows)
+    except Exception:
+        return 0  # 失敗しても表示自体は既存キャッシュで続行する
+    finally:
+        _translation_refresh_lock.release()
 
 
 def _persist_translation(namespace: str, target_lang: str, article_id: str, text: str) -> None:
@@ -425,7 +473,7 @@ def get_short_translation_nonblocking(namespace: str, article_id: str, text: str
 
 
 def _translate_short(azure_client, model: str, namespace: str, article_id: str,
-                      text: str, target_lang: str) -> str:
+                      text: str, target_lang: str, multiline: bool = False) -> str:
     key = (namespace, target_lang, article_id)
     if key in _short_cache:
         return _short_cache[key]
@@ -433,13 +481,15 @@ def _translate_short(azure_client, model: str, namespace: str, article_id: str,
         _short_cache[key] = text
         return text
     lang_name = _LANG_NAME.get(target_lang, "日本語")
+    # 詳細要約は段落構成(改行)を保ったまま訳す。タイトル・一覧要約は1行
+    output_rule = ("原文の段落構成（改行）を保ち、翻訳結果のみを出力してください。" if multiline
+                   else "翻訳結果のみを1行で出力してください。")
     try:
         resp = azure_client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": f"あなたは翻訳者です。次のテキストを自然な{lang_name}に"
-                                               f"翻訳してください。前置きや説明を付けず、翻訳結果のみを"
-                                               f"1行で出力してください。"},
+                                               f"翻訳してください。前置きや説明を付けず、{output_rule}"},
                 {"role": "user", "content": text},
             ],
         )
@@ -447,7 +497,10 @@ def _translate_short(azure_client, model: str, namespace: str, article_id: str,
         if _looks_garbled(result):
             result = text
     except Exception:
-        result = text
+        # LLM呼び出しの失敗(レート制限・ネットワーク断等)は一時的なものなので、原文を
+        # キャッシュ/DBへ保存しない（保存すると以後ずっと未翻訳のまま固定されてしまう）。
+        # 今回の表示は原文で返し、次回アクセス・次回バッチで再試行させる（2026-10-19）
+        return text
     _short_cache[key] = result
     try:
         _persist_translation(namespace, target_lang, article_id, result)
@@ -499,6 +552,14 @@ def translate_summary(azure_client, model: str, article_id: str, summary: str, t
     return _translate_short(azure_client, model, "summary", article_id, summary, target_lang)
 
 
+def translate_display_title(azure_client, model: str, article_id: str, title: str, target_lang: str = "ja") -> str:
+    return _translate_short(azure_client, model, "display_title", article_id, title, target_lang)
+
+
+def translate_summary_detail(azure_client, model: str, article_id: str, text: str, target_lang: str = "ja") -> str:
+    return _translate_short(azure_client, model, "summary_detail", article_id, text, target_lang, multiline=True)
+
+
 def translate_body(azure_client, model: str, article_id: str, text: str, target_lang: str = "ja") -> str:
     key = (target_lang, article_id)
     if key in _body_cache:
@@ -508,6 +569,8 @@ def translate_body(azure_client, model: str, article_id: str, text: str, target_
         return text
     lang_name = _LANG_NAME.get(target_lang, "日本語")
     chunks = split_text(text, TRANSLATE_CHUNK_SIZE)
+
+    failed = []  # 1チャンクでもLLM呼び出しに失敗したら、全体をキャッシュしない（一時失敗の固定化防止）
 
     def _translate_chunk(chunk: str) -> str:
         try:
@@ -524,6 +587,7 @@ def translate_body(azure_client, model: str, article_id: str, text: str, target_
             piece = (resp.choices[0].message.content or "").strip() or chunk
             return chunk if _looks_garbled(piece) else piece
         except Exception:
+            failed.append(True)
             return chunk
 
     # チャンクを逐次翻訳すると長い記事ほど所要時間が線形に増え、
@@ -532,6 +596,8 @@ def translate_body(azure_client, model: str, article_id: str, text: str, target_
     with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as pool:
         translated = list(pool.map(_translate_chunk, chunks))
     result = "\n\n".join(translated)
+    if failed:
+        return result  # 一部が原文のまま。保存せず、次回アクセス・次回バッチで再試行させる
     _body_cache[key] = result
     try:
         _persist_translation("body", target_lang, article_id, result)

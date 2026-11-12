@@ -88,6 +88,11 @@ function ArticleDetail() {
             <h1 className="text-editorial text-5xl mt-4 leading-[1.05]">
               {article.title}
             </h1>
+            {article.originalTitle && article.originalTitle !== article.title && (
+              <p className="mt-3 text-xs text-muted-foreground">
+                {t("article.originalTitle")}: {article.originalTitle}
+              </p>
+            )}
 
             <div className="flex items-center gap-4 mt-5 pb-6 border-b border-border text-sm">
               <div className="flex items-center gap-2">
@@ -120,6 +125,21 @@ function ArticleDetail() {
               <p className="text-sm mt-2 leading-relaxed text-foreground">
                 {article.summary}
               </p>
+              {(article.detailSummary ?? []).length > 0 && (
+                <div className="mt-4 pt-4 border-t border-border/70">
+                  <div className="text-muted-foreground uppercase tracking-wider text-[10px] mb-2">
+                    {t("article.detailSummary")}
+                  </div>
+                  <div className="space-y-3 text-sm leading-relaxed text-foreground">
+                    {(article.detailSummary ?? []).map((p: string, i: number) => (
+                      <p key={i}>{p}</p>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {article.bodyShort && (
+                <p className="mt-3 text-xs text-muted-foreground">{t("article.bodyShortNotice")}</p>
+              )}
               <div className="mt-4 grid grid-cols-2 gap-3 text-xs">
                 {article.sector && (
                   <div>
@@ -181,19 +201,20 @@ function ArticleDetail() {
               )}
             </section>
 
-            <div className="prose prose-sm max-w-none mt-8 space-y-5 text-[15px] leading-[1.8] text-foreground/90">
-              {(article.body ?? []).map((p: string, i: number) => (
-                <p
-                  key={i}
-                  className="first:first-letter:text-editorial first:first-letter:text-5xl first:first-letter:float-left first:first-letter:mr-2 first:first-letter:leading-none first:first-letter:mt-1"
-                >
-                  {p}
-                </p>
-              ))}
-              {(!article.body || article.body.length === 0) && (
-                <p className="text-muted-foreground">{t("article.noBody")}</p>
-              )}
-            </div>
+            {/* 詳細要約がある記事は本文を折りたたむ（無い既存記事は従来どおり開いた状態） */}
+            <details open={(article.detailSummary ?? []).length === 0} className="mt-8 group">
+              <summary className="cursor-pointer text-xs text-primary hover:underline select-none">
+                {t("article.bodyToggle")}
+              </summary>
+              <div className="prose prose-sm max-w-none mt-4 space-y-5 text-[15px] leading-[1.8] text-foreground/90">
+                {(article.body ?? []).map((p: string, i: number) => (
+                  <p key={i}>{p}</p>
+                ))}
+                {(!article.body || article.body.length === 0) && (
+                  <p className="text-muted-foreground">{t("article.noBody")}</p>
+                )}
+              </div>
+            </details>
 
             {/* Actions bar */}
             <div className="mt-10 pt-6 border-t border-border flex items-center gap-2">

@@ -49,3 +49,9 @@ neural_analysis/data/
 
 # Zyte API PoC: 取得結果(HTML/CSV/サマリー)は生成物のため除外。zyte_test.py/targets.txt/READMEは管理対象
 scripts/zyte_poc/results/
+selector_recovery*.lock
+
+# 設定ファイルの控え（秘密情報を含むためコミット禁止）
+config.json_*
+# エージェントの作業用コピー
+.claude/worktrees/
