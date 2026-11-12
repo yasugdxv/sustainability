@@ -29,7 +29,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-import sustainability_expert_common as common
+from supabase_client import _select_in_chunks
 from article_crawler import SupabaseClient, load_config
 
 # 既に手動対応済み（＝自動クロール対象外と分かっている）ものはアラート対象から除外
@@ -61,7 +61,7 @@ def main():
     long_cutoff = (now - timedelta(days=args.long_window_days)).isoformat()
     recent_cutoff = (now - timedelta(days=args.lookback_days)).isoformat()
 
-    logs = common._select_in_chunks(client, "crawl_logs", {
+    logs = _select_in_chunks(client, "crawl_logs", {
         "select": "crawl_target_id,started_at,items_detected",
         "started_at": f"gte.{long_cutoff}",
     }, "crawl_target_id", target_ids)

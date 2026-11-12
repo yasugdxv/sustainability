@@ -341,31 +341,9 @@ def shared_cache_clear_all() -> None:
         pass
 
 
-def _select_in_chunks(client, table: str, base_params: dict, id_field: str, ids: list,
-                       chunk_size: int = 100, max_workers: int = 8) -> list:
-    """idsを1つの巨大な in.(id1,id2,...) にまとめると、件数が多い場合にURLが長くなりすぎて
-    PostgRESTが400 Bad Requestを返すことがある（実際に記事数が700件を超えて発生した）ため、
-    chunk_size件ずつに分割してクエリし、結果を連結する。
-
-    2026-09-14: chunkを順次(逐次)実行していたため、chunk数が多い呼び出し
-    （例: /api/competitors/changes、after_record_id 2842件→29chunk）で
-    社内プロキシ経由のラウンドトリップが積み上がり15秒超のタイムアウトが発生していた。
-    各chunkは独立した読み取りクエリで結果の集約順序に依存しないため、
-    ThreadPoolExecutorで並列実行する（実測: 29chunkで約12秒→約2秒に短縮）。"""
-    chunks = [ids[i:i + chunk_size] for i in range(0, len(ids), chunk_size)]
-    if not chunks:
-        return []
-    if len(chunks) == 1:
-        return client.select(table, {**base_params, id_field: f"in.({','.join(chunks[0])})"})
-    rows = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(client.select, table, {**base_params, id_field: f"in.({','.join(c)})"})
-            for c in chunks
-        ]
-        for future in futures:
-            rows.extend(future.result())
-    return rows
+# _select_in_chunks は収集基盤の共通部品として supabase_client.py へ移動した。
+# 既存の common._select_in_chunks が動くよう、ここから再公開する
+from supabase_client import _select_in_chunks  # noqa: E402,F401
 
 
 def fetch_articles_with_tags(client, since_days: int, ranks: tuple = None) -> list:
