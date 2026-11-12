@@ -9,19 +9,22 @@
 実行順序（各ステップは独立したサブプロセスとして実行し、1ステップが失敗/タイムアウト
 しても後続ステップは継続する。article_crawler.pyのprocess_target()が既に1ソース単位で
 同じ方針を取っているため、パイプライン全体でもこれを踏襲する）:
+    【共通クロール部分（collection/steps.py。単独実行は run_collection.py）】
     1. article_crawler.py                  通常クロール（RSS/HTML/ブラウザ操作）
     2. reference_list_monitor.py           参照リスト差分検知（UN_SC/OFAC_SDN/eCFR/UK制裁）
     3. api_article_crawler.py              規制系記事API（Federal Register/openFDA/UK FSA/
                                             EU Safety Gate/RASFF）
-    4. check_filter_keyword_coverage.py    フィルタ語彙のtag_referenceカバレッジ検証
+    4. crawl_health_check.py               クロール結果の健全性チェック
+    【サステナ独自の処理】
+    5. check_filter_keyword_coverage.py    フィルタ語彙のtag_referenceカバレッジ検証
                                             （holesがあればステップ失敗として通知。
                                             記事は既にスタブ保存方式のため記事は失われない）
-    5. article_analyzer.py                 LLMタグ付け・重要度判定（全件対象、並列5）
-    6. competitor_crawler.py               競合サイトクロール
-    7. sustainability_article_selector.py  記事選定（テーマ別上位N件をLLM判定、expert_runsへ記録。
+    6. article_analyzer.py                 LLMタグ付け・重要度判定（全件対象、並列5）
+    7. competitor_crawler.py               競合サイトクロール
+    8. sustainability_article_selector.py  記事選定（テーマ別上位N件をLLM判定、expert_runsへ記録。
                                             週次メールのlist_weekly_picks()が参照する判定結果を
                                             日次で最新化しておく）
-    8. warm_dashboard_cache.py              記事一覧ダッシュボードの共有キャッシュを先回りして温める
+    9. warm_dashboard_cache.py              記事一覧ダッシュボードの共有キャッシュを先回りして温める
                                             （api_server.pyのユーザーリクエストが重いDB再取得を
                                             踏まないようにするため）
 
@@ -45,6 +48,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from collection import pipeline
+from collection.steps import COLLECTION_STEPS
+
 BASE = Path(__file__).parent
 # 現在このスクリプトを実行しているPythonインタプリタをそのまま子プロセスにも使う
 # （Windows開発環境の.venvとAzure App Service(Linux)のantenvでパス構造が異なるため、
@@ -59,12 +65,12 @@ LOCK_PATH = BASE / f"run_daily_{_lock_suffix}.lock"
 MAX_LOCK_AGE_HOURS = 6  # これを超えて残っているロックは前回異常終了とみなし上書きする
 
 # (ステップ名, コマンド引数, タイムアウト秒)
-STEPS = [
-    ("crawl", ["article_crawler.py"], 21600),
-    ("reference_list", ["reference_list_monitor.py"], 900),
-    ("api_articles", ["api_article_crawler.py"], 900),
+# 共通クロール部分（クロール・参照リスト・API記事・ヘルスチェック）の工程は collection/steps.py に
+# 置き、ここではそれを先頭に並べる。ステップ名と --skip-<ステップ名> は従来どおり。
+# （従来は filter_coverage_check がヘルスチェックの前にあったが、両者は独立した検査のため、
+#  共通の工程をまとめて先に実行する並びに変えた。他の順序は変わらない）
+SUSTAINABILITY_STEPS = [
     ("filter_coverage_check", ["check_filter_keyword_coverage.py"], 300),
-    ("crawl_health_check", ["crawl_health_check.py"], 300),
     ("analyze", ["article_analyzer.py", "9999", "5"], 5400),
     # 分析済み記事のタイトル・要約・本文を先回り翻訳(日↔英両方向)してtranslation_cacheへ保存。
     # ユーザーの初回アクセスが翻訳待ち/原文表示にならないようにする(2026-10-19)
@@ -76,57 +82,19 @@ STEPS = [
     # ユーザーの最初のアクセスが重いDB再取得を踏まずに済む(2026-09-29)
     ("warm_dashboard_cache", ["warm_dashboard_cache.py"], 300),
 ]
+STEPS = [*COLLECTION_STEPS, *SUSTAINABILITY_STEPS]
 
 
 def acquire_lock() -> bool:
-    if LOCK_PATH.exists():
-        age_hours = (time.time() - LOCK_PATH.stat().st_mtime) / 3600
-        if age_hours < MAX_LOCK_AGE_HOURS:
-            print(f"ロックファイルが{age_hours:.1f}時間前から存在します。多重実行防止のため終了します"
-                  f"（{LOCK_PATH}）。前回の実行が異常終了した場合は手動で削除してください。")
-            return False
-        print(f"ロックファイルは{age_hours:.1f}時間前のものです（{MAX_LOCK_AGE_HOURS}時間超）。"
-              "前回実行が異常終了したとみなし上書きします。")
-    LOCK_PATH.write_text(f"pid={os.getpid()} started_at={datetime.now(timezone.utc).isoformat()}")
-    return True
+    return pipeline.acquire_lock(LOCK_PATH, MAX_LOCK_AGE_HOURS)
 
 
 def release_lock():
-    try:
-        LOCK_PATH.unlink()
-    except FileNotFoundError:
-        pass
+    pipeline.release_lock(LOCK_PATH)
 
 
 def run_step(name: str, args: list, timeout_sec: int) -> dict:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = LOG_DIR / f"{ts}_{name}.log"
-    cmd = [str(PYTHON), *args]
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-
-    print(f"[{name}] 開始: {' '.join(args)}", flush=True)
-    started = time.monotonic()
-    try:
-        with open(log_path, "w", encoding="utf-8") as f:
-            result = subprocess.run(cmd, cwd=BASE, stdout=f, stderr=subprocess.STDOUT,
-                                     timeout=timeout_sec, env=env)
-        elapsed = time.monotonic() - started
-        ok = result.returncode == 0
-        print(f"[{name}] {'完了' if ok else '失敗'}（{elapsed:.0f}秒、returncode={result.returncode}） "
-              f"ログ: {log_path}")
-        error = None if ok else f"returncode={result.returncode}"
-        return {"name": name, "ok": ok, "elapsed_sec": elapsed, "log_path": str(log_path), "error": error}
-    except subprocess.TimeoutExpired:
-        elapsed = time.monotonic() - started
-        error = f"タイムアウト（{timeout_sec}秒）"
-        print(f"[{name}] {error} ログ: {log_path}")
-        return {"name": name, "ok": False, "elapsed_sec": elapsed, "log_path": str(log_path), "error": error}
-    except Exception as e:
-        elapsed = time.monotonic() - started
-        error = f"{type(e).__name__}: {e}"
-        print(f"[{name}] 予期しないエラー: {error}")
-        return {"name": name, "ok": False, "elapsed_sec": elapsed, "log_path": str(log_path), "error": error}
+    return pipeline.run_step(name, args, timeout_sec, base=BASE, python=PYTHON, log_dir=LOG_DIR)
 
 
 def notify_failures(results: list) -> None:

@@ -52,7 +52,10 @@ def test_common_modules_do_not_import_sustainability_specific_modules():
 def test_root_entry_points_return_the_same_module_object():
     """ルートの入口は、実体と同じモジュールを返す（テストの差し替え・非公開関数の参照が従来どおり動く）。"""
     import importlib
-    for m in cb.COMMON_MODULES:
+    # 従来から import されていた5つ。steps / pipeline は新設のため、ルートの入口は無い
+    legacy = ["supabase_client", "article_crawler", "api_article_crawler", "reference_list_monitor", "crawl_health_check"]
+    for m in legacy:
+        assert m in cb.COMMON_MODULES and (ROOT / f"{m}.py").is_file()
         assert importlib.import_module(m) is importlib.import_module(f"collection.{m}")
 
 
