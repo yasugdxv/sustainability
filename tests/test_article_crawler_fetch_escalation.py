@@ -1,5 +1,6 @@
 """article_crawler.py のBot対策フォールバックチェーン
-（通常取得 → Zyte → TinyFish Fetch → TinyFish Agent）のテスト。
+（通常取得 → TinyFish Fetch → Zyte → TinyFish Agent。2026-11-13に、Zyteが有料のため、
+TinyFish Fetchを先にする順へ変更。PDF/.docxとstart_with_zyteはZyte先）のテスト。
 
 2026-10-09追加: Zyte/TinyFish PoCでの検証結果(52件のbot対策失敗targetに対し
 チェーンさせると100%解決、うちAgentが必要だったのは1件のみ)を踏まえ、
@@ -88,29 +89,13 @@ def test_404_does_not_escalate(monkeypatch):
     tf_fetch_mock.assert_not_called()
 
 
-# ─── 通常取得が403等(404以外)で失敗 → Zyteへエスカレーション ──────────────
-def test_non_404_failure_escalates_to_zyte(monkeypatch):
+# ─── 通常取得が403等(404以外)で失敗 → まずTinyFish Fetchへエスカレーション
+#     (2026-11-13: Zyteは有料のため、TinyFish Fetchを先にする) ──────────────
+def test_non_404_failure_escalates_to_tinyfish_fetch_first(monkeypatch):
     monkeypatch.setattr(ac, "_requests_get_with_retry",
                          lambda *a, **k: (_ for _ in ()).throw(_http_error(403)))
-    monkeypatch.setattr(ac, "_fetch_with_zyte",
-                         lambda *a, **k: ("<html>zyte</html>", "https://example.com/final", 200, b"raw"))
-    tf_fetch_mock = MagicMock(side_effect=AssertionError("Zyte成功時はTinyFishは呼ばれないはず"))
-    monkeypatch.setattr(ac, "_call_tinyfish_fetch", tf_fetch_mock)
-
-    html, final_url, status_code, raw_content = ac._fetch_with_escalation(
-        "https://example.com/", {}, True)
-
-    assert html == "<html>zyte</html>"
-    assert raw_content == b"raw"
-    tf_fetch_mock.assert_not_called()
-
-
-# ─── 通常取得・Zyte両方失敗 → TinyFish Fetchへエスカレーション ────────────
-def test_zyte_failure_escalates_to_tinyfish_fetch(monkeypatch):
-    monkeypatch.setattr(ac, "_requests_get_with_retry",
-                         lambda *a, **k: (_ for _ in ()).throw(_http_error(403)))
-    monkeypatch.setattr(ac, "_fetch_with_zyte",
-                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("Zyte失敗")))
+    zyte_mock = MagicMock(side_effect=AssertionError("TinyFish Fetch成功時はZyteは呼ばれないはず"))
+    monkeypatch.setattr(ac, "_fetch_with_zyte", zyte_mock)
     monkeypatch.setattr(ac, "_call_tinyfish_fetch",
                          lambda *a, **k: ("<html>tinyfish</html>", "https://example.com/final", 200))
 
@@ -119,6 +104,39 @@ def test_zyte_failure_escalates_to_tinyfish_fetch(monkeypatch):
 
     assert html == "<html>tinyfish</html>"
     assert raw_content is None
+    zyte_mock.assert_not_called()
+
+
+# ─── 通常取得・TinyFish Fetch両方失敗 → Zyteへエスカレーション ────────────
+def test_tinyfish_fetch_failure_escalates_to_zyte(monkeypatch):
+    monkeypatch.setattr(ac, "_requests_get_with_retry",
+                         lambda *a, **k: (_ for _ in ()).throw(_http_error(403)))
+    monkeypatch.setattr(ac, "_call_tinyfish_fetch",
+                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("TinyFish Fetch失敗")))
+    monkeypatch.setattr(ac, "_fetch_with_zyte",
+                         lambda *a, **k: ("<html>zyte</html>", "https://example.com/final", 200, b"raw"))
+
+    html, final_url, status_code, raw_content = ac._fetch_with_escalation(
+        "https://example.com/", {}, True)
+
+    assert html == "<html>zyte</html>"
+    assert raw_content == b"raw"
+
+
+# ─── PDF/.docxは、Zyteのraw_contentでしか中身を取れないため、Zyteを先に試す ──
+def test_document_url_tries_zyte_before_tinyfish_fetch(monkeypatch):
+    monkeypatch.setattr(ac, "_requests_get_with_retry",
+                         lambda *a, **k: (_ for _ in ()).throw(_http_error(403)))
+    monkeypatch.setattr(ac, "_fetch_with_zyte",
+                         lambda *a, **k: ("", "https://example.com/doc.pdf", 200, b"%PDF-raw"))
+    tf_fetch_mock = MagicMock(side_effect=AssertionError("PDFはZyte成功時にTinyFishは呼ばれないはず"))
+    monkeypatch.setattr(ac, "_call_tinyfish_fetch", tf_fetch_mock)
+
+    html, final_url, status_code, raw_content = ac._fetch_with_escalation(
+        "https://example.com/doc.pdf", {}, True)
+
+    assert raw_content == b"%PDF-raw"
+    tf_fetch_mock.assert_not_called()
 
 
 # ─── 全段階失敗・allow_tinyfish_agent=False → Agentは呼ばれず例外を送出 ────
@@ -132,7 +150,7 @@ def test_all_fail_without_agent_raises(monkeypatch):
     agent_mock = MagicMock(side_effect=AssertionError("allow_tinyfish_agent=FalseならAgentは呼ばれないはず"))
     monkeypatch.setattr(ac, "_call_tinyfish_agent", agent_mock)
 
-    with pytest.raises(RuntimeError, match="TinyFish Fetch失敗"):
+    with pytest.raises(RuntimeError, match="Zyte失敗"):       # 最後に試すのはZyteのため、その例外が出る
         ac._fetch_with_escalation("https://example.com/", {}, True, allow_tinyfish_agent=False)
 
     agent_mock.assert_not_called()
@@ -169,7 +187,7 @@ def test_agent_budget_exhausted_does_not_call_agent(monkeypatch):
     agent_mock = MagicMock(side_effect=AssertionError("上限到達後はAgentは呼ばれないはず"))
     monkeypatch.setattr(ac, "_call_tinyfish_agent", agent_mock)
 
-    with pytest.raises(RuntimeError, match="TinyFish Fetch失敗"):
+    with pytest.raises(RuntimeError, match="Zyte失敗"):       # 最後に試すのはZyteのため、その例外が出る
         ac._fetch_with_escalation("https://example.com/", {}, True, allow_tinyfish_agent=True)
 
     agent_mock.assert_not_called()

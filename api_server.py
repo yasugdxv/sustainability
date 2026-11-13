@@ -1214,8 +1214,8 @@ def weekly_report_build(body: WeeklyBuildBody):
         raise HTTPException(status_code=409, detail=f"ドラフト生成が実行中です（job_id={running}）")
     cmd = [sys.executable, "weekly_email_report.py", "build"]
     if body.sinceDays is not None:
-        if not 1 <= body.sinceDays <= 31:
-            raise HTTPException(status_code=400, detail="sinceDaysは1〜31で指定してください")
+        if not 1 <= body.sinceDays <= 90:
+            raise HTTPException(status_code=400, detail="sinceDaysは1〜90で指定してください")
         cmd += ["--since-days", str(body.sinceDays)]
     if body.forceGeoRerun:
         cmd.append("--force-geo-rerun")

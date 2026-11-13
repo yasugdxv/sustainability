@@ -1091,8 +1091,10 @@ def _call_tinyfish_agent(url: str, proxies: dict, verify: bool, goal: str = None
 def _fetch_with_escalation(url: str, proxies: dict, verify: bool, *, start_with_zyte: bool = False,
                             force_zyte_browser: bool = False, want_links: bool = False,
                             allow_tinyfish_agent: bool = False, allow_escalation: bool = True):
-    """通常HTTP取得を軸に、失敗時は Zyte → TinyFish Fetch → (allow_tinyfish_agent時のみ)
-    TinyFish Agent の順に自動でエスカレーションする。(html, final_url, status_code, raw_content)を返す
+    """通常HTTP取得を軸に、失敗時は TinyFish Fetch → Zyte → (allow_tinyfish_agent時のみ)
+    TinyFish Agent の順に自動でエスカレーションする(Zyteは有料のため後。2026-11-13に、従来の
+    Zyte→TinyFish Fetchの順から変更。start_with_zyte=TrueやPDF/.docxは、従来どおりZyteが先)。
+    (html, final_url, status_code, raw_content)を返す
     （raw_contentはZyteのHTTPモードで取得できた場合のみ値が入る、それ以外はNone）。
 
     明確な404(ページが存在しない)はエスカレーションしない。コストのかかる手段を
@@ -1127,19 +1129,28 @@ def _fetch_with_escalation(url: str, proxies: dict, verify: bool, *, start_with_
     elif not allow_escalation:
         return _fetch_with_zyte(url, proxies, verify, force_browser=force_zyte_browser)
 
-    if ZYTE_ENABLED:  # 停止中は、失敗が確定している呼び出しで時間を使わずTinyFishへ進む
-        try:
-            html, final_url, status_code, raw_content = _fetch_with_zyte(url, proxies, verify,
-                                                                          force_browser=force_zyte_browser)
-            return html, final_url, status_code, raw_content
-        except Exception as e:
-            last_exc = e
+    # 失敗時の順番(2026-11-13変更): TinyFish Fetch → Zyte(有効時のみ) → (allow_tinyfish_agent時のみ)TinyFish Agent。
+    # Zyteは従量課金のため、先にTinyFish Fetchを試す(Pass2の段階 ESCALATION_TIERS の既定順と揃えた)。
+    # 例外として、次の場合はZyteを先に試す:
+    #   ・start_with_zyte=True(Zyteから始める指定の対象)
+    #   ・PDF/.docx(Zyteのraw_contentでしか文書の中身を取れない。TinyFishは本文テキストのみでraw_contentが無い)
+    # Zyte停止中(ZYTE_ENABLED=False)は、失敗が確定している呼び出しで時間を使わず、Zyteの段を飛ばす
+    def _step_zyte():
+        return _fetch_with_zyte(url, proxies, verify, force_browser=force_zyte_browser)
 
-    try:
+    def _step_tinyfish_fetch():
         html, final_url, status_code = _call_tinyfish_fetch(url, proxies, verify, want_links=want_links)
         return html, final_url, status_code, None
-    except Exception as e:
-        last_exc = e
+
+    steps = [_step_tinyfish_fetch]
+    if ZYTE_ENABLED:
+        zyte_first = start_with_zyte or bool(_detect_document_kind(url))
+        steps = [_step_zyte, _step_tinyfish_fetch] if zyte_first else [_step_tinyfish_fetch, _step_zyte]
+    for step in steps:
+        try:
+            return step()
+        except Exception as e:
+            last_exc = e
 
     if allow_tinyfish_agent and _tinyfish_agent_budget_available():
         html, final_url, status_code = _call_tinyfish_agent(url, proxies, verify)

@@ -17,7 +17,7 @@ parameters:
   - name: serviceConnection
     displayName: Azure サービス接続の名前（Project settings → Service connections の名前と完全に一致させる）
     type: string
-    default: 'susintelli'
+    default: 'sc-azure-susiq'
   - name: withFrontend
     displayName: 画面（静的ビルド）もバックに含める（1サーバー構成）
     type: boolean

@@ -24,7 +24,8 @@ def test_source_url_cell_with_many_urls_is_split():
 
 
 def test_read_neural_xlsx(tmp_path):
-    import openpyxl
+    # openpyxlは手動の週次チェック用で、Azureの本番には入れない。無い環境ではこのテストを飛ばす
+    openpyxl = pytest.importorskip("openpyxl")
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.append([None] * 9)

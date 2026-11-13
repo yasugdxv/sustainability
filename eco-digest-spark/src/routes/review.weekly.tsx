@@ -115,7 +115,6 @@ function BuildPanel({ canRun, onDone }: { canRun: boolean; onDone: (reportId: st
   const { data } = useLatestBuildJob();
   const start = useStartBuild();
   const [sinceDays, setSinceDays] = useState("7");
-  const [force, setForce] = useState(false);
   const job = data?.job ?? null;
   const running = job?.state === "running" || start.isPending;
 
@@ -128,9 +127,9 @@ function BuildPanel({ canRun, onDone }: { canRun: boolean; onDone: (reportId: st
 
   const run = () => {
     const n = Number(sinceDays);
-    if (!Number.isInteger(n) || n < 1 || n > 31) return;
+    if (!Number.isInteger(n) || n < 1 || n > 90) return;
     if (!window.confirm(`直近${n}日分で週次ドラフトを生成します（LLMを呼び出すため数分かかります。メールは送信されません）。よろしいですか？`)) return;
-    start.mutate({ sinceDays: n, forceGeoRerun: force });
+    start.mutate({ sinceDays: n }); // Geo Intelligence連携は停止中のため、強制再実行は指定しない
   };
 
   return (
@@ -139,11 +138,7 @@ function BuildPanel({ canRun, onDone }: { canRun: boolean; onDone: (reportId: st
         <h2 className="font-semibold">ドラフト生成</h2>
         <label className="text-sm text-muted-foreground flex items-center gap-2">
           対象期間（日）
-          <Input type="number" min={1} max={31} value={sinceDays} onChange={(e) => setSinceDays(e.target.value)} className="w-20" />
-        </label>
-        <label className="text-sm text-muted-foreground flex items-center gap-2">
-          <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
-          Geo Intelligenceを強制再実行
+          <Input type="number" min={1} max={90} value={sinceDays} onChange={(e) => setSinceDays(e.target.value)} className="w-20" />
         </label>
         <Button disabled={!canRun || running} onClick={run}>{running ? "生成中…" : "ドラフトを生成"}</Button>
         <span className="text-xs text-muted-foreground">生成してもメールは送信されません。承認は下の一覧から行います。</span>

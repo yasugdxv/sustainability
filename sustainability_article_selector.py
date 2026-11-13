@@ -164,7 +164,7 @@ def _stratified_top_n(candidate_ids: list, clusters: dict, top_n: int) -> list:
 def list_theme_prioritized_cluster_ids(client, all_urls: dict, top_n: int = 10,
                                         top_n_cross_cutting: int = CROSS_CUTTING_TOP_N_DEFAULT,
                                         top_n_sub_axis: int = SUB_AXIS_TOP_N_DEFAULT,
-                                        since_days: int = None) -> list:
+                                        since_days: int = None, since_dt=None, until_dt=None) -> list:
     """主要9テーマ＋横断2軸（情報開示／ESG評価・サステナブルファイナンス）ごとに、
     ランクB以上かつimportance_total_score上位N件の事象クラスタのみを候補とする（Tier0）。
     各テーマ・軸の上位N件選定では、規制・基準系と企業・業界の取組事例系の双方が
@@ -224,7 +224,15 @@ def list_theme_prioritized_cluster_ids(client, all_urls: dict, top_n: int = 10,
     }
     articles_params = {"select": "article_id,article_url_id,crawl_target_id,published_at",
                         "is_current": "eq.true"}
-    if since_days is not None:
+    if since_dt is not None or until_dt is not None:
+        # 過去の週を再現する検証用（検証スクリプトから、期間の始点・終点を直接指定する）。既存の動作には影響しない
+        conds = []
+        if since_dt is not None:
+            conds.append(f"published_at.gte.{since_dt.isoformat()}")
+        if until_dt is not None:
+            conds.append(f"published_at.lte.{until_dt.isoformat()}")
+        articles_params["and"] = "(" + ",".join(conds) + ")"
+    elif since_days is not None:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
         # published_atがNULLの行は日付不明として除外しない（他箇所の日付フィルタと同じ方針）
         articles_params["or"] = f"(published_at.gte.{cutoff},published_at.is.null)"
