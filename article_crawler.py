@@ -1540,10 +1540,10 @@ def _rss_entry_summary(entry) -> str:
 
 
 def _list_rss_candidates_once(target: dict, proxies: dict, verify: bool, allow_escalation: bool = True) -> list:
-    """RSS取得。素のHTTPがBot対策等で失敗した場合はZyte経由に自動フォールバックする
-    (2026-09-17、unwater.org/stand.earth等で確認: 素のrequestsは403でも、Zyteの
-    HTTPモード経由なら普通に取得できるケースがあった)。
-    allow_escalation=Falseの場合はこのZyteフォールバックを行わず、例外をそのまま送出する"""
+    """RSS取得。素のHTTPがBot対策等で失敗した場合は、TinyFish Fetch → Zyte(有効時のみ)の順に
+    自動フォールバックする(2026-09-17、unwater.org/stand.earth等で確認: 素のrequestsは403でも、Zyteの
+    HTTPモード経由なら普通に取得できるケースがあった。2026-11-13: Zyteは有料のため、TinyFish Fetchを先にした)。
+    allow_escalation=Falseの場合はこのフォールバックを行わず、例外をそのまま送出する"""
     try:
         resp = requests.get(target["target_url"], proxies=proxies, verify=verify,
                              timeout=REQUEST_TIMEOUT, headers=_HEADERS)
@@ -1552,6 +1552,13 @@ def _list_rss_candidates_once(target: dict, proxies: dict, verify: bool, allow_e
     except requests.exceptions.RequestException:
         if not allow_escalation:
             raise
+        # 順番(2026-11-13変更): TinyFish Fetch → Zyte(有効時のみ)。Zyteは有料のため後
+        # (HTML一覧・記事の再試行 _fetch_with_escalation と揃えた)
+        try:
+            return list_rss_candidates_via_fetch(target, proxies, verify)
+        except Exception as tf_exc:  # noqa: BLE001
+            if not ZYTE_ENABLED:
+                raise tf_exc          # Zyte停止中は、Zyteの段を飛ばし、TinyFishの失敗理由をそのまま返す
         html, final_url, status_code, raw = _fetch_with_zyte(target["target_url"], proxies, verify)
         content = raw if raw else html.encode("utf-8", errors="ignore")
     feed = feedparser.parse(content)

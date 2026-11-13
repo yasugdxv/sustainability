@@ -177,3 +177,54 @@ def test_rss_method_listing_failure_is_recovered_via_fetch_and_articles_use_fetc
     assert result["run_result"] == "成功" and len(saved) == 2 and tiers == ["tinyfish_fetch"] * 2
     funnel = ac._split_notes(client.inserted["crawl_logs"][0]["notes"])[1]
     assert funnel["p1_listing_fallback"] == "tinyfish_fetch"
+
+
+# ─── RSSの再試行の順番: TinyFish Fetch → Zyte（2026-11-13。Zyteは有料のため後）────────
+def _rss_direct_fails(monkeypatch):
+    monkeypatch.setattr(ac.requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.exceptions.ConnectionError("blocked")))
+
+
+def test_rss_retry_tries_tinyfish_fetch_before_zyte(monkeypatch):
+    monkeypatch.setattr(ac, "ZYTE_ENABLED", True)
+    _rss_direct_fails(monkeypatch)
+    monkeypatch.setattr(ac, "list_rss_candidates_via_fetch", lambda *a, **k: ([{"url": "https://example.com/tf"}], 200))
+    zyte_calls = []
+    monkeypatch.setattr(ac, "_fetch_with_zyte", lambda *a, **k: zyte_calls.append(1) or ("", BASE, 200, None))
+
+    cands, status = ac._list_rss_candidates_once({"target_url": BASE}, {}, True, allow_escalation=True)
+
+    assert cands == [{"url": "https://example.com/tf"}]
+    assert zyte_calls == []                                   # TinyFish Fetchが成功したら、Zyteは呼ばない
+
+
+def test_rss_retry_falls_back_to_zyte_when_tinyfish_fetch_fails(monkeypatch):
+    monkeypatch.setattr(ac, "ZYTE_ENABLED", True)
+    _rss_direct_fails(monkeypatch)
+    monkeypatch.setattr(ac, "list_rss_candidates_via_fetch", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("TinyFish失敗")))
+    feed = ('<rss><channel><item><title>Zyte経由</title><link>https://example.com/z/1</link>'
+            "<pubDate>Tue, 1 Sep 2026 22:54:00 GMT</pubDate></item></channel></rss>")
+    monkeypatch.setattr(ac, "_fetch_with_zyte", lambda *a, **k: ("", BASE, 200, feed.encode("utf-8")))
+
+    cands, status = ac._list_rss_candidates_once({"target_url": BASE}, {}, True, allow_escalation=True)
+
+    assert [c["url"] for c in cands] == ["https://example.com/z/1"]
+
+
+def test_rss_retry_with_zyte_disabled_raises_the_tinyfish_error_and_skips_zyte(monkeypatch):
+    monkeypatch.setattr(ac, "ZYTE_ENABLED", False)
+    _rss_direct_fails(monkeypatch)
+    monkeypatch.setattr(ac, "list_rss_candidates_via_fetch", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("TinyFish失敗")))
+    monkeypatch.setattr(ac, "_fetch_with_zyte", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Zyte停止中は呼ばれないはず")))
+
+    with pytest.raises(RuntimeError, match="TinyFish失敗"):
+        ac._list_rss_candidates_once({"target_url": BASE}, {}, True, allow_escalation=True)
+
+
+def test_rss_without_escalation_raises_without_calling_any_fallback(monkeypatch):
+    monkeypatch.setattr(ac, "ZYTE_ENABLED", True)
+    _rss_direct_fails(monkeypatch)
+    monkeypatch.setattr(ac, "list_rss_candidates_via_fetch", lambda *a, **k: (_ for _ in ()).throw(AssertionError("呼ばれないはず")))
+    monkeypatch.setattr(ac, "_fetch_with_zyte", lambda *a, **k: (_ for _ in ()).throw(AssertionError("呼ばれないはず")))
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        ac._list_rss_candidates_once({"target_url": BASE}, {}, True, allow_escalation=False)
