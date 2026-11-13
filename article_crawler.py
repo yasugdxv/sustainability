@@ -785,6 +785,7 @@ _ZYTE_LOADING_PLACEHOLDER_MARKERS = ("animate-spin", "animate-pulse")
 # HTTP取得では本文が取れない(例: 欧州委 presscorner。HTML 2.2万字のうち、読める文字は40字)。
 # この場合も、Browser Renderingへ切り替える。文書(PDF/.docx)・XML・JSONは、対象外。
 ZYTE_MIN_VISIBLE_CHARS = 120
+ZYTE_EXTRACT_RETRY_MIN_VISIBLE_CHARS = 1000      # HTTPで本文を抽出できなかったとき、Browserで取り直すのは、読める文字がこれ以上あるページだけ
 ZYTE_BROWSER_RETRY_STATUS = range(520, 530)     # Zyteが、対象サイトの拒否・接続失敗を示すステータス
 
 
@@ -1388,18 +1389,29 @@ def _extract_article_once(url: str, proxies: dict, verify: bool, use_browser: bo
             return {"ok": False, "error": "文書ファイルはブラウザ経由での取得に未対応です", "http_status": status_code}
         return _extract_document(doc_kind, raw_content, final_url, status_code)
 
+    def _extract_json(page_html):
+        return trafilatura.extract(page_html, url=url, output_format="json", with_metadata=True, favor_recall=True)
+
+    try:
+        json_str = _extract_json(html)
+    except Exception as e:
+        return {"ok": False, "error": f"抽出処理エラー {type(e).__name__}: {e}", "http_status": status_code}
+
+    # 2026-11-13: ZyteのHTTP取得で、読める文字は十分あるのに本文を抽出できない場合(JS描画で、本文がスクリプトの中にあるページ。
+    # 例: tescoplc.com。HTTPは抽出失敗、Browser Renderingなら本文4,000字)は、Browser Renderingで、1回だけ取り直す。
+    # 読める文字が少ないページ(空のページ等)は、費用をかけない(取得の段階で、_fetch_with_zyteが、すでに切り替えている)
+    if (not json_str and (tier == "zyte" or (tier is None and use_zyte))
+            and _visible_text_len(html) >= ZYTE_EXTRACT_RETRY_MIN_VISIBLE_CHARS):
+        try:
+            html, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify, force_browser=True)
+            json_str = _extract_json(html)
+        except Exception:  # noqa: BLE001  Browserでも取れない場合は、下の「抽出に失敗」として扱う
+            json_str = None
+
     try:
         tree = _safe_lxml_parse(html)
     except Exception:
         tree = None
-
-    try:
-        json_str = trafilatura.extract(
-            html, url=url, output_format="json",
-            with_metadata=True, favor_recall=True,
-        )
-    except Exception as e:
-        return {"ok": False, "error": f"抽出処理エラー {type(e).__name__}: {e}", "http_status": status_code}
 
     if not json_str:
         return {"ok": False, "error": "本文抽出に失敗（対象外ページの可能性）", "http_status": status_code}
