@@ -781,6 +781,28 @@ def _call_zyte(url: str, proxies: dict, verify: bool, browser: bool, wait_sec: i
 # 応答が長くてもBrowser Renderingへ強制的にエスカレーションする
 _ZYTE_LOADING_PLACEHOLDER_MARKERS = ("animate-spin", "animate-pulse")
 
+# 2026-11-13: HTMLは長い(スクリプト・メニューが大半)のに、読める文字がほとんど無いページは、JS描画のページで、
+# HTTP取得では本文が取れない(例: 欧州委 presscorner。HTML 2.2万字のうち、読める文字は40字)。
+# この場合も、Browser Renderingへ切り替える。文書(PDF/.docx)・XML・JSONは、対象外。
+ZYTE_MIN_VISIBLE_CHARS = 120
+ZYTE_BROWSER_RETRY_STATUS = range(520, 530)     # Zyteが、対象サイトの拒否・接続失敗を示すステータス
+
+
+def _visible_text_len(html: str) -> int:
+    """HTMLから、スクリプト・スタイル・タグを除いた、読める文字数(空白を畳んで数える)"""
+    t = re.sub(r"<(script|style|noscript)\b.*?</\1>", " ", html or "", flags=re.S | re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return len(re.sub(r"\s+", " ", t).strip())
+
+
+def _zyte_html_too_thin(url: str, html: str, raw_content) -> bool:
+    if _detect_document_kind(url) or (raw_content or b"")[:5] == b"%PDF-":
+        return False
+    head = (html or "")[:2000].lstrip().lower()
+    if head.startswith(("<?xml", "<rss", "<feed", "<urlset", "<sitemapindex", "{", "[")):
+        return False
+    return _visible_text_len(html) < ZYTE_MIN_VISIBLE_CHARS
+
 
 def _fetch_with_zyte(url: str, proxies: dict, verify: bool, force_browser: bool = False):
     """Zyte APIでページを取得する。まず安価なHTTP取得を試し、応答が短すぎる、または
@@ -796,12 +818,23 @@ def _fetch_with_zyte(url: str, proxies: dict, verify: bool, force_browser: bool 
     if force_browser:
         html, final_url, status_code, _ = _call_zyte(url, proxies, verify, browser=True, wait_sec=10)
         return html, final_url, status_code, None
-    html, final_url, status_code, raw_content = _call_zyte(url, proxies, verify, browser=False)
+    try:
+        html, final_url, status_code, raw_content = _call_zyte(url, proxies, verify, browser=False)
+    except requests.exceptions.HTTPError as e:
+        # 2026-11-13: HTTP取得が、対象サイト側の拒否(Zyteの520〜529)で失敗した場合は、Browser Renderingで再試行する
+        # (consilium.europa.eu・oecd.orgで、HTTPは520だがBrowserなら取れることを確認)。
+        # 認証・課金・アカウント停止(401/402/403等)は、Browserでも直らず費用だけかかるため、再試行しない
+        code = e.response.status_code if e.response is not None else None
+        if code is None or code not in ZYTE_BROWSER_RETRY_STATUS:
+            raise
+        html, final_url, status_code, _ = _call_zyte(url, proxies, verify, browser=True)
+        return html, final_url, status_code, None
     looks_like_placeholder = any(m in html for m in _ZYTE_LOADING_PLACEHOLDER_MARKERS)
-    if len(html) >= ZYTE_MIN_HTML_CHARS and not looks_like_placeholder:
+    if len(html) >= ZYTE_MIN_HTML_CHARS and not looks_like_placeholder and not _zyte_html_too_thin(url, html, raw_content):
         return html, final_url, status_code, raw_content
     html2, final_url2, status_code2, _ = _call_zyte(url, proxies, verify, browser=True)
-    if len(html2) >= len(html):
+    # 比較は、HTML全体の長さではなく、読める文字数で行う(HTTPのHTMLは、スクリプトで長くなりがちなため)
+    if _visible_text_len(html2) >= _visible_text_len(html):
         return html2, final_url2, status_code2, None
     return html, final_url, status_code, raw_content
 
