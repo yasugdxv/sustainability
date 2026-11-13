@@ -1281,7 +1281,8 @@ def _fetch_page(url: str, proxies: dict, verify: bool, use_browser: bool, use_zy
     return html, final_url, status_code
 
 
-def _fetch_page_with_tier(url: str, proxies: dict, verify: bool, tier: str, want_links: bool = False):
+def _fetch_page_with_tier(url: str, proxies: dict, verify: bool, tier: str, want_links: bool = False,
+                           force_zyte_browser: bool = False):
     """ページ取得を、指定された1段階(tier: "tinyfish_fetch"/"zyte"/"tinyfish_agent")だけで
     試す。(html, final_url, status_code)を返す。
 
@@ -1293,7 +1294,7 @@ def _fetch_page_with_tier(url: str, proxies: dict, verify: bool, tier: str, want
     if tier == "tinyfish_fetch":
         html, final_url, status_code = _call_tinyfish_fetch(url, proxies, verify, want_links=want_links)
     elif tier == "zyte":
-        html, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify)
+        html, final_url, status_code, _ = _fetch_with_zyte(url, proxies, verify, force_browser=force_zyte_browser)
     elif tier == "tinyfish_agent":
         html, final_url, status_code = _call_tinyfish_agent(url, proxies, verify)
     else:
@@ -1654,6 +1655,58 @@ def _parse_lastmod(text):
         return None
 
 
+_RENDERED_SITEMAP_TOKEN = re.compile(r"https?://[^\s<>\"']+|\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})?")
+
+
+def _normalize_sitemap_text(text: str) -> str:
+    """サイトマップの本文を、<urlset><url><loc>..</loc><lastmod>..</lastmod></url></urlset>の形に揃える(2026-11-13)。
+    ・XML(urlset/sitemapindex): そのまま
+    ・RSS形式(例: wbcsd.org/sitemap.rss): <item>の<link>をloc、<pubDate>をlastmodにする
+    ・ブラウザ描画されたXMLの表示画面(例: oecd.org。通常取得は403でZyteのBrowserのみ可): タグを除いた文字から、
+      URLと、その直後の日時を取り出す"""
+    import html as _html
+    head = (text or "")[:3000]
+    if "<urlset" in head or "<sitemapindex" in head:
+        return text
+    if "<rss" in head:
+        blocks = []
+        for item in re.findall(r"<item>(.*?)</item>", text, re.S):
+            link = re.search(r"<link>(.*?)</link>", item, re.S)
+            date = re.search(r"<pubDate>(.*?)</pubDate>", item, re.S)
+            if link:
+                blocks.append(f"<url><loc>{_clean_loc(link.group(1))}</loc>"
+                              + (f"<lastmod>{_clean_loc(date.group(1))}</lastmod>" if date else "") + "</url>")
+        return "<urlset>" + "".join(blocks) + "</urlset>"
+    if "xml-viewer" not in (text or "")[:5000]:      # ブラウザのXML表示画面ではない(通常のHTMLなど)ものは、URLを拾わず、そのまま返す
+        return text
+    plain = _html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    entries = []
+    for tok in _RENDERED_SITEMAP_TOKEN.findall(plain):
+        if tok.startswith("http"):
+            if any(x in tok for x in ("sitemaps.org", "w3.org", "chromium")):
+                continue
+            entries.append([tok, None])
+        elif entries and entries[-1][1] is None:
+            entries[-1][1] = tok
+    return "<urlset>" + "".join(
+        f"<url><loc>{u}</loc>" + (f"<lastmod>{d}</lastmod>" if d else "") + "</url>" for u, d in entries) + "</urlset>"
+
+
+def _fetch_sitemap_root(url: str, proxies: dict, verify: bool):
+    """サイトマップ(または索引)の本文と、ステータスを返す。通常取得が失敗したら、Zyte有効時のみ、Zyte経由で取得する
+    (HTTPで足りなければ、自動でBrowser Rendering)。(本文, ステータス)。形はXMLに揃える"""
+    try:
+        resp = requests.get(url, proxies=proxies, verify=verify, timeout=REQUEST_TIMEOUT, headers=_HEADERS)
+        resp.raise_for_status()
+        return _normalize_sitemap_text(resp.text), resp.status_code
+    except requests.exceptions.RequestException:
+        if not ZYTE_ENABLED:
+            raise
+        html, _final, status, raw = _fetch_with_zyte(url, proxies, verify)
+        text = raw.decode("utf-8", errors="replace") if raw else html
+        return _normalize_sitemap_text(text), status
+
+
 def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
     """XMLサイトマップ(<url><loc>...</loc><lastmod>...</lastmod></url>)から候補記事を
     一覧する。<a href>を汎用収集するlist_html_candidates()とは構造が異なる
@@ -1672,10 +1725,7 @@ def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
     include_paths = [p.strip() for p in (target.get("include_paths") or "").split(",") if p.strip()]
     exclude_paths = [p.strip() for p in (target.get("exclude_paths") or "").split(",") if p.strip()]
 
-    resp = requests.get(url, proxies=proxies, verify=verify, timeout=REQUEST_TIMEOUT, headers=_HEADERS)
-    resp.raise_for_status()
-
-    root_text = resp.text
+    root_text, root_status = _fetch_sitemap_root(url, proxies, verify)
     if "<sitemapindex" in root_text:
         children = []
         for sm in re.findall(r"<sitemap>(.*?)</sitemap>", root_text, re.S):
@@ -1726,7 +1776,7 @@ def list_sitemap_candidates(target: dict, proxies: dict, verify: bool) -> list:
     if any(k is not None for k in sort_keys):
         order = sorted(range(len(candidates)), key=lambda i: (sort_keys[i] is None, -(sort_keys[i].timestamp() if sort_keys[i] else 0), i))
         candidates = [candidates[i] for i in order]      # 新しい順。日付の無いものは、最後（ファイルの順）
-    return candidates[:max_links], resp.status_code
+    return candidates[:max_links], root_status
 
 
 # ─── HTML（汎用） ─────────────────────────────────────────────────
@@ -1838,7 +1888,11 @@ def list_html_candidates(target: dict, proxies: dict, verify: bool, use_browser:
     exclude_paths = [p.strip() for p in (target.get("exclude_paths") or "").split(",") if p.strip()]
 
     if tier is not None:
-        html, final_url, status_code = _fetch_page_with_tier(url, proxies, verify, tier, want_links=True)
+        # 段階指定の取得(方式「Zyte」)でも、強制ブラウザ描画の指定を効かせる(2026-11-13。fao.org・who.intの一覧は、
+        # ブラウザ描画でないと記事リンクが出ない)
+        html, final_url, status_code = _fetch_page_with_tier(
+            url, proxies, verify, tier, want_links=True,
+            force_zyte_browser=(target.get("search_conditions") == "force_zyte_browser"))
     else:
         # search_conditions列を「Zyte強制ブラウザレンダリング」フラグとして流用
         # (2026-09-17、canada.caで確認: 通常のZyte自動判定ではBrowser Renderingへ
@@ -1927,9 +1981,9 @@ def _strip_aem_content_prefix(path: str) -> str:
 # JSON APIのレスポンス内で記事URL・タイトル・日付を指す可能性があるキー名
 # （サイトごとに命名が異なるため複数候補を順に試す。例: mcdonalds.comの
 # /bin/getCategory は articlePath/title/defaultDate、他サイトは url/link/date等の場合がある）
-_JSON_URL_KEYS = ("articlePath", "url", "link", "path", "href", "urlId")
+_JSON_URL_KEYS = ("articlePath", "url", "link", "path", "href", "urlId", "@id")      # "@id": Plone/Volto(cop30.br)
 _JSON_TITLE_KEYS = ("title", "headline", "name")
-_JSON_DATE_KEYS = ("defaultDate", "publishDate", "date", "pubDate", "published")
+_JSON_DATE_KEYS = ("defaultDate", "publishDate", "date", "pubDate", "published", "effective")   # "effective": Plone/Volto
 
 
 def list_json_api_candidates(target: dict, proxies: dict, verify: bool, use_zyte: bool = False,
@@ -3163,6 +3217,11 @@ def _resolve_tiered_listing(target: dict, proxies: dict, verify: bool, tiers: tu
     (2026-10-15追加、crawl_method='Zyte'/'JSON API'のtarget用)"""
     error_message = None
     is_404 = False
+    # 強制ブラウザ描画の指定(search_conditions=force_zyte_browser)がある対象は、Zyteを先に試す(2026-11-13)。
+    # TinyFish Fetchは、JS描画の一覧で「記事リンク0件」を、エラーなしで返す(fao.org・who.int)ため、
+    # 先に試すと成功扱いになり、Zyteの段に進まない
+    if target.get("search_conditions") == "force_zyte_browser" and ZYTE_ENABLED and "zyte" in tiers:
+        tiers = ("zyte",) + tuple(t for t in tiers if t != "zyte")
     for tier in tiers:
         # 2026-10-19: 記事の再試行にしか効いていなかったAgentの上限を、一覧取得にも効かせる
         # （Agentは1回数十秒〜数分・有料。上限を超えたら使わず、失敗として返す）
