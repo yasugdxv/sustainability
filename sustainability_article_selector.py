@@ -136,11 +136,16 @@ def _matches_threshold_condition(patterns: list, title: str, body: str) -> bool:
     return any(p.search(haystack) for p in patterns)
 
 
+# 規制・基準系／企業取組系それぞれに優先確保する件数(テーマ・軸ごと)
+PRIORITY_SLOTS_PER_TYPE = 3
+
+
 def _stratified_top_n(candidate_ids: list, clusters: dict, top_n: int) -> list:
     """スコア上位を優先しつつ、規制・基準系(regulatory_type)と企業・業界の取組事例系
     (corporate_type)の双方が一定数含まれるよう配慮する（PMO 2026-08-03フィードバック④）。
-    各タイプについて上限top_n//2件を優先確保し、残り枠は全体のスコア順で埋める。"""
-    half = -(-top_n // 2)  # 切り上げ
+    各タイプについて上限PRIORITY_SLOTS_PER_TYPE件を優先確保し、残り枠は全体のスコア順で埋める。
+    (2026-11-15: 優先枠が5件ずつだと、種別タグの無い高ランク記事が押し出されるため3件に縮小)"""
+    half = min(PRIORITY_SLOTS_PER_TYPE, -(-top_n // 2))
     regulatory = sorted((c for c in candidate_ids if clusters[c]["regulatory_type"]),
                          key=lambda c: clusters[c]["best_key"])[:half]
     corporate = sorted((c for c in candidate_ids if clusters[c]["corporate_type"]),
