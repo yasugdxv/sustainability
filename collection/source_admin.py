@@ -11,7 +11,11 @@ from urllib.parse import urlparse
 
 from collection import consumers
 
-REQUIRED_NEW_TARGET_KEYS = ("crawl_target_id", "target_name", "target_url", "domain", "used_by")
+# crawl_targets で NOT NULL の列（実DBの全行で値がある列）。空文字・未指定は不可
+REQUIRED_NEW_TARGET_KEYS = ("crawl_target_id", "target_name", "target_url", "domain", "publisher_name", "publisher_tag_id",
+                            "endpoint_type", "crawl_method", "change_detection_method", "used_by")
+# NOT NULL だが False / 0 が正しい値になりうる列（未指定(None)だけを不可にする）
+REQUIRED_NOT_NULL_KEYS = ("crawl_detail_pages", "authentication_required", "lookback_days")
 # crawl_targets_crawl_method_check と同じ値（sql/2026-09-16b_crawl_method_add_json_api.sql）。
 # 新しいSourceは稼働させる前提なので、廃止系（重複廃止・廃止）は含めない
 VALID_CRAWL_METHODS = ("HTML", "RSS", "API", "ブラウザ操作", "Zyte", "JSON API", "メール", "手動")
@@ -94,17 +98,18 @@ def plan_used_by_change(targets: list, *, add=(), remove=()) -> list:
     return plan
 
 
-def validate_new_targets(new_rows: list, existing_targets: list) -> dict:
+def validate_new_targets(new_rows: list, existing_targets: list, valid_publisher_tags=None) -> dict:
     """新しいSourceの追加の検査。戻り値: {"to_insert": [...], "already_exists": [{"new": 行, "existing": 行}], "errors": [...]}。
     既存のURL(正規化して一致)は挿入せず already_exists に分ける（その場合は used_by の追加で対応する）。
-    必須列のうち DB 側の NOT NULL の検査はここでは行わない（DBのエラーで検出する）。"""
+    valid_publisher_tags を渡すと、publisher_tag_id がその集合に実在するかも検査する（tag_reference の tag_id）。"""
     existing_by_url = {normalize_url_key(t.get("target_url")): t for t in existing_targets}
     existing_ids = {t["crawl_target_id"] for t in existing_targets}
     out = {"to_insert": [], "already_exists": [], "errors": []}
     seen_ids, seen_urls = set(), set()
     for i, row in enumerate(new_rows, 1):
         label = row.get("crawl_target_id") or f"{i}行目"
-        missing = [k for k in REQUIRED_NEW_TARGET_KEYS if not row.get(k)]
+        missing = ([k for k in REQUIRED_NEW_TARGET_KEYS if not row.get(k)]
+                   + [k for k in REQUIRED_NOT_NULL_KEYS if row.get(k) is None])
         if missing:
             out["errors"].append(f"{label}: 必須項目がありません: {', '.join(missing)}"
                                  + ("（used_by は必須です。忘れるとサステナの分析対象になります）" if "used_by" in missing else ""))
@@ -114,8 +119,11 @@ def validate_new_targets(new_rows: list, existing_targets: list) -> dict:
         except SourceAdminError as e:
             out["errors"].append(f"{label}: {e}")
             continue
-        if row.get("crawl_method") and row["crawl_method"] not in VALID_CRAWL_METHODS:
+        if row["crawl_method"] not in VALID_CRAWL_METHODS:
             out["errors"].append(f"{label}: crawl_method が不正です: {row['crawl_method']!r}")
+            continue
+        if valid_publisher_tags is not None and row["publisher_tag_id"] not in valid_publisher_tags:
+            out["errors"].append(f"{label}: publisher_tag_id が tag_reference に存在しません: {row['publisher_tag_id']!r}")
             continue
         key = normalize_url_key(row["target_url"])
         if key in existing_by_url:

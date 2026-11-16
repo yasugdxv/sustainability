@@ -49,6 +49,8 @@ def test_plan_requires_a_change_and_rejects_contradiction():
 
 def _new(**kw):
     return {"crawl_target_id": "n1", "target_name": "N", "target_url": "https://new.example.net/a", "domain": "new.example.net",
+            "publisher_name": "N", "publisher_tag_id": "SJ-11-01", "endpoint_type": "RSS", "change_detection_method": "GUID／URL／公開日",
+            "crawl_detail_pages": True, "authentication_required": False, "lookback_days": 7,
             "used_by": ["erm"], "crawl_method": "RSS", **kw}
 
 
@@ -70,6 +72,20 @@ def test_validate_new_targets_splits_existing_urls_and_validates_values():
     assert len(r["errors"]) == 4
 
 
+def test_validate_new_targets_requires_db_not_null_columns_but_allows_false_and_zero():
+    for key in ("publisher_tag_id", "endpoint_type", "change_detection_method", "crawl_detail_pages", "lookback_days"):
+        r = sa.validate_new_targets([{k: v for k, v in _new().items() if k != key}], T)
+        assert r["to_insert"] == [] and key in r["errors"][0], key
+    ok = sa.validate_new_targets([_new(crawl_detail_pages=False, authentication_required=False, lookback_days=0)], T)
+    assert len(ok["to_insert"]) == 1 and not ok["errors"]
+
+
+def test_validate_new_targets_checks_publisher_tag_exists():
+    assert sa.validate_new_targets([_new()], T, valid_publisher_tags={"SJ-11-01"})["to_insert"]
+    r = sa.validate_new_targets([_new(publisher_tag_id="SJ-99")], T, valid_publisher_tags={"SJ-11-01"})
+    assert r["to_insert"] == [] and "tag_reference" in r["errors"][0]
+
+
 def test_summarize_used_by():
     assert sa.summarize_used_by(T) == {"sustainability": 2, "erm+sustainability": 1}
 
@@ -81,6 +97,8 @@ class _Client:
         self.updates, self.inserts = [], []
 
     def select(self, table, params):
+        if table == "tag_reference":
+            return [{"tag_id": "SJ-11-01"}]
         return [dict(t) for t in T]
 
     def update(self, table, params, patch, prefer=None):

@@ -92,7 +92,8 @@ def cmd_add_targets(client, args):
     new_rows = json.loads(Path(args.file).read_text(encoding="utf-8"))
     if not isinstance(new_rows, list):
         sys.exit("JSONは、Sourceの配列にしてください")
-    res = sa.validate_new_targets(new_rows, select_targets(client, "crawl_target_id,target_url"))
+    tags = {t["tag_id"] for t in client.select("tag_reference", {"select": "tag_id"})}
+    res = sa.validate_new_targets(new_rows, select_targets(client, "crawl_target_id,target_url"), valid_publisher_tags=tags)
     print(f"追加できる: {len(res['to_insert'])}件 / 既に登録済み: {len(res['already_exists'])}件 / エラー: {len(res['errors'])}件")
     for e in res["errors"]:
         print("  エラー:", e)
