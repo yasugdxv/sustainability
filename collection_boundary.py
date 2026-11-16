@@ -26,6 +26,7 @@ COMMON_MODULES = [
     "api_article_crawler",   # API 型ソースの記事取得
     "reference_list_monitor",  # 参照リスト（規制・基準などの一覧）の監視
     "crawl_health_check",    # クロール結果の健全性チェック
+    "source_admin",          # Sourceの used_by 変更・追加の検査と計画（書き込みはしない）
     "consumers",             # クロール先(Source)を使うアプリの扱い（crawl_targets.used_by）
     "steps",                 # 日次の工程の一覧（クロール→参照リスト→API記事→ヘルスチェック）
     "pipeline",              # 工程を順番に実行する仕組み（ロック・失敗しても続行・スキップ指定）
