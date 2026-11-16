@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import sustainability_article_selector as sas
+from collection import consumers
 import sustainability_expert_common as common
 
 BASE = Path(__file__).parent
@@ -103,7 +104,9 @@ def build_eligible_index(client, all_urls: dict, floor: set | None = None) -> tu
     }
     articles = client.select("articles", {"select": "article_id,article_url_id,crawl_target_id,published_at",
                                           "is_current": "eq.true"})
-    articles = [a for a in articles if a.get("crawl_target_id") not in own_target_ids]
+    other_app_targets = consumers.excluded_target_ids(client, sas.APP_NAME)    # 他アプリ専用のSourceの記事は対象外
+    articles = [a for a in articles if a.get("crawl_target_id") not in own_target_ids
+                and a.get("crawl_target_id") not in other_app_targets]
     analysis = {a["article_id"]: a for a in client.select(
         "article_analysis", {"select": "article_id,importance_level,importance_total_score,representative_role",
                              "is_current": "eq.true"})}

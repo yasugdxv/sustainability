@@ -35,6 +35,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from article_crawler import SupabaseClient, load_config  # noqa: E402
+from collection import consumers  # noqa: E402
+
+APP_NAME = "sustainability"  # crawl_targets.used_by に入れる、このアプリの名前
 from ai_client import make_openai_client  # noqa: E402
 import article_filter  # noqa: E402
 import sustainability_expert_common as common  # noqa: E402
@@ -694,12 +697,16 @@ def fetch_unanalyzed_articles(client: SupabaseClient, limit: int = None) -> list
     })
     analyzed = client.select("article_analysis", {"select": "article_id", "is_current": "eq.true"})
     analyzed_ids = {a["article_id"] for a in analyzed}
-    targets = {t["crawl_target_id"]: t for t in client.select(
-        "crawl_targets", {"select": "crawl_target_id,publisher_name,domain,publisher_tag_id"})}
+    targets = {t["crawl_target_id"]: t for t in consumers.select_targets(
+        client, "crawl_target_id,publisher_name,domain,publisher_tag_id")}
 
     result = []
     for a in articles:
         if a["article_id"] in analyzed_ids:
+            continue
+        # 共通クロールで集めた他アプリ(ERM/geo等)専用のSourceの記事は、サステナの分析対象にしない
+        # （used_by列が無い/空のSourceはサステナ用として扱う＝従来どおり）
+        if a.get("crawl_target_id") in targets and not consumers.is_used_by(targets[a["crawl_target_id"]], APP_NAME):
             continue
         a["_target"] = targets.get(a["crawl_target_id"], {})
         result.append(a)

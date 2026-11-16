@@ -37,6 +37,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from article_crawler import SupabaseClient, load_config  # noqa: E402
+from collection import consumers  # noqa: E402
+
+APP_NAME = "sustainability"  # crawl_targets.used_by に入れる、このアプリの名前
 from ai_client import make_openai_client  # noqa: E402
 import sustainability_expert_common as common  # noqa: E402
 from sustainability_knowledge_store import get_knowledge_store  # noqa: E402
@@ -53,10 +56,13 @@ def list_candidate_cluster_ids(client, since_days: int = None, article_ids: list
                                 all_urls: dict = None) -> list:
     """未処理の事象クラスタ（article_urls.article_url_idを代表IDとする）一覧を返す。
     all_urlsを渡せばcommon.fetch_all_article_urlsの結果を使い回す（未指定ならここで取得する）"""
-    params = {"select": "article_id,article_url_id,published_at", "is_current": "eq.true"}
+    params = {"select": "article_id,article_url_id,published_at,crawl_target_id", "is_current": "eq.true"}
     if article_ids:
         params["article_id"] = f"in.({','.join(article_ids)})"
     articles = client.select("articles", params)
+    # 共通クロールで集めた他アプリ(ERM/geo等)専用のSourceの記事は、サステナの選定候補にしない
+    other_app_targets = consumers.excluded_target_ids(client, APP_NAME)
+    articles = [a for a in articles if a.get("crawl_target_id") not in other_app_targets]
 
     suppressed_ids = {
         a["article_id"] for a in common._select_in_chunks(
@@ -236,7 +242,9 @@ def list_theme_prioritized_cluster_ids(client, all_urls: dict, top_n: int = 10,
         # published_atがNULLの行は日付不明として除外しない（他箇所の日付フィルタと同じ方針）
         articles_params["or"] = f"(published_at.gte.{cutoff},published_at.is.null)"
     articles = client.select("articles", articles_params)
-    articles = [a for a in articles if a.get("crawl_target_id") not in own_company_target_ids]
+    other_app_targets = consumers.excluded_target_ids(client, APP_NAME)    # 他アプリ専用のSourceの記事は対象外
+    articles = [a for a in articles if a.get("crawl_target_id") not in own_company_target_ids
+                and a.get("crawl_target_id") not in other_app_targets]
     analysis_by_article = {
         a["article_id"]: a for a in client.select(
             "article_analysis", {"select": "article_id,importance_level,importance_total_score,"
