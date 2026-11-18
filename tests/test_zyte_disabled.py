@@ -153,14 +153,18 @@ def test_zyte_method_article_failures_become_pending_for_the_normal_retry_path(m
     assert funnel["p1_pending"][0]["u"] == "https://z.example/a/1" and funnel["p1_tinyfish_direct"] == 1
 
 
-def test_when_zyte_is_enabled_again_zyte_method_goes_back_to_pass2_deferral(monkeypatch):
+def test_when_zyte_is_enabled_again_zyte_method_still_lists_with_tinyfish_first(monkeypatch):
+    """Zyte有効に戻しても、方式Zyteの一覧は先にTinyFish Fetchで取る(2026-11-18)。
+    取れなかったときだけ、Zyte→Agentの一覧再試行へ回す"""
     monkeypatch.setattr(ac, "ZYTE_ENABLED", True)
     monkeypatch.setattr(ac, "_ZYTE_METHOD_TIERS", ac._build_zyte_method_tiers(True))
     client = FakeSupabaseClient({"crawl_logs": []})
+    monkeypatch.setattr(ac, "_list_candidates_with_tier",
+                        lambda target, proxies, verify, tier: ([], None, False, "RuntimeError: TinyFish Fetch: 取得失敗", False))
 
     result = ac.process_target(_target("Zyte"), client, {}, True)
 
-    assert result["pending_listing_escalation"]["tiers"] == ("tinyfish_fetch", "zyte", "tinyfish_agent")
+    assert result["pending_listing_escalation"]["tiers"] == ("zyte", "tinyfish_agent")
 
 
 def test_crawl_step_timeout_leaves_room_for_the_zyte_method_targets():

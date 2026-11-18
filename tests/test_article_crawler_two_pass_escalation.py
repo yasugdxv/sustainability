@@ -537,22 +537,34 @@ def _zyte_method_target(**overrides):
     return target
 
 
-def test_process_target_defers_zyte_method_without_any_fetch_attempt(monkeypatch):
-    """crawl_method='Zyte'はPass1で一覧取得・記事取得とも一切呼ばれず、
-    即座にpending_listing_escalationへ回送されること"""
-    client = FakeSupabaseClient({})
-    listing_mock = MagicMock(side_effect=AssertionError("Pass1で一覧取得が呼ばれないはず"))
-    monkeypatch.setattr(ac, "list_html_candidates", listing_mock)
-    extract_mock = MagicMock(side_effect=AssertionError("Pass1で記事取得が呼ばれないはず"))
-    monkeypatch.setattr(ac, "extract_article", extract_mock)
+def test_zyte_method_lists_with_tinyfish_first_and_defers_only_on_listing_failure(monkeypatch):
+    """crawl_method='Zyte'は、Zyte有効でも、Pass1で一覧をTinyFish Fetchで取る(2026-11-18変更)。
+    取れなかった対象だけ、TinyFish Fetchを除いた段階(Zyte→Agent)の一覧再試行へ回すこと"""
+    client = FakeSupabaseClient({"crawl_logs": []})
+    tiers_called = []
+    monkeypatch.setattr(ac, "_list_candidates_with_tier",
+                        lambda target, proxies, verify, tier: (tiers_called.append(tier), ([], None, False, "RuntimeError: TinyFish Fetch: 取得失敗", False))[1])
+    monkeypatch.setattr(ac, "extract_article", MagicMock(side_effect=AssertionError("一覧が取れないので記事取得は呼ばれないはず")))
 
     summary = ac.process_target(_zyte_method_target(), client, {}, True)
 
-    listing_mock.assert_not_called()
-    extract_mock.assert_not_called()
+    assert tiers_called == ["tinyfish_fetch"]
     assert summary["pending_escalations"] == []
-    assert summary["pending_listing_escalation"]["tiers"] == ("tinyfish_fetch", "zyte", "tinyfish_agent")
+    assert summary["pending_listing_escalation"]["tiers"] == ("zyte", "tinyfish_agent")
     assert summary["run_result"] == "更新なし"
+    funnel = ac._split_notes(client.inserted["crawl_logs"][0]["notes"])[1]
+    assert funnel == {"p1_listing_failed": 1, "p1_tinyfish_direct": 1}
+
+
+def test_zyte_method_listing_success_is_completed_in_pass1_even_when_zyte_is_enabled(monkeypatch):
+    client = FakeSupabaseClient({"crawl_logs": [], "articles": []})
+    monkeypatch.setattr(ac, "_list_candidates_with_tier", lambda *a, **k: ([], 200, False, None, False))
+
+    summary = ac.process_target(_zyte_method_target(), client, {}, True)
+
+    assert not summary.get("pending_listing_escalation")        # Pass2の一覧再試行へ回さない
+    funnel = ac._split_notes(client.inserted["crawl_logs"][0]["notes"])[1]
+    assert funnel.get("p1_tinyfish_direct") == 1 and "p1_routed_to_pass2" not in funnel
 
 
 def test_process_target_defers_json_api_method_with_zyte_first_tiers(monkeypatch):
@@ -661,10 +673,10 @@ def test_list_json_api_candidates_rejects_unknown_tier():
 
 
 def test_pass1_preroute_to_pass2_is_marked_as_routed_not_failed():
-    """Zyte/JSON API方式の対象は、Pass1で試さずPass2へ直送する。失敗ではないので、
+    """JSON API方式の対象は、Pass1で試さずPass2へ直送する。失敗ではないので、
     notesはp1_listing_failedではなくp1_routed_to_pass2で記録する"""
     client = FakeSupabaseClient({"crawl_logs": []})
-    method = next(iter(ac._ZYTE_METHOD_TIERS))
+    method = "JSON API"        # 「Zyte」方式は2026-11-18から、Pass1で一覧をTinyFish Fetchで取る。JSON APIは従来どおり直送
     target = {"crawl_target_id": "t-1", "target_name": "x", "crawl_method": method}
 
     result = ac.process_target(target, client, {}, True)

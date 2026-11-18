@@ -2631,9 +2631,29 @@ def process_target(target: dict, client: SupabaseClient, proxies: dict, verify: 
     # 一覧取得に失敗した場合は、記事を取れないだけで済むよう「失敗」として記録する（一覧取得をAgentへ
     # 回すと、記事ごとにAgentを呼ぶ高コストの経路になるため、ここではPass2へ回さない）
     tiers_for_method = _ZYTE_METHOD_TIERS.get(method)
-    if tiers_for_method and not ZYTE_ENABLED and tiers_for_method[0] == "tinyfish_fetch":
+    # 2026-11-18変更: Zyteが有効でも、一覧は先にTinyFish Fetchで、その場で取る(従来はZyte有効だと、
+    # 全件をPass2の一覧再試行へ回しており、Zyteの一覧取得は遅く時間切れで実行されず、方式Zyteの99対象のうち
+    # 半数以上が、一覧すら取れていなかった。11/14以降: 一覧取得なし／期限切れが41〜80件/日、新規保存は0〜12件/日)。
+    # TinyFish Fetchで一覧が取れなかった対象だけを、Zyte(→Agent)の一覧再試行へ回す。
+    if tiers_for_method and tiers_for_method[0] == "tinyfish_fetch":
         candidates, http_status, single_page_mode, error_message, is_404 = \
             _list_candidates_with_tier(target, proxies, verify, "tinyfish_fetch")
+        if ZYTE_ENABLED and error_message is not None and not is_404:
+            finished_at = datetime.now(timezone.utc)
+            save_crawl_log(client, target, started_at, finished_at, "更新なし", None,
+                            0, 0, 0, 0, None, crawl_log_id=crawl_log_id,
+                            notes=_compose_notes("", {"p1_listing_failed": 1, "p1_tinyfish_direct": 1}))
+            return {
+                "run_result": "更新なし",
+                "items_detected": 0, "new_items": 0, "updated_items": 0,
+                "extraction_failures": 0, "error_message": None, "bot_block_detections": 0,
+                "crawl_log_id": crawl_log_id, "pending_escalations": [],
+                "pending_listing_escalation": {
+                    "target": target, "crawl_log_id": crawl_log_id, "lookback": lookback,
+                    "started_at": started_at,
+                    "tiers": tuple(t for t in tiers_for_method if t != "tinyfish_fetch"),   # TinyFish Fetchは試し済み
+                },
+            }
         return _process_target_articles(
             target, client, proxies, verify, candidates, http_status, single_page_mode,
             error_message, False, False, lookback, crawl_log_id, started_at,
@@ -2716,6 +2736,72 @@ def _defer_remaining_candidates(client: SupabaseClient, target: dict, remaining:
     return deferred, known
 
 
+# ── RSSの記事は、保存済み・期間外のものを、本文から取り直さない（2026-11-18追加）──────────────
+# 従来は、フィードに載った記事の本文を毎日すべて取り直していた（Council of the EUは毎日20件、新規は0〜4件。
+# 残りは保存済みの記事を、Bot対策のため、TinyFish Fetch→Zyteと毎日課金して取り直していた）。
+# RSSは、記事の公開日と一意のURLを持つため、保存済みのURLと、公開日が期間外の記事は、取得しない。
+# 環境変数 CRAWL_SKIP_KNOWN_RSS=false で、従来どおり(毎回取り直す)に戻せる。
+#
+# 方式「Zyte」(Bot対策のあるサイトの一覧型。Reuters等)にも広げた（2026-11-18）。ただし、HTMLの一覧型は、
+# 記事の更新を検知する役割があるため、RSSのように永久には飛ばさず、保存してから ZYTE_RECHECK_DAYS(7)日たった
+# 記事は取り直す(更新の検知は最大7日遅れる)。環境変数 CRAWL_SKIP_KNOWN_ZYTE=false で、広げた分だけ戻せる。
+SKIP_KNOWN_RSS = _env_flag("CRAWL_SKIP_KNOWN_RSS", default=True)
+SKIP_KNOWN_ZYTE_METHOD = _env_flag("CRAWL_SKIP_KNOWN_ZYTE", default=True)
+ZYTE_RECHECK_DAYS = int(os.environ.get("CRAWL_ZYTE_RECHECK_DAYS") or 7)
+KNOWN_URL_QUERY_CHUNK = 15
+
+
+def _known_fetched_urls(client: SupabaseClient, urls: list) -> dict:
+    """urlsのうち、すでにarticles.fetched_urlに保存されているURLと、その最新の取得日時(ISO文字列。不明は空)の辞書。
+    問い合わせに失敗したURLは、取りこぼさないよう「未保存」として扱う(取得する側に倒す)"""
+    known = {}
+    for i in range(0, len(urls), KNOWN_URL_QUERY_CHUNK):
+        chunk = urls[i:i + KNOWN_URL_QUERY_CHUNK]
+        quoted = ",".join('"' + u.replace('"', "%22") + '"' for u in chunk)
+        try:
+            rows = client.select("articles", {"select": "fetched_url,fetched_at", "fetched_url": f"in.({quoted})",
+                                              "limit": str(len(chunk) * 5)})
+        except Exception:  # noqa: BLE001
+            continue
+        for r in rows:
+            u = r.get("fetched_url")
+            if u:
+                known[u] = max(known.get(u, ""), r.get("fetched_at") or "")
+    return known
+
+
+def _fetched_within_days(fetched_at: str, days: int) -> bool:
+    """取得日時(ISO文字列)が、days日以内か。読めない・空のときはFalse(取り直す側に倒す)"""
+    try:
+        dt = datetime.fromisoformat((fetched_at or "").replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return dt >= datetime.now(timezone.utc) - timedelta(days=days)
+
+
+def _skip_known_or_stale_rss(target: dict, client: SupabaseClient, candidates: list, lookback: int) -> tuple:
+    """取得しなくてよい候補を除く。(残す候補, 保存済みで除いた数, 期間外で除いた数)。
+    ・RSSフィード型: 保存済みのURLは、いつでも取らない
+    ・方式「Zyte」の一覧型: 保存してからZYTE_RECHECK_DAYS日以内のURLは取らない(それより古いものは、更新の検知のため取り直す)
+    ・上記以外(HTML・JSON API等): 何も除かない。公開日が期間外の記事は、両方で取らない"""
+    if not candidates:
+        return candidates, 0, 0
+    is_feed = _is_feed_target(target)
+    is_zyte_method = target.get("crawl_method") == "Zyte" and not is_feed
+    if not ((SKIP_KNOWN_RSS and is_feed) or (SKIP_KNOWN_ZYTE_METHOD and is_zyte_method)):
+        return candidates, 0, 0
+    fresh = [c for c in candidates if _within_lookback(c.get("published_at"), lookback)]
+    stale = len(candidates) - len(fresh)
+    known = _known_fetched_urls(client, [c["url"] for c in fresh])
+    if is_feed:
+        kept = [c for c in fresh if c["url"] not in known]
+    else:
+        kept = [c for c in fresh if not (c["url"] in known and _fetched_within_days(known[c["url"]], ZYTE_RECHECK_DAYS))]
+    return kept, len(fresh) - len(kept), stale
+
+
 def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict, verify: bool,
                               candidates: list, http_status, single_page_mode: bool, error_message,
                               use_browser: bool, use_zyte: bool, lookback: int, crawl_log_id: str,
@@ -2740,7 +2826,9 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
     budget_skipped_known = 0   # 時間上限を超えたが、既知の記事なので取得しなかった候補の数
     target_t0 = time.monotonic()
 
+    skipped_known = skipped_stale = 0
     if error_message is None:
+        candidates, skipped_known, skipped_stale = _skip_known_or_stale_rss(target, client, candidates, lookback)
         extracted_pairs = []
         for idx, cand in enumerate(candidates):
             if PER_TARGET_BUDGET_SEC > 0 and time.monotonic() - target_t0 > PER_TARGET_BUDGET_SEC:
@@ -2859,6 +2947,9 @@ def _process_target_articles(target: dict, client: SupabaseClient, proxies: dict
         if len(pending_escalations) > PENDING_STORE_MAX:
             crawl_funnel["p1_pending_overflow"] = len(pending_escalations) - PENDING_STORE_MAX
     crawl_funnel.update(_include_nomatch_funnel(target))     # 条件に合う記事が0件なのに、記事らしいリンクがある（設定ミスの疑い）
+    if skipped_known or skipped_stale:
+        crawl_funnel["p1_skipped_known"] = skipped_known     # RSSで、保存済みのため本文を取らなかった記事
+        crawl_funnel["p1_skipped_stale"] = skipped_stale     # RSSで、公開日が期間外のため本文を取らなかった記事
     if budget_deferred or budget_skipped_known:
         crawl_funnel["p1_budget_deferred"] = budget_deferred          # 時間上限で再試行待ちへ回した候補
         crawl_funnel["p1_budget_skipped_known"] = budget_skipped_known  # 既知の記事のため取得しなかった候補
